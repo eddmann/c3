@@ -34,13 +34,13 @@ jobs:
             arch: arm64
             cross: true
           - os: macos
-            runner: macos-13
+            runner: macos-15-intel
             arch: x64
             cc: clang
             cxx: clang++
             clang_tools_bin: /usr/local/opt/llvm/bin
           - os: macos
-            runner: macos-14
+            runner: macos-latest
             arch: arm64
             cc: clang
             cxx: clang++

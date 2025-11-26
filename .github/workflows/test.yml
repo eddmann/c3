@@ -8,6 +8,32 @@ on:
   workflow_call:
 
 jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang clang-tidy clang-format
+
+      - name: Configure
+        run: |
+          cmake --preset lint \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Lint (clang-tidy)
+        run: cmake --build --preset lint
+
+      - name: Check formatting
+        run: |
+          find src include -name '*.cpp' -o -name '*.hpp' | xargs clang-format --dry-run --Werror
+
   build-and-test:
     name: ${{ matrix.os }} / ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -21,18 +47,16 @@ jobs:
             arch: x64
             cc: clang
             cxx: clang++
-            clang_tools_bin: ''
           - os: linux
             runner: ubuntu-latest
             arch: arm64
-            cross: true
           - os: macos
-            runner: macos-13
+            runner: macos-15-intel
             arch: x64
             cc: /usr/bin/clang
             cxx: /usr/bin/clang++
           - os: macos
-            runner: macos-14
+            runner: macos-latest
             arch: arm64
             cc: /usr/bin/clang
             cxx: /usr/bin/clang++
@@ -49,17 +73,17 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install dependencies (Linux)
-        if: matrix.os == 'linux' && !matrix.cross
+      - name: Install dependencies (Linux x86)
+        if: matrix.os == 'linux' && matrix.arch == 'x64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build clang clang-tidy clang-format
+          sudo apt-get install -y ninja-build clang
 
-      - name: Install dependencies (Linux ARM64 cross)
-        if: matrix.os == 'linux' && matrix.cross
+      - name: Install dependencies (Linux arm64)
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build clang clang-tidy clang-format \
+          sudo apt-get install -y ninja-build \
             qemu-user-static gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             libc6-arm64-cross libstdc++-13-dev-arm64-cross
 
@@ -74,13 +98,8 @@ jobs:
         run: |
           choco install llvm ninja --no-progress
 
-      - name: Add clang tools to PATH
-        if: matrix.clang_tools_bin != ''
-        shell: bash
-        run: echo "PATH=${{ matrix.clang_tools_bin }}:${PATH}" >> $GITHUB_ENV
-
       - name: Configure (Debug)
-        if: ${{ !matrix.cross }}
+        if: matrix.cc
         shell: bash
         run: |
           cmake --preset debug \
@@ -88,8 +107,8 @@ jobs:
             -DCMAKE_CXX_COMPILER="${{ matrix.cxx }}" \
             ${{ matrix.ninja_path && format('-DCMAKE_MAKE_PROGRAM="{0}"', matrix.ninja_path) || '' }}
 
-      - name: Configure (Debug, cross-compile ARM64)
-        if: matrix.cross
+      - name: Configure (Debug, cross-compile arm64)
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
         run: |
           cmake --preset debug \
             -DCMAKE_SYSTEM_NAME=Linux \
@@ -105,20 +124,3 @@ jobs:
 
       - name: Test
         run: ctest --preset tests
-
-      - name: Configure (clang-tidy)
-        if: matrix.os == 'linux' && !matrix.cross
-        shell: bash
-        run: |
-          cmake --preset lint \
-            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
-            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
-
-      - name: Lint (clang-tidy)
-        if: matrix.os == 'linux' && !matrix.cross
-        run: cmake --build --preset lint
-
-      - name: Check formatting
-        if: matrix.os == 'linux' && !matrix.cross
-        run: |
-          find src include -name '*.cpp' -o -name '*.hpp' | xargs clang-format --dry-run --Werror
