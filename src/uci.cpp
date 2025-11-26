@@ -39,7 +39,7 @@ template <typename T> T clamp_non_negative(T value) {
 }
 
 template <typename T> T div_ceil(T value, T divisor) {
-  return (value + divisor - 1) / divisor;
+  return static_cast<T>((value + divisor - 1) / divisor);
 }
 
 std::vector<std::string> split_tokens(const std::string& line) {
