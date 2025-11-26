@@ -1,0 +1,6 @@
+# name|fen|key_hex
+startpos|rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1|0xd9189e710b0d5138
+kiwipete|r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1|0x7c0e2cf71bb8d452
+en-passant|4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1|0xf3d7a65b68760255
+no-castling|rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1|0x72614101d5f00594
+black-castling|r3k2r/8/8/8/8/8/8/8 b kq - 0 1|0x45032b40092d1ad5

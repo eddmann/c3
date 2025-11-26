@@ -1,0 +1,25 @@
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-unchecked-optional-access,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-branch-clone,
+  clang-analyzer-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  -modernize-use-trailing-return-type,
+  -modernize-use-nodiscard,
+  -readability-identifier-length,
+  -readability-identifier-naming,
+  -readability-magic-numbers
+WarningsAsErrors: >
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  modernize-use-after-move
+HeaderFilterRegex: "^(src|include|tests)/"
+FormatStyle: none
+CheckOptions:
+  - key: modernize-use-nullptr.NullMacros
+    value: "NULL"

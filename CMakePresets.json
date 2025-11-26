@@ -1,0 +1,63 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "Debug (asan/ubsan)",
+      "description": "Debug build with sanitizers in build/",
+      "generator": "Ninja",
+      "binaryDir": "build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (O3 + LTO)",
+      "description": "Optimized release build in build-release/",
+      "generator": "Ninja",
+      "binaryDir": "build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "lint",
+      "displayName": "Debug + clang-tidy",
+      "description": "Debug build in build-tidy with clang-tidy enabled",
+      "generator": "Ninja",
+      "binaryDir": "build-tidy",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "C3_ENABLE_CLANG_TIDY": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "targets": ["c3"]
+    },
+    {
+      "name": "lint",
+      "configurePreset": "lint"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "tests",
+      "configurePreset": "debug",
+      "output": {"outputOnFailure": true}
+    }
+  ]
+}

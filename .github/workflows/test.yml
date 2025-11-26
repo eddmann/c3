@@ -1,0 +1,123 @@
+name: Test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            arch: x64
+            cc: clang
+            cxx: clang++
+            clang_tools_bin: ''
+          - os: linux
+            runner: ubuntu-latest
+            arch: arm64
+            cross: true
+          - os: macos
+            runner: macos-13
+            arch: x64
+            cc: clang
+            cxx: clang++
+            clang_tools_bin: /usr/local/opt/llvm/bin
+          - os: macos
+            runner: macos-14
+            arch: arm64
+            cc: clang
+            cxx: clang++
+            clang_tools_bin: /opt/homebrew/opt/llvm/bin
+          - os: windows
+            runner: windows-latest
+            arch: x64
+            cc: clang-cl
+            cxx: clang-cl
+            clang_tools_bin: 'C:/Program Files/LLVM/bin'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'linux' && !matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang clang-tidy clang-format
+
+      - name: Install dependencies (Linux ARM64 cross)
+        if: matrix.os == 'linux' && matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang clang-tidy clang-format \
+            qemu-user-static gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libc6-arm64-cross libstdc++-13-dev-arm64-cross
+
+      - name: Install dependencies (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          brew update
+          brew install ninja llvm
+
+      - name: Install dependencies (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          choco install llvm ninja --no-progress
+
+      - name: Add clang tools to PATH
+        if: matrix.clang_tools_bin != ''
+        shell: bash
+        run: echo "PATH=${{ matrix.clang_tools_bin }}:${PATH}" >> $GITHUB_ENV
+
+      - name: Configure (Debug)
+        if: ${{ !matrix.cross }}
+        run: |
+          cmake --preset debug \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Configure (Debug, cross-compile ARM64)
+        if: matrix.cross
+        run: |
+          cmake --preset debug \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_CROSSCOMPILING_EMULATOR="qemu-aarch64-static;-L;/usr/aarch64-linux-gnu" \
+            -DC3_ENABLE_ASAN=OFF \
+            -DC3_ENABLE_UBSAN=OFF
+
+      - name: Build (Debug)
+        run: cmake --build --preset debug
+
+      - name: Test
+        run: ctest --preset tests
+
+      - name: Configure (clang-tidy)
+        if: ${{ !matrix.cross }}
+        run: |
+          cmake --preset lint \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Lint (clang-tidy)
+        if: ${{ !matrix.cross }}
+        run: cmake --build --preset lint
+
+      - name: Check formatting
+        if: matrix.os == 'linux' && !matrix.cross
+        run: |
+          find src include -name '*.cpp' -o -name '*.hpp' | xargs clang-format --dry-run --Werror
