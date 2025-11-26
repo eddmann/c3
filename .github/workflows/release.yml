@@ -28,29 +28,25 @@ jobs:
             arch: x64
             cc: clang
             cxx: clang++
-            clang_tools_bin: ''
           - os: linux
             runner: ubuntu-latest
             arch: arm64
-            cross: true
           - os: macos
             runner: macos-15-intel
             arch: x64
-            cc: clang
-            cxx: clang++
-            clang_tools_bin: /usr/local/opt/llvm/bin
+            cc: /usr/bin/clang
+            cxx: /usr/bin/clang++
           - os: macos
             runner: macos-latest
             arch: arm64
-            cc: clang
-            cxx: clang++
-            clang_tools_bin: /opt/homebrew/opt/llvm/bin
+            cc: /usr/bin/clang
+            cxx: /usr/bin/clang++
           - os: windows
             runner: windows-latest
             arch: x64
-            cc: clang-cl
-            cxx: clang-cl
-            clang_tools_bin: 'C:/Program Files/LLVM/bin'
+            cc: 'C:/Program Files/LLVM/bin/clang-cl.exe'
+            cxx: 'C:/Program Files/LLVM/bin/clang-cl.exe'
+            ninja_path: 'C:/ProgramData/chocolatey/bin/ninja.exe'
 
     steps:
       - name: Checkout
@@ -58,14 +54,14 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install dependencies (Linux)
-        if: matrix.os == 'linux' && !matrix.cross
+      - name: Install dependencies (Linux x86)
+        if: matrix.os == 'linux' && matrix.arch == 'x64'
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build clang
 
-      - name: Install dependencies (Linux ARM64 cross)
-        if: matrix.os == 'linux' && matrix.cross
+      - name: Install dependencies (Linux arm64)
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build \
@@ -76,27 +72,24 @@ jobs:
         if: matrix.os == 'macos'
         run: |
           brew update
-          brew install ninja llvm
+          brew install ninja
 
       - name: Install dependencies (Windows)
         if: matrix.os == 'windows'
         run: |
           choco install llvm ninja --no-progress
 
-      - name: Add clang tools to PATH
-        if: matrix.clang_tools_bin != ''
-        shell: bash
-        run: echo "PATH=${{ matrix.clang_tools_bin }}:${PATH}" >> $GITHUB_ENV
-
       - name: Configure (Release)
-        if: ${{ !matrix.cross }}
+        if: matrix.cc
+        shell: bash
         run: |
           cmake --preset release \
-            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
-            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+            -DCMAKE_C_COMPILER="${{ matrix.cc }}" \
+            -DCMAKE_CXX_COMPILER="${{ matrix.cxx }}" \
+            ${{ matrix.ninja_path && format('-DCMAKE_MAKE_PROGRAM="{0}"', matrix.ninja_path) || '' }}
 
-      - name: Configure (Release, cross-compile ARM64)
-        if: matrix.cross
+      - name: Configure (Release, cross-compile arm64)
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
         run: |
           cmake --preset release \
             -DCMAKE_SYSTEM_NAME=Linux \
