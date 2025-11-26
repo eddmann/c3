@@ -39,9 +39,8 @@ jobs:
           - os: windows
             runner: windows-latest
             arch: x64
-            cc: clang-cl
-            cxx: clang-cl
-            clang_tools_bin: 'C:/Program Files/LLVM/bin'
+            cc: 'C:/Program Files/LLVM/bin/clang-cl.exe'
+            cxx: 'C:/Program Files/LLVM/bin/clang-cl.exe'
             ninja_path: 'C:/ProgramData/chocolatey/bin/ninja.exe'
 
     steps:
