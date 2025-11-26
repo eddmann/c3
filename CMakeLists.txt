@@ -37,22 +37,24 @@ endfunction()
 
 set(MAGIC_OUTPUT ${PROJECT_SOURCE_DIR}/include/c3/magic.hpp)
 
-add_executable(c3_magic_bitboard_generator
-  src/magic_bitboard_generator.cpp
-)
-target_include_directories(c3_magic_bitboard_generator PRIVATE ${PROJECT_SOURCE_DIR}/include)
-c3_apply_standard_settings(c3_magic_bitboard_generator)
+option(C3_REGENERATE_MAGIC "Regenerate magic.hpp" OFF)
 
-add_custom_command(
-  OUTPUT ${MAGIC_OUTPUT}
-  COMMAND c3_magic_bitboard_generator ${MAGIC_OUTPUT}
-  DEPENDS ${PROJECT_SOURCE_DIR}/src/magic_bitboard_generator.cpp
-  COMMENT "Generating magic.hpp"
-  VERBATIM
-)
+if(C3_REGENERATE_MAGIC)
+  add_executable(c3_magic_bitboard_generator
+    src/magic_bitboard_generator.cpp
+  )
+  target_include_directories(c3_magic_bitboard_generator PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  c3_apply_standard_settings(c3_magic_bitboard_generator)
 
-add_custom_target(generate_magic DEPENDS ${MAGIC_OUTPUT})
-add_dependencies(generate_magic c3_magic_bitboard_generator)
+  add_custom_target(generate_magic
+    COMMAND c3_magic_bitboard_generator ${MAGIC_OUTPUT}
+    DEPENDS c3_magic_bitboard_generator
+    COMMENT "Generating magic.hpp"
+    VERBATIM
+  )
+else()
+  add_custom_target(generate_magic)
+endif()
 
 add_library(c3_core STATIC
   src/about.cpp

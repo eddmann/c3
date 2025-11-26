@@ -80,6 +80,15 @@ cmake --preset release
 cmake --build --preset release
 ```
 
+### Regenerating magic bitboards
+
+The magic bitboard tables are checked in at `include/c3/magic.hpp`. To regenerate:
+
+```bash
+cmake --preset debug -DC3_REGENERATE_MAGIC=ON
+cmake --build --preset debug
+```
+
 ### Running tests
 
 ```bash

@@ -5,7 +5,7 @@
 - `src/` holds engine sources (UCI glue, search, move generation, evaluation); headers live in `include/c3/` under the `c3` namespace.
 - `tests/` contains GoogleTest units plus fixtures in `tests/fixtures/`; `Testing/` is an output dir created by test/gauntlet runs.
 - `scripts/` provides helpers such as `run_fastchess_gauntlet.py`.
-- Generated file: `include/c3/magic.hpp` is produced by the `generate_magic` target—never hand-edit.
+- Generated file: `include/c3/magic.hpp` is produced by the `generate_magic` target—never hand-edit. Regenerate with `-DC3_REGENERATE_MAGIC=ON`.
 - Build trees: `build/` (Debug + sanitizers), `build-release/` (Release + LTO), `build-tidy/` (Debug + clang-tidy).
 
 ## Build, Test, and Development Commands
@@ -42,6 +42,6 @@
 ## Release Checklist
 
 - Build Release: `cmake --preset release && cmake --build --preset release`; verify `build-release/c3` exists.
-- Regenerate magics if needed: rebuilding will run `generate_magic`; commit the updated `include/c3/magic.hpp` when it changes.
+- Regenerate magics if needed: configure with `-DC3_REGENERATE_MAGIC=ON` and rebuild; commit the updated `include/c3/magic.hpp` when it changes.
 - Quality gates: `clang-format` over touched files, lint build clean, `ctest --preset tests` green.
 - Optional strength check: run `scripts/run_fastchess_gauntlet.py` against a known baseline and capture the summary in `Testing/fastchess/`; attach the PGN/summary to the release notes or PR.
