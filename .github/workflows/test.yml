@@ -84,9 +84,9 @@ jobs:
         shell: bash
         run: |
           cmake --preset debug \
-            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
-            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
-            ${{ matrix.ninja_path && format('-DCMAKE_MAKE_PROGRAM={0}', matrix.ninja_path) || '' }}
+            -DCMAKE_C_COMPILER="${{ matrix.cc }}" \
+            -DCMAKE_CXX_COMPILER="${{ matrix.cxx }}" \
+            ${{ matrix.ninja_path && format('-DCMAKE_MAKE_PROGRAM="{0}"', matrix.ninja_path) || '' }}
 
       - name: Configure (Debug, cross-compile ARM64)
         if: matrix.cross
