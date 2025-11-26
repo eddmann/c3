@@ -29,14 +29,14 @@ jobs:
           - os: macos
             runner: macos-13
             arch: x64
-            cc: clang
-            cxx: clang++
+            cc: /usr/bin/clang
+            cxx: /usr/bin/clang++
             clang_tools_bin: /usr/local/opt/llvm/bin
           - os: macos
             runner: macos-14
             arch: arm64
-            cc: clang
-            cxx: clang++
+            cc: /usr/bin/clang
+            cxx: /usr/bin/clang++
             clang_tools_bin: /opt/homebrew/opt/llvm/bin
           # - os: windows
           #   runner: windows-latest
