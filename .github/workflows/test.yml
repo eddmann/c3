@@ -31,13 +31,11 @@ jobs:
             arch: x64
             cc: /usr/bin/clang
             cxx: /usr/bin/clang++
-            clang_tools_bin: /usr/local/opt/llvm/bin
           - os: macos
             runner: macos-14
             arch: arm64
             cc: /usr/bin/clang
             cxx: /usr/bin/clang++
-            clang_tools_bin: /opt/homebrew/opt/llvm/bin
           # - os: windows
           #   runner: windows-latest
           #   arch: x64
@@ -69,7 +67,7 @@ jobs:
         if: matrix.os == 'macos'
         run: |
           brew update
-          brew install ninja llvm
+          brew install ninja
 
       - name: Install dependencies (Windows)
         if: matrix.os == 'windows'
@@ -108,7 +106,7 @@ jobs:
         run: ctest --preset tests
 
       - name: Configure (clang-tidy)
-        if: ${{ !matrix.cross }}
+        if: matrix.os == 'linux' && !matrix.cross
         shell: bash
         run: |
           cmake --preset lint \
@@ -116,7 +114,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
 
       - name: Lint (clang-tidy)
-        if: ${{ !matrix.cross }}
+        if: matrix.os == 'linux' && !matrix.cross
         run: cmake --build --preset lint
 
       - name: Check formatting
