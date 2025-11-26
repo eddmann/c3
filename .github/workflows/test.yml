@@ -36,12 +36,12 @@ jobs:
             arch: arm64
             cc: /usr/bin/clang
             cxx: /usr/bin/clang++
-          # - os: windows
-          #   runner: windows-latest
-          #   arch: x64
-          #   cc: clang-cl
-          #   cxx: clang-cl
-          #   clang_tools_bin: 'C:/Program Files/LLVM/bin'
+          - os: windows
+            runner: windows-latest
+            arch: x64
+            cc: clang-cl
+            cxx: clang-cl
+            clang_tools_bin: 'C:/Program Files/LLVM/bin'
 
     steps:
       - name: Checkout
