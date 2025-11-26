@@ -83,6 +83,7 @@ jobs:
 
       - name: Configure (Debug)
         if: ${{ !matrix.cross }}
+        shell: bash
         run: |
           cmake --preset debug \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
@@ -108,6 +109,7 @@ jobs:
 
       - name: Configure (clang-tidy)
         if: ${{ !matrix.cross }}
+        shell: bash
         run: |
           cmake --preset lint \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
