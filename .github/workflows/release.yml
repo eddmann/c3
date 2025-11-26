@@ -28,6 +28,7 @@ jobs:
             arch: x64
             cc: clang
             cxx: clang++
+            linker_flags: '-fuse-ld=lld'
           - os: linux
             runner: ubuntu-latest
             arch: arm64
@@ -58,7 +59,7 @@ jobs:
         if: matrix.os == 'linux' && matrix.arch == 'x64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build clang
+          sudo apt-get install -y ninja-build clang lld
 
       - name: Install dependencies (Linux arm64)
         if: matrix.os == 'linux' && matrix.arch == 'arm64'
@@ -86,7 +87,8 @@ jobs:
           cmake --preset release \
             -DCMAKE_C_COMPILER="${{ matrix.cc }}" \
             -DCMAKE_CXX_COMPILER="${{ matrix.cxx }}" \
-            ${{ matrix.ninja_path && format('-DCMAKE_MAKE_PROGRAM="{0}"', matrix.ninja_path) || '' }}
+            ${{ matrix.ninja_path && format('-DCMAKE_MAKE_PROGRAM="{0}"', matrix.ninja_path) || '' }} \
+            ${{ matrix.linker_flags && format('-DCMAKE_EXE_LINKER_FLAGS="{0}"', matrix.linker_flags) || '' }}
 
       - name: Configure (Release, cross-compile arm64)
         if: matrix.os == 'linux' && matrix.arch == 'arm64'
