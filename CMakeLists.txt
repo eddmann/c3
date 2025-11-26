@@ -8,8 +8,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(C3_ENABLE_CLANG_TIDY "Run clang-tidy during builds" OFF)
-option(C3_ENABLE_ASAN "Enable AddressSanitizer in Debug builds" ON)
-option(C3_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer in Debug builds" ON)
+
+# ASan/UBSan are incompatible with MSVC debug runtime (-MDd) on Windows.
+# Disable sanitizers by default on Windows to avoid the conflict.
+if(WIN32)
+  option(C3_ENABLE_ASAN "Enable AddressSanitizer in Debug builds" OFF)
+  option(C3_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer in Debug builds" OFF)
+else()
+  option(C3_ENABLE_ASAN "Enable AddressSanitizer in Debug builds" ON)
+  option(C3_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer in Debug builds" ON)
+endif()
 
 if(C3_ENABLE_CLANG_TIDY)
   find_program(CLANG_TIDY_EXE NAMES clang-tidy)
