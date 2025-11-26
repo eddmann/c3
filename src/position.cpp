@@ -56,12 +56,12 @@ Position::Position() {
   key = compute_key();
 }
 
-Position::Position(Board board, Colour colour_to_move, CastlingRights castling_rights,
-                   std::optional<Square> en_passant_square, std::uint8_t half_move_clock,
-                   std::uint8_t full_move_counter)
-    : board(board), colour_to_move(colour_to_move), castling_rights(castling_rights),
-      en_passant_square(en_passant_square), half_move_clock(half_move_clock),
-      full_move_counter(full_move_counter) {
+Position::Position(Board board_, Colour colour_to_move_, CastlingRights castling_rights_,
+                   std::optional<Square> en_passant_square_, std::uint8_t half_move_clock_,
+                   std::uint8_t full_move_counter_)
+    : board(board_), colour_to_move(colour_to_move_), castling_rights(castling_rights_),
+      en_passant_square(en_passant_square_), half_move_clock(half_move_clock_),
+      full_move_counter(full_move_counter_) {
   history_.reserve(MAX_HISTORY);
   key = compute_key();
 }
