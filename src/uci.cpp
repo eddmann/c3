@@ -501,9 +501,9 @@ void UciReporter::send(const search::Report& report) {
 
   if (mutex_ != nullptr) {
     std::scoped_lock lock(*mutex_);
-    *out_ << line.str() << std::endl;
+    *out_ << line.str() << '\n' << std::flush;
   } else {
-    *out_ << line.str() << std::endl;
+    *out_ << line.str() << '\n' << std::flush;
   }
 }
 
@@ -549,7 +549,7 @@ void run_loop_impl(std::istream& in,
 
   auto write_line = [&](const std::string& line) {
     std::scoped_lock lock(out_mutex);
-    out << line << std::endl;
+    out << line << '\n' << std::flush;
   };
 
   std::string line;
@@ -666,9 +666,9 @@ void run_loop_impl(std::istream& in,
               const auto best = reporter.best_move();
               std::scoped_lock lock(out_mutex);
               if (best.has_value()) {
-                out << "bestmove " << to_uci_string(*best) << std::endl;
+                out << "bestmove " << to_uci_string(*best) << '\n' << std::flush;
               } else {
-                out << "bestmove (none)" << std::endl;
+                out << "bestmove (none)" << '\n' << std::flush;
               }
             });
 
