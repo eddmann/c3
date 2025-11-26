@@ -361,16 +361,33 @@ TEST(SearchLimits, RespectsNodeLimit) {
 TEST(SearchLimits, StopSignalHalts) {
   Position pos = Position::startpos();
 
-  search::NullReporter reporter;
+  // Use a reporter that tracks when we've completed at least depth 1
+  struct DepthTracker : search::Reporter {
+    std::atomic<std::uint8_t> max_depth{0};
+    void send(const search::Report& report) override {
+      std::uint8_t current = max_depth.load();
+      while (report.depth > current && !max_depth.compare_exchange_weak(current, report.depth)) {
+      }
+    }
+  };
+
+  DepthTracker reporter;
   search::Limits limits;
   limits.depth = 100; // Very deep - would take forever without stop
 
   auto stop_signal = std::make_shared<std::atomic_bool>(false);
 
-  // Start searching in a separate thread and stop it
+  // Start searching in a separate thread, wait for at least depth 1, then stop
   std::thread search_thread([&]() {
-    // Small delay then stop
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Wait for search to complete at least depth 1 (with timeout for safety)
+    auto start = std::chrono::steady_clock::now();
+    while (reporter.max_depth.load() < 1) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      // Timeout after 5 seconds (generous for slow emulation)
+      if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) {
+        break;
+      }
+    }
     stop_signal->store(true);
   });
 
@@ -380,7 +397,7 @@ TEST(SearchLimits, StopSignalHalts) {
 
   // Should have stopped early (not reached depth 100)
   EXPECT_LT(result.depth, 100);
-  // Should still return a valid result
+  // Should still return a valid result (at least depth 1 was completed)
   EXPECT_FALSE(result.pv.empty());
 }
 
