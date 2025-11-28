@@ -435,6 +435,9 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
       switch (entry->bound) {
       case Bound::Exact:
+        if (entry->move.has_value()) {
+          pv.push_back(*entry->move);
+        }
         return tt_eval; // Exact score: we're done
       case Bound::Lower:
         if (tt_eval >= beta) {
