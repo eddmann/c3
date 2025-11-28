@@ -27,8 +27,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from common import (
-    ROOT,
-    build_engine,
+    is_git_ref,
+    get_commit_hash,
+    checkout_and_build,
+    cleanup_worktree,
 )
 
 
@@ -61,60 +63,6 @@ class PerftResult:
   nodes: int
   time_ms: int
   nps: int
-
-
-def is_git_ref(ref: str) -> bool:
-  """Check if ref is a git reference (branch/tag/commit) vs external path."""
-  if Path(ref).exists():
-    return False
-  result = subprocess.run(
-      ["git", "rev-parse", "--verify", ref],
-      cwd=ROOT,
-      capture_output=True,
-  )
-  return result.returncode == 0
-
-
-def get_commit_hash(ref: str) -> str:
-  """Get the short commit hash for a git ref."""
-  result = subprocess.run(
-      ["git", "rev-parse", "--short", ref],
-      cwd=ROOT,
-      capture_output=True,
-      text=True,
-  )
-  return result.stdout.strip() if result.returncode == 0 else ref
-
-
-def checkout_and_build(ref: str, build_dir: Path) -> Path:
-  """Checkout ref to worktree and build release binary."""
-  worktree_dir = build_dir / "src"
-  cmake_build_dir = build_dir / "build"
-
-  print(f"  Checking out {ref}...")
-  subprocess.run(
-      ["git", "worktree", "add", "--detach", str(worktree_dir), ref],
-      cwd=ROOT,
-      check=True,
-      capture_output=True,
-  )
-
-  try:
-    print(f"  Building {ref}...")
-    binary = build_engine(worktree_dir, cmake_build_dir)
-    return binary
-  except subprocess.CalledProcessError as e:
-    raise RuntimeError(f"Build failed for {ref}: {e}") from e
-
-
-def cleanup_worktree(worktree_dir: Path) -> None:
-  """Remove a git worktree."""
-  if worktree_dir.exists():
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(worktree_dir)],
-        cwd=ROOT,
-        capture_output=True,
-    )
 
 
 def run_perft(engine_path: Path, name: str, fen: str, depth: int) -> PerftResult:
@@ -284,6 +232,10 @@ def main() -> None:
       help="Enable CI mode (structured output)",
   )
   args = parser.parse_args()
+
+  # Validate arguments
+  if args.threshold < 0:
+    parser.error("--threshold must be non-negative")
 
   worktrees_to_clean: list[Path] = []
 

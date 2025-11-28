@@ -23,133 +23,24 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 from common import (
-    ROOT,
     FASTCHESS_DIR,
     generate_timestamp,
-    build_engine,
     run,
     elo_from_score,
     elo_error,
     los,
     ensure_fastchess_available,
+    is_git_ref,
+    get_commit_hash,
+    checkout_and_build,
+    cleanup_worktree,
+    parse_pgn_results,
 )
-
-
-def is_git_ref(ref: str) -> bool:
-  """Check if ref is a git reference (branch/tag/commit) vs external path."""
-  if Path(ref).exists():
-    return False
-  result = subprocess.run(
-      ["git", "rev-parse", "--verify", ref],
-      cwd=ROOT,
-      capture_output=True,
-  )
-  return result.returncode == 0
-
-
-def get_commit_hash(ref: str) -> str:
-  """Get the short commit hash for a git ref."""
-  result = subprocess.run(
-      ["git", "rev-parse", "--short", ref],
-      cwd=ROOT,
-      capture_output=True,
-      text=True,
-  )
-  return result.stdout.strip() if result.returncode == 0 else ref
-
-
-def checkout_and_build(ref: str, build_dir: Path) -> Path:
-  """Checkout ref to worktree and build release binary.
-
-  Args:
-    ref: Git reference (branch, tag, or commit hash).
-    build_dir: Directory to place worktree and build artifacts.
-
-  Returns:
-    Path to the built engine binary.
-  """
-  worktree_dir = build_dir / "src"
-  cmake_build_dir = build_dir / "build"
-
-  print(f"  Checking out {ref}...")
-  subprocess.run(
-      ["git", "worktree", "add", "--detach", str(worktree_dir), ref],
-      cwd=ROOT,
-      check=True,
-      capture_output=True,
-  )
-
-  try:
-    print(f"  Building {ref}...")
-    binary = build_engine(worktree_dir, cmake_build_dir)
-    return binary
-  except subprocess.CalledProcessError as e:
-    raise RuntimeError(f"Build failed for {ref}: {e}") from e
-
-
-def cleanup_worktree(worktree_dir: Path) -> None:
-  """Remove a git worktree."""
-  if worktree_dir.exists():
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(worktree_dir)],
-        cwd=ROOT,
-        capture_output=True,
-    )
-
-
-def parse_pgn_results_generic(pgn_path: Path, name_a: str, name_b: str) -> tuple[int, int, int]:
-  """Parse PGN results for arbitrary engine names.
-
-  Args:
-    pgn_path: Path to PGN file.
-    name_a: Name of engine A (test).
-    name_b: Name of engine B (base).
-
-  Returns:
-    Tuple of (wins_a, wins_b, draws).
-  """
-  wins_a = wins_b = draws = 0
-  white = black = result = None
-
-  def flush():
-    nonlocal wins_a, wins_b, draws, white, black, result
-    if white is None or black is None or result is None:
-      return
-    if result == "1-0":
-      if white == name_a:
-        wins_a += 1
-      else:
-        wins_b += 1
-    elif result == "0-1":
-      if black == name_a:
-        wins_a += 1
-      else:
-        wins_b += 1
-    else:
-      draws += 1
-    white = black = result = None
-
-  for line in pgn_path.read_text(encoding="utf-8").splitlines():
-    line = line.strip()
-    if line.startswith("[White "):
-      white = line.split('"')[1]
-    elif line.startswith("[Black "):
-      black = line.split('"')[1]
-    elif line.startswith("[Result "):
-      result = line.split('"')[1]
-    elif line == "":
-      flush()
-
-  flush()
-  return wins_a, wins_b, draws
 
 
 def build_comparison_command(
@@ -191,7 +82,7 @@ def write_comparison_summary(
     ci_mode: bool = False,
 ) -> tuple[str, int]:
   """Write comparison summary and return (summary_text, exit_code)."""
-  wins_test, wins_base, draws = parse_pgn_results_generic(pgn_path, name_test, name_base)
+  wins_test, wins_base, draws = parse_pgn_results(pgn_path, name_test, name_base)
   games = wins_test + wins_base + draws
 
   if games == 0:
@@ -306,6 +197,18 @@ def main() -> None:
       help="Enable CI mode (structured output, exit codes)",
   )
   args = parser.parse_args()
+
+  # Validate arguments
+  if args.games <= 0:
+    parser.error("--games must be positive")
+  if args.depth <= 0:
+    parser.error("--depth must be positive")
+  if args.concurrency <= 0:
+    parser.error("--concurrency must be positive")
+  if args.movetime_ms <= 0:
+    parser.error("--movetime-ms must be positive")
+  if args.external and not args.external.exists():
+    parser.error(f"External engine not found: {args.external}")
 
   ensure_fastchess_available(args.fastchess)
 

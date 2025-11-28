@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Tuple
 
 from common import (
     ROOT,
@@ -34,6 +33,7 @@ from common import (
     elo_from_score,
     elo_error,
     los,
+    parse_pgn_results,
 )
 
 
@@ -71,45 +71,8 @@ def build_fastchess_command(args: argparse.Namespace, mode: str, pgn_path: Path)
   return cmd
 
 
-def parse_pgn_results(pgn_path: Path) -> Tuple[int, int, int]:
-  wins_a = wins_b = draws = 0
-  white = black = result = None
-
-  def flush():
-    nonlocal wins_a, wins_b, draws, white, black, result
-    if white is None or black is None or result is None:
-      return
-    if result == "1-0":
-      if white == "c3":
-        wins_a += 1
-      else:
-        wins_b += 1
-    elif result == "0-1":
-      if black == "c3":
-        wins_a += 1
-      else:
-        wins_b += 1
-    else:
-      draws += 1
-    white = black = result = None
-
-  for line in pgn_path.read_text(encoding="utf-8").splitlines():
-    line = line.strip()
-    if line.startswith("[White "):
-      white = line.split('"')[1]
-    elif line.startswith("[Black "):
-      black = line.split('"')[1]
-    elif line.startswith("[Result "):
-      result = line.split('"')[1]
-    elif line == "":
-      flush()
-
-  flush()
-  return wins_a, wins_b, draws
-
-
 def write_summary(pgn_path: Path, summary_path: Path, label: str, opponent_name: str) -> str:
-  wins_a, wins_b, draws = parse_pgn_results(pgn_path)
+  wins_a, wins_b, draws = parse_pgn_results(pgn_path, name_a="c3")
   games = wins_a + wins_b + draws
   score = (wins_a + 0.5 * draws) / games if games else 0.5
   elo = elo_from_score(score)
@@ -154,6 +117,16 @@ def main() -> None:
 
   args = parser.parse_args()
 
+  # Validate arguments
+  if args.games <= 0:
+    parser.error("--games must be positive")
+  if args.depth <= 0:
+    parser.error("--depth must be positive")
+  if args.concurrency <= 0:
+    parser.error("--concurrency must be positive")
+  if args.movetime_ms <= 0:
+    parser.error("--movetime-ms must be positive")
+
   # Apply timestamped defaults if not explicitly provided
   if args.pgn is None:
     args.pgn = FASTCHESS_DIR / f"games_{timestamp}.pgn"
@@ -165,12 +138,16 @@ def main() -> None:
   FASTCHESS_DIR.mkdir(parents=True, exist_ok=True)
 
   if args.summarize_only:
+    if not args.summarize_only.exists():
+      parser.error(f"PGN file not found: {args.summarize_only}")
     opponent_name = args.opponent_name or "opponent"
     print(write_summary(args.summarize_only, args.summary, label="summary", opponent_name=opponent_name))
     return
 
   if not args.opponent:
     parser.error("--opponent is required when running a gauntlet")
+  if not Path(args.opponent).exists():
+    parser.error(f"Opponent binary not found: {args.opponent}")
 
   ensure_fastchess_available(args.fastchess)
 
@@ -178,6 +155,9 @@ def main() -> None:
   cmd = build_fastchess_command(args, args.mode, args.pgn)
   print("Running fastchess...")
   run(cmd, log_path=args.log)
+
+  if not args.pgn.exists() or args.pgn.stat().st_size == 0:
+    raise RuntimeError(f"fastchess did not create PGN file: {args.pgn}")
 
   summary = write_summary(args.pgn, args.summary, label=f"fastchess ({args.mode})", opponent_name=opponent_name)
   print(summary)
