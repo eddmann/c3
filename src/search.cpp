@@ -22,13 +22,56 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
 #include "c3/piece.hpp"
 
 namespace c3::search {
+
+// ---------------------------------------------------------------------------
+// Global thread count for Lazy SMP
+// ---------------------------------------------------------------------------
+
+namespace {
+std::atomic<std::size_t> THREAD_COUNT{DEFAULT_THREADS};
+} // namespace
+
+void ThreadPool::set_thread_count(std::size_t count) {
+  if (count < MIN_THREADS) {
+    count = MIN_THREADS;
+  }
+  if (count > MAX_THREADS) {
+    count = MAX_THREADS;
+  }
+  THREAD_COUNT.store(count, std::memory_order_release);
+}
+
+std::size_t ThreadPool::thread_count() {
+  return THREAD_COUNT.load(std::memory_order_acquire);
+}
+
+ThreadPool::ThreadPool() = default;
+ThreadPool::~ThreadPool() = default;
+
+void ThreadPool::resize(std::size_t num_threads) {
+  if (num_threads < MIN_THREADS) {
+    num_threads = MIN_THREADS;
+  }
+  if (num_threads > MAX_THREADS) {
+    num_threads = MAX_THREADS;
+  }
+  num_threads_ = num_threads;
+}
+
+std::size_t ThreadPool::size() const {
+  return num_threads_;
+}
+
 namespace {
 
 // =============================================================================
@@ -174,12 +217,90 @@ bool Stopper::should_stop(const Report& report) const {
 }
 
 // ---------------------------------------------------------------------------
-// Transposition table
+// Transposition table - Thread-safe implementation using atomics
 // ---------------------------------------------------------------------------
+
+// AtomicTTEntry copy constructor
+AtomicTTEntry::AtomicTTEntry(const AtomicTTEntry& other) noexcept
+    : key(other.key.load(std::memory_order_relaxed)),
+      depth(other.depth.load(std::memory_order_relaxed)),
+      bound(other.bound.load(std::memory_order_relaxed)),
+      eval(other.eval.load(std::memory_order_relaxed)),
+      move_data(other.move_data.load(std::memory_order_relaxed)) {}
+
+// AtomicTTEntry assignment operator
+AtomicTTEntry& AtomicTTEntry::operator=(const AtomicTTEntry& other) noexcept {
+  if (this != &other) {
+    key.store(other.key.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    depth.store(other.depth.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    bound.store(other.bound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    eval.store(other.eval.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    move_data.store(other.move_data.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  }
+  return *this;
+}
+
+// Pack a move into a 32-bit value
+std::uint32_t pack_move(const Move& mv) {
+  std::uint32_t data = 0;
+  data |= static_cast<std::uint32_t>(mv.from.index());
+  data |= static_cast<std::uint32_t>(mv.to.index()) << 6;
+  data |= static_cast<std::uint32_t>(mv.piece) << 12;
+  if (mv.captured_piece.has_value()) {
+    data |= (static_cast<std::uint32_t>(*mv.captured_piece) + 1) << 16;
+  }
+  if (mv.promotion_piece.has_value()) {
+    data |= (static_cast<std::uint32_t>(*mv.promotion_piece) + 1) << 20;
+  }
+  if (mv.is_en_passant) {
+    data |= 1U << 24;
+  }
+  // Set valid flag
+  data |= 1U << 31;
+  return data;
+}
+
+// Helper to create Square from index (using public interface)
+Square square_from_index(std::uint8_t idx) {
+  const auto file = static_cast<std::uint8_t>(idx & 7);
+  const auto rank = static_cast<std::uint8_t>(idx >> 3);
+  return Square::from_file_and_rank(file, rank);
+}
+
+// Unpack a 32-bit value into a move
+std::optional<Move> unpack_move(std::uint32_t data) {
+  if ((data & (1U << 31)) == 0) {
+    return std::nullopt;  // Invalid/empty move
+  }
+
+  Move mv{};
+  mv.from = square_from_index(static_cast<std::uint8_t>(data & 0x3F));
+  mv.to = square_from_index(static_cast<std::uint8_t>((data >> 6) & 0x3F));
+  mv.piece = static_cast<Piece>((data >> 12) & 0xF);
+
+  const auto captured = (data >> 16) & 0xF;
+  if (captured != 0) {
+    mv.captured_piece = static_cast<Piece>(captured - 1);
+  }
+
+  const auto promo = (data >> 20) & 0xF;
+  if (promo != 0) {
+    mv.promotion_piece = static_cast<Piece>(promo - 1);
+  }
+
+  mv.is_en_passant = ((data >> 24) & 1) != 0;
+
+  return mv;
+}
+
+namespace {
+// Thread-local storage for probe result to avoid returning dangling pointer
+thread_local TTEntry tl_probe_result;
+} // namespace
 
 TranspositionTable::TranspositionTable() {
   const std::size_t size_bytes = size_mb() * 1024 * 1024;
-  std::size_t capacity = size_bytes / sizeof(TTEntry);
+  std::size_t capacity = size_bytes / sizeof(AtomicTTEntry);
 
   // nearest lower power of two
   std::size_t pow2 = 1;
@@ -191,15 +312,31 @@ TranspositionTable::TranspositionTable() {
   }
 
   capacity_ = pow2;
-  entries_.assign(capacity_, TTEntry{});
+  entries_.resize(capacity_);
 }
 
 const TTEntry* TranspositionTable::probe(std::uint64_t key) const {
   const auto& entry = entries_[key & (capacity_ - 1)];
-  if (entry.key == key) {
-    return &entry;
+
+  // Load key first
+  const auto stored_key = entry.key.load(std::memory_order_relaxed);
+  if (stored_key != key) {
+    return nullptr;
   }
-  return nullptr;
+
+  // Load all data with relaxed ordering
+  tl_probe_result.key = stored_key;
+  tl_probe_result.depth = entry.depth.load(std::memory_order_relaxed);
+  tl_probe_result.bound = static_cast<Bound>(entry.bound.load(std::memory_order_relaxed));
+  tl_probe_result.eval = entry.eval.load(std::memory_order_relaxed);
+  tl_probe_result.move = unpack_move(entry.move_data.load(std::memory_order_relaxed));
+
+  // Verify key hasn't changed (detect torn reads)
+  if (entry.key.load(std::memory_order_relaxed) != key) {
+    return nullptr;
+  }
+
+  return &tl_probe_result;
 }
 
 void TranspositionTable::store(std::uint64_t key, std::uint8_t depth, int eval, Bound bound,
@@ -207,16 +344,33 @@ void TranspositionTable::store(std::uint64_t key, std::uint8_t depth, int eval, 
   const auto index = key & (capacity_ - 1);
   auto& entry = entries_[index];
 
-  if (depth >= entry.depth) {
-    if (entry.key == 0) {
-      ++usage_;
+  const auto stored_depth = entry.depth.load(std::memory_order_relaxed);
+  if (depth >= stored_depth) {
+    const auto old_key = entry.key.load(std::memory_order_relaxed);
+    if (old_key == 0) {
+      usage_.fetch_add(1, std::memory_order_relaxed);
     }
-    entry.key = key;
-    entry.depth = depth;
-    entry.eval = eval;
-    entry.bound = bound;
-    entry.move = move;
+
+    // Store data first, then key (key acts as validation)
+    entry.depth.store(depth, std::memory_order_relaxed);
+    entry.bound.store(static_cast<std::uint8_t>(bound), std::memory_order_relaxed);
+    entry.eval.store(static_cast<std::int16_t>(std::clamp(eval, -32000, 32000)),
+                     std::memory_order_relaxed);
+    entry.move_data.store(move.has_value() ? pack_move(*move) : 0, std::memory_order_relaxed);
+    // Key written last to ensure data is visible when key matches
+    entry.key.store(key, std::memory_order_release);
   }
+}
+
+void TranspositionTable::clear() {
+  for (auto& entry : entries_) {
+    entry.key.store(0, std::memory_order_relaxed);
+    entry.depth.store(0, std::memory_order_relaxed);
+    entry.bound.store(0, std::memory_order_relaxed);
+    entry.eval.store(0, std::memory_order_relaxed);
+    entry.move_data.store(0, std::memory_order_relaxed);
+  }
+  usage_.store(0, std::memory_order_relaxed);
 }
 
 void TranspositionTable::set_size_mb(std::size_t size_mb) {
@@ -642,14 +796,27 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 // are in the final iteration (exponential growth of the tree).
 // ---------------------------------------------------------------------------
 
-SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
-                    std::shared_ptr<std::atomic_bool> stop_signal) {
-  Stopper stopper(std::move(stop_signal));
-  stopper.at_depth(limits.depth);
-  stopper.at_nodes(limits.nodes);
-  stopper.at_elapsed(limits.time);
+namespace {
 
-  TranspositionTable tt;
+// Worker function for a single search thread (used by both main thread and helpers)
+// Returns the search result for this thread
+struct ThreadResult {
+  std::uint8_t depth{0};
+  int eval{0};
+  MoveList pv{};
+  std::uint64_t nodes{0};
+};
+
+void search_worker(Position pos, const Limits& limits, TranspositionTable& tt,
+                   std::atomic<std::uint64_t>& shared_nodes,
+                   std::shared_ptr<std::atomic_bool> stop_signal, std::size_t thread_id,
+                   ThreadResult& result, Reporter* reporter) {
+  Stopper stopper(stop_signal);
+  stopper.at_depth(limits.depth);
+  stopper.at_elapsed(limits.time);
+  stopper.at_nodes(limits.nodes);
+
+  // Each thread has its own killers (thread-local state)
   KillerMoves killers;
   Report report;
 
@@ -659,7 +826,16 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
   MoveList best_pv;
   std::uint8_t best_depth = 0;
 
-  for (std::uint8_t depth = 1; depth <= max_depth; ++depth) {
+  // Helper threads start at slightly different depths to increase divergence
+  // Thread 0 starts at depth 1, thread 1 at depth 2, etc. (capped at max_depth)
+  std::uint8_t start_depth = 1;
+  if (thread_id > 0) {
+    // Helper threads skip some depths or start deeper to diverge
+    start_depth = static_cast<std::uint8_t>(std::min(static_cast<std::size_t>(max_depth),
+                                                     1 + (thread_id % 4)));
+  }
+
+  for (std::uint8_t depth = start_depth; depth <= max_depth; ++depth) {
     MoveList pv;
 
     const bool do_aspiration =
@@ -667,6 +843,12 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
 
     int delta_low = ASPIRATION_WINDOW_INITIAL_DELTA;
     int delta_high = ASPIRATION_WINDOW_INITIAL_DELTA;
+
+    // Helper threads use slightly offset aspiration windows for more divergence
+    if (thread_id > 0) {
+      delta_low += static_cast<int>(thread_id * 5);
+      delta_high += static_cast<int>(thread_id * 5);
+    }
 
     int alpha = do_aspiration ? std::max(CENTIPAWN_MIN, last_eval - delta_low) : CENTIPAWN_MIN;
     int beta = do_aspiration ? std::min(CENTIPAWN_MAX, last_eval + delta_high) : CENTIPAWN_MAX;
@@ -679,7 +861,6 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
       const int eval = detail::alphabeta(pos, depth, alpha, beta, pv, tt, killers, report, stopper);
 
       // Accept result if: within bounds, stopped, or already using full window
-      // (full window means we can't widen further, so accept whatever we get)
       if ((eval > alpha && eval < beta) || stopper.should_stop(report) || using_full_window) {
         eval_final = eval;
         break;
@@ -713,17 +894,84 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
     best_pv = sanitised_pv;
     best_depth = depth;
 
-    report.depth = depth;
-    report.pv = std::make_pair(sanitised_pv, sanitised_eval);
-    report.tt_stats = {tt.usage(), tt.capacity()};
-    reporter.send(report);
+    // Only the main thread (thread 0) reports progress
+    if (thread_id == 0 && reporter != nullptr) {
+      report.depth = depth;
+      report.pv = std::make_pair(sanitised_pv, sanitised_eval);
+      report.tt_stats = {tt.usage(), tt.capacity()};
+      reporter->send(report);
+    }
   }
 
-  SearchResult result;
+  // Update shared node count with this thread's contribution
+  shared_nodes.fetch_add(report.nodes, std::memory_order_relaxed);
+
   result.depth = best_depth;
   result.eval = last_eval;
   result.pv = best_pv;
   result.nodes = report.nodes;
+}
+
+} // namespace
+
+SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
+                    std::shared_ptr<std::atomic_bool> stop_signal) {
+  const std::size_t num_threads = ThreadPool::thread_count();
+
+  // Shared transposition table for all threads
+  TranspositionTable tt;
+
+  // Shared node counter for accurate statistics
+  std::atomic<std::uint64_t> shared_nodes{0};
+
+  // Create or use stop signal
+  auto stop = stop_signal ? stop_signal : std::make_shared<std::atomic_bool>(false);
+
+  // Results from each thread
+  std::vector<ThreadResult> results(num_threads);
+
+  if (num_threads == 1) {
+    // Single-threaded path (no overhead of thread creation)
+    search_worker(pos, limits, tt, shared_nodes, stop, 0, results[0], &reporter);
+  } else {
+    // Multi-threaded Lazy SMP
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads - 1);
+
+    // Launch helper threads (1 to N-1)
+    for (std::size_t i = 1; i < num_threads; ++i) {
+      threads.emplace_back([&, i]() {
+        search_worker(pos, limits, tt, shared_nodes, stop, i, results[i], nullptr);
+      });
+    }
+
+    // Main thread (thread 0) runs in this thread and reports progress
+    search_worker(pos, limits, tt, shared_nodes, stop, 0, results[0], &reporter);
+
+    // Signal all threads to stop
+    stop->store(true, std::memory_order_release);
+
+    // Wait for all helper threads to finish
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+
+  // Select the best result: prefer the deepest search that completed
+  // In Lazy SMP, helper threads may reach deeper depths due to different
+  // search paths and timing. Use their result if deeper.
+  const ThreadResult* best_result = &results[0];
+  for (std::size_t i = 1; i < num_threads; ++i) {
+    if (!results[i].pv.empty() && results[i].depth > best_result->depth) {
+      best_result = &results[i];
+    }
+  }
+
+  SearchResult result;
+  result.depth = best_result->depth;
+  result.eval = best_result->eval;
+  result.pv = best_result->pv;
+  result.nodes = shared_nodes.load(std::memory_order_relaxed);
   result.hashfull = static_cast<std::uint32_t>(
       result.nodes == 0 || tt.capacity() == 0 ? 0 : (tt.usage() * 1000) / tt.capacity());
 

@@ -307,6 +307,19 @@ SetOptionCommand parse_setoption(
     } catch (...) {
       throw std::runtime_error("could not parse value for 'hash' option");
     }
+  } else if (name == "threads") {
+    if (!option.value.has_value()) {
+      throw std::runtime_error("missing value for 'threads' option");
+    }
+
+    try {
+      const std::size_t threads = std::stoull(*option.value);
+      if (threads < search::MIN_THREADS || threads > search::MAX_THREADS) {
+        throw std::runtime_error("invalid value for 'threads' option");
+      }
+    } catch (...) {
+      throw std::runtime_error("could not parse value for 'threads' option");
+    }
   } else {
     throw std::runtime_error("unknown option '" + name + "'");
   }
@@ -569,6 +582,10 @@ void run_loop_impl(std::istream& in,
                    std::to_string(search::TT_DEFAULT_SIZE_MB) + " min " +
                    std::to_string(search::TT_MIN_SIZE_MB) + " max " +
                    std::to_string(search::TT_MAX_SIZE_MB));
+        write_line("option name Threads type spin default " +
+                   std::to_string(search::DEFAULT_THREADS) + " min " +
+                   std::to_string(search::MIN_THREADS) + " max " +
+                   std::to_string(search::MAX_THREADS));
         write_line("uciok");
         break;
 
@@ -683,6 +700,8 @@ void run_loop_impl(std::istream& in,
         }
         if (cmd.option->name == "hash") {
           engine.set_hash_size_mb(std::stoull(cmd.option->value.value()));
+        } else if (cmd.option->name == "threads") {
+          search::ThreadPool::set_thread_count(std::stoull(cmd.option->value.value()));
         }
         break;
 
@@ -732,6 +751,10 @@ std::string run_script_for_test(
                  std::to_string(search::TT_DEFAULT_SIZE_MB) + " min " +
                  std::to_string(search::TT_MIN_SIZE_MB) + " max " +
                  std::to_string(search::TT_MAX_SIZE_MB));
+      write_line("option name Threads type spin default " +
+                 std::to_string(search::DEFAULT_THREADS) + " min " +
+                 std::to_string(search::MIN_THREADS) + " max " +
+                 std::to_string(search::MAX_THREADS));
       write_line("uciok");
       break;
 
@@ -819,6 +842,8 @@ std::string run_script_for_test(
     case CommandType::SetOption:
       if (cmd.option->name == "hash" && cmd.option->value.has_value()) {
         search::TranspositionTable::set_size_mb(std::stoull(*cmd.option->value));
+      } else if (cmd.option->name == "threads" && cmd.option->value.has_value()) {
+        search::ThreadPool::set_thread_count(std::stoull(*cmd.option->value));
       }
       break;
 
