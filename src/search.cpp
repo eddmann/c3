@@ -676,6 +676,44 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
   KillerMoves killers;
   Report report;
 
+  // ROOT TABLEBASE PROBE
+  // At the root, use DTZ probing to find the optimal move in endgame positions.
+  // DTZ gives us perfect knowledge of the game outcome and the fastest path to
+  // victory (or slowest path to defeat).
+  if (tablebase::is_probeable(pos)) {
+    // Generate legal moves by filtering pseudo-legal moves
+    MoveList legal_moves;
+    for (const auto& mv : pseudo_legal_moves(pos)) {
+      Position copy = pos;
+      copy.make_move(mv);
+      if (!is_in_check(pos.colour_to_move, copy.board)) {
+        legal_moves.push_back(mv);
+      }
+    }
+
+    if (auto root_moves = tablebase::get_tablebase().probe_root(pos, legal_moves)) {
+      if (!root_moves->empty()) {
+        const auto& best = root_moves->front();
+        const int tb_eval = tablebase::wdl_to_centipawns(best.dtz_result.wdl);
+
+        SearchResult result;
+        result.depth = 1;
+        result.eval = tb_eval;
+        result.pv = {best.move};
+        result.nodes = 1;
+        result.hashfull = 0;
+
+        // Report the tablebase result
+        report.depth = 1;
+        report.nodes = 1;
+        report.pv = std::make_pair(result.pv, tb_eval);
+        reporter.send(report);
+
+        return result;
+      }
+    }
+  }
+
   const std::uint8_t max_depth = limits.depth.has_value() ? *limits.depth : MAX_DEPTH;
 
   int last_eval = 0;

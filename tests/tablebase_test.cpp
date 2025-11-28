@@ -435,3 +435,57 @@ TEST_F(SearchWithTablebaseTest, DoesNotProbeWithCastlingRights) {
 
   EXPECT_FALSE(result.pv.empty());
 }
+
+TEST_F(SearchWithTablebaseTest, UsesRootProbeForOptimalMove) {
+  // KP vs K endgame (3 pieces, no castling)
+  Position pos = parse("8/8/8/8/8/4k3/4P3/4K3 w - - 0 1");
+
+  // Configure stub to return a ranked list of root moves
+  // Create a move (e2e4 as an example winning move)
+  Move winning_move;
+  winning_move.piece = Piece::WP;
+  winning_move.from = Square::E2;
+  winning_move.to = Square::E4;
+
+  std::vector<tb::RootMove> root_moves = {
+      {winning_move, tb::DtzResult{tb::WdlResult::Win, 10}},
+  };
+  stub_->set_root_result(root_moves);
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 10; // High depth that would take time without TB
+
+  const auto result = search::search(pos, limits, reporter);
+
+  // Should return immediately with the tablebase move
+  EXPECT_EQ(result.pv.size(), 1);
+  EXPECT_EQ(result.pv[0].from, Square::E2);
+  EXPECT_EQ(result.pv[0].to, Square::E4);
+  EXPECT_EQ(result.eval, tb::wdl_to_centipawns(tb::WdlResult::Win));
+  EXPECT_EQ(result.nodes, 1); // Only counted the probe, no search
+}
+
+TEST_F(SearchWithTablebaseTest, RootProbeDrawReturnsZeroEval) {
+  // Simple drawn endgame
+  Position pos = parse("8/8/8/4k3/8/4K3/8/8 w - - 0 1");
+
+  // Configure stub to return a draw
+  Move draw_move;
+  draw_move.piece = Piece::WK;
+  draw_move.from = Square::E3;
+  draw_move.to = Square::E2;
+
+  std::vector<tb::RootMove> root_moves = {
+      {draw_move, tb::DtzResult{tb::WdlResult::Draw, 0}},
+  };
+  stub_->set_root_result(root_moves);
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 5;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  EXPECT_EQ(result.eval, 0); // Draw should be 0
+}

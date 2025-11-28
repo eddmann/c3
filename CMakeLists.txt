@@ -1,13 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(c3 LANGUAGES CXX)
+project(c3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(FetchContent)
+
 option(C3_ENABLE_CLANG_TIDY "Run clang-tidy during builds" OFF)
+option(C3_ENABLE_SYZYGY "Enable Syzygy tablebase support via Fathom" ON)
 
 # ASan/UBSan are incompatible with MSVC debug runtime (-MDd) on Windows.
 # Disable sanitizers by default on Windows to avoid the conflict.
@@ -81,6 +84,39 @@ else()
   add_custom_target(generate_magic)
 endif()
 
+# =============================================================================
+# Fathom Syzygy Tablebase Library
+# =============================================================================
+if(C3_ENABLE_SYZYGY)
+  FetchContent_Declare(
+    fathom
+    GIT_REPOSITORY https://github.com/jdart1/Fathom.git
+    GIT_TAG master
+  )
+  FetchContent_MakeAvailable(fathom)
+
+  # Build Fathom as a static library
+  add_library(fathom_lib STATIC
+    ${fathom_SOURCE_DIR}/src/tbprobe.c
+  )
+  target_include_directories(fathom_lib PUBLIC ${fathom_SOURCE_DIR}/src)
+
+  # Fathom requires these compile definitions
+  target_compile_definitions(fathom_lib PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+  )
+
+  # Disable warnings for third-party C code
+  if(NOT MSVC)
+    target_compile_options(fathom_lib PRIVATE -w)
+  endif()
+
+  # Skip clang-tidy on Fathom
+  if(CMAKE_CXX_CLANG_TIDY)
+    set_target_properties(fathom_lib PROPERTIES C_CLANG_TIDY "")
+  endif()
+endif()
+
 add_library(c3_core STATIC
   src/about.cpp
   src/eval.cpp
@@ -96,6 +132,11 @@ target_compile_definitions(c3_core PUBLIC C3_TESTING)
 add_dependencies(c3_core generate_magic)
 target_include_directories(c3_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
 c3_apply_standard_settings(c3_core)
+
+if(C3_ENABLE_SYZYGY)
+  target_link_libraries(c3_core PUBLIC fathom_lib)
+  target_compile_definitions(c3_core PUBLIC C3_USE_FATHOM)
+endif()
 
 add_executable(c3
   src/main.cpp
