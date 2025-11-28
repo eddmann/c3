@@ -215,6 +215,26 @@ TEST(UciParse, SetOptionHashValidRange) {
   EXPECT_EQ(max_cmd.option->value, "4096");
 }
 
+TEST(UciParse, SetOptionThreadsValidRange) {
+  // Min boundary
+  const auto min_cmd = uci::parse_command("setoption name Threads value 1");
+  ASSERT_EQ(min_cmd.type, uci::CommandType::SetOption);
+  ASSERT_TRUE(min_cmd.option.has_value());
+  EXPECT_EQ(min_cmd.option->name, "threads");
+  EXPECT_EQ(min_cmd.option->value, "1");
+
+  // Max boundary
+  const auto max_cmd = uci::parse_command("setoption name Threads value 256");
+  ASSERT_EQ(max_cmd.type, uci::CommandType::SetOption);
+  EXPECT_EQ(max_cmd.option->value, "256");
+
+  // Out of range (too high) should throw
+  EXPECT_THROW(uci::parse_command("setoption name Threads value 257"), std::runtime_error);
+
+  // Out of range (0) should throw
+  EXPECT_THROW(uci::parse_command("setoption name Threads value 0"), std::runtime_error);
+}
+
 TEST(UciParse, SetOptionUnknownThrows) {
   EXPECT_THROW(uci::parse_command("setoption name UnknownOption value 123"), std::runtime_error);
 }

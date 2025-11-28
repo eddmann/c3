@@ -48,6 +48,11 @@
 //      Use narrow alpha-beta windows based on the previous iteration's score.
 //      If the score is stable, this drastically reduces the search tree.
 //
+//   7. LAZY SMP (Symmetric Multi-Processing)
+//      Multiple threads search the same position simultaneously, sharing a
+//      transposition table. Threads naturally diverge due to TT interactions,
+//      effectively exploring different parts of the search tree.
+//
 // =============================================================================
 
 #include <array>
@@ -161,6 +166,34 @@ struct TTEntry {
   std::optional<Move> move{}; // Best move found (for move ordering)
 };
 
+// ---------------------------------------------------------------------------
+// Thread-Safe Transposition Table Entry
+// ---------------------------------------------------------------------------
+// For Lazy SMP, we need lock-free concurrent access. We pack the entry data
+// into atomic-friendly fields and use relaxed memory ordering for maximum
+// performance. The key is used to detect collisions and torn reads.
+//
+// Packed Entry Layout (16 bytes total, aligned for cache efficiency):
+//   - key:      64 bits (Zobrist hash, used for verification)
+//   - depth:    8 bits
+//   - bound:    8 bits
+//   - eval:     16 bits (clamped to int16_t range)
+//   - move:     32 bits packed (from:8, to:8, piece:4, captured:4, promo:4, flags:4)
+// ---------------------------------------------------------------------------
+
+struct alignas(16) AtomicTTEntry {
+  std::atomic<std::uint64_t> key{0};
+  std::atomic<std::uint8_t> depth{0};
+  std::atomic<std::uint8_t> bound{0};  // 0=Exact, 1=Lower, 2=Upper
+  std::atomic<std::int16_t> eval{0};
+  std::atomic<std::uint32_t> move_data{0};  // Packed move representation
+
+  AtomicTTEntry() = default;
+  AtomicTTEntry(const AtomicTTEntry& other) noexcept;
+  AtomicTTEntry& operator=(const AtomicTTEntry& other) noexcept;
+  ~AtomicTTEntry() = default;
+};
+
 class TranspositionTable {
 public:
   TranspositionTable();
@@ -169,7 +202,9 @@ public:
   void store(std::uint64_t key, std::uint8_t depth, int eval, Bound bound,
              std::optional<Move> move);
 
-  [[nodiscard]] std::size_t usage() const { return usage_; }
+  void clear();
+
+  [[nodiscard]] std::size_t usage() const { return usage_.load(std::memory_order_relaxed); }
   [[nodiscard]] std::size_t capacity() const { return capacity_; }
 
   static void set_size_mb(std::size_t size_mb);
@@ -177,8 +212,47 @@ public:
 
 private:
   std::size_t capacity_{0};
-  std::size_t usage_{0};
-  std::vector<TTEntry> entries_;
+  std::atomic<std::size_t> usage_{0};
+  std::vector<AtomicTTEntry> entries_;
+};
+
+// ---------------------------------------------------------------------------
+// Thread Pool for Lazy SMP
+// ---------------------------------------------------------------------------
+// Manages a pool of search threads. Each thread runs the same search algorithm
+// independently, sharing only the transposition table. Threads diverge
+// naturally due to TT interactions and different timings.
+//
+// Configuration:
+//   - MIN_THREADS: 1 (single-threaded mode)
+//   - MAX_THREADS: 256 (per UCI spec)
+//   - Default: 1 thread
+// ---------------------------------------------------------------------------
+
+inline constexpr std::size_t MIN_THREADS = 1;
+inline constexpr std::size_t MAX_THREADS = 256;
+inline constexpr std::size_t DEFAULT_THREADS = 1;
+
+class ThreadPool {
+public:
+  ThreadPool();
+  ~ThreadPool();
+
+  // Non-copyable, non-movable
+  ThreadPool(const ThreadPool&) = delete;
+  ThreadPool& operator=(const ThreadPool&) = delete;
+  ThreadPool(ThreadPool&&) = delete;
+  ThreadPool& operator=(ThreadPool&&) = delete;
+
+  void resize(std::size_t num_threads);
+  [[nodiscard]] std::size_t size() const;
+
+  // Global thread count configuration (used by search)
+  static void set_thread_count(std::size_t count);
+  [[nodiscard]] static std::size_t thread_count();
+
+private:
+  std::size_t num_threads_{1};
 };
 
 // ---------------------------------------------------------------------------
