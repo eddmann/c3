@@ -94,6 +94,32 @@ constexpr int FUTILITY_MARGIN[] = {0, 100, 300}; // margins for depth 0, 1, 2
 constexpr int FUTILITY_DEPTH = 2;
 
 // =============================================================================
+// LATE-MOVE REDUCTIONS (LMR)
+// =============================================================================
+// Moves ordered late in the move list are statistically less likely to be good.
+// LMR reduces the search depth for these "late" quiet moves. If the reduced
+// search unexpectedly improves alpha, we re-search at full depth to confirm.
+//
+// This dramatically reduces tree size with minimal accuracy loss, as good move
+// ordering means the best moves are usually searched first.
+//
+// Parameters:
+//   - LMR_MIN_DEPTH: Don't reduce at shallow depths (tactics are critical)
+//   - LMR_MOVE_THRESHOLD: First N moves searched at full depth
+//   - LMR_REDUCTION: Depth reduction amount (conservative = 1)
+// =============================================================================
+constexpr std::uint8_t LMR_MIN_DEPTH = 3;
+constexpr std::size_t LMR_MOVE_THRESHOLD = 4;
+constexpr std::uint8_t LMR_REDUCTION = 1;
+
+// Check if a move is a killer move at the given ply
+bool is_killer_move(const Move& mv, const KillerMoves& killers, std::uint8_t ply) {
+  const auto killer1 = killers.probe(ply, 0);
+  const auto killer2 = killers.probe(ply, 1);
+  return (killer1.has_value() && mv == *killer1) || (killer2.has_value() && mv == *killer2);
+}
+
+// =============================================================================
 // MVV-LVA: Most Valuable Victim - Least Valuable Attacker
 // =============================================================================
 // The best captures tend to be: high-value pieces captured by low-value pieces.
@@ -494,6 +520,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
   bool has_searched_one = false;
   Bound tt_bound = Bound::Upper;
+  std::size_t moves_searched = 0; // Track legal moves searched for LMR
 
   if (tt_move.has_value()) {
     pos.make_move(*tt_move);
@@ -521,6 +548,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     }
 
     has_searched_one = true;
+    moves_searched = 1; // TT move counts as first move searched
   }
 
   // Static evaluation for futility pruning (only compute at shallow depths when not in check)
@@ -552,28 +580,54 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       continue;
     }
 
+    // Check if move gives check (for LMR decision)
+    const bool gives_check = is_in_check(pos.colour_to_move, pos.board);
+
     report.ply += 1;
+    ++moves_searched;
 
     MoveList child_pv;
     int eval;
 
-    // PRINCIPAL VARIATION SEARCH (PVS)
+    // PRINCIPAL VARIATION SEARCH (PVS) with LATE-MOVE REDUCTIONS (LMR)
     // After searching the first move (assumed best due to move ordering),
     // search remaining moves with a "zero window" (alpha, alpha+1). This is
     // faster but only proves "this move is worse than alpha" or "better".
     //
-    // If a move beats alpha in the zero-window search, it might be a new best
-    // move—re-search with the full window to get the true score.
+    // LMR reduces search depth for late quiet moves that are unlikely to be
+    // best. If the reduced search unexpectedly improves alpha, re-search
+    // at full depth to get the true score.
     if (has_searched_one) {
-      MoveList zero_window_pv;
-      // Zero-window: just checking if move can beat alpha
-      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
-                        zero_window_pv, tt, killers, report, stopper);
+      // LMR: Check if this move qualifies for depth reduction
+      const bool is_quiet = !mv.captured_piece.has_value() && !mv.promotion_piece.has_value();
+      const bool is_killer = is_killer_move(mv, killers, report.ply - 1);
 
-      // Re-search with full window if zero-window found a potential improvement
-      if (eval > alpha && eval < beta) {
-        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
-                          killers, report, stopper);
+      const bool can_reduce = depth >= LMR_MIN_DEPTH && moves_searched > LMR_MOVE_THRESHOLD &&
+                              is_quiet && !gives_check && !is_killer && !in_check;
+
+      if (can_reduce) {
+        // LMR: Search with reduced depth first (zero window)
+        const auto reduced_depth = static_cast<std::uint8_t>(depth - 1 - LMR_REDUCTION);
+        MoveList lmr_pv;
+        eval = -alphabeta(pos, reduced_depth, -alpha - 1, -alpha, lmr_pv, tt, killers, report,
+                          stopper);
+
+        // If reduced search beats alpha, re-search at full depth
+        if (eval > alpha) {
+          eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
+                            killers, report, stopper);
+        }
+      } else {
+        // Standard PVS: zero-window search first
+        MoveList zero_window_pv;
+        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
+                          zero_window_pv, tt, killers, report, stopper);
+
+        // Re-search with full window if zero-window found a potential improvement
+        if (eval > alpha && eval < beta) {
+          eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
+                            killers, report, stopper);
+        }
       }
     } else {
       // First move: search with full window
