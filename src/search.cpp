@@ -957,14 +957,20 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
     }
   }
 
-  // Use the result from the main thread (thread 0)
-  // In Lazy SMP, the main thread typically has the most complete result
-  const auto& main_result = results[0];
+  // Select the best result: prefer the deepest search that completed
+  // In Lazy SMP, helper threads may reach deeper depths due to different
+  // search paths and timing. Use their result if deeper.
+  const ThreadResult* best_result = &results[0];
+  for (std::size_t i = 1; i < num_threads; ++i) {
+    if (!results[i].pv.empty() && results[i].depth > best_result->depth) {
+      best_result = &results[i];
+    }
+  }
 
   SearchResult result;
-  result.depth = main_result.depth;
-  result.eval = main_result.eval;
-  result.pv = main_result.pv;
+  result.depth = best_result->depth;
+  result.eval = best_result->eval;
+  result.pv = best_result->pv;
   result.nodes = shared_nodes.load(std::memory_order_relaxed);
   result.hashfull = static_cast<std::uint32_t>(
       result.nodes == 0 || tt.capacity() == 0 ? 0 : (tt.usage() * 1000) / tt.capacity());
