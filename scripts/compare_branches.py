@@ -30,8 +30,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Import reusable functions from the gauntlet script
-from run_fastchess_gauntlet import (
+from common import (
     ROOT,
     FASTCHESS_DIR,
     generate_timestamp,

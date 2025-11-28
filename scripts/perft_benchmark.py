@@ -26,8 +26,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-# Import reusable functions from the gauntlet script
-from run_fastchess_gauntlet import (
+from common import (
     ROOT,
     build_engine,
 )
