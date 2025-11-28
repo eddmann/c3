@@ -41,7 +41,7 @@ jobs:
         run: |
           cd scripts
           python3 perft_benchmark.py \
-            --base ${{ github.base_ref }} \
+            --base origin/${{ github.base_ref }} \
             --test HEAD \
             --threshold 5.0 \
             | tee ../perft.txt
@@ -122,7 +122,7 @@ jobs:
         run: |
           cd scripts
           python3 compare_branches.py \
-            --base ${{ github.base_ref }} \
+            --base origin/${{ github.base_ref }} \
             --test HEAD \
             --games ${{ inputs.games || '200' }} \
             --depth ${{ inputs.depth || '5' }} \
