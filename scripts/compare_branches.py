@@ -23,6 +23,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -58,7 +59,7 @@ def build_comparison_command(
       else [f"st={args.movetime_ms / 1000:.3f}"]
   )
 
-  return [
+  cmd = [
       args.fastchess,
       "-tournament", "gauntlet",
       "-seeds", "1",
@@ -71,6 +72,13 @@ def build_comparison_command(
       "-each", "proto=uci", *time_conf,
       "-recover",
   ]
+
+  # Add opening book if specified
+  if args.openings and args.openings.exists():
+    openings_abs = args.openings.resolve()
+    cmd.extend(["-openings", f"file={openings_abs}", "format=epd", "order=random"])
+
+  return cmd
 
 
 def write_comparison_summary(
@@ -192,6 +200,11 @@ def main() -> None:
       help="Path to fastchess executable",
   )
   parser.add_argument(
+      "--openings",
+      type=Path,
+      help="Path to opening book file (EPD format)",
+  )
+  parser.add_argument(
       "--ci",
       action="store_true",
       help="Enable CI mode (structured output, exit codes)",
@@ -258,7 +271,15 @@ def main() -> None:
       cmd = build_comparison_command(
           test_engine, base_engine, test_name, base_name, args, pgn_path
       )
-      run(cmd, log_path=log_path)
+      try:
+        run(cmd, log_path=log_path)
+      except subprocess.CalledProcessError:
+        # Print log content on failure to help debug
+        if log_path.exists():
+          print("=== Fastchess log ===")
+          print(log_path.read_text())
+          print("=== End log ===")
+        raise
 
       # Generate summary
       summary, exit_code = write_comparison_summary(
