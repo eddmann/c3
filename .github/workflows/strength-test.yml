@@ -41,7 +41,7 @@ jobs:
         run: |
           cd scripts
           python3 perft_benchmark.py \
-            --base ${{ github.base_ref }} \
+            --base origin/${{ github.base_ref }} \
             --test HEAD \
             --threshold 5.0 \
             | tee ../perft.txt
@@ -111,17 +111,18 @@ jobs:
 
       - name: Install fastchess
         run: |
-          wget -q https://github.com/Disservin/fastchess/releases/latest/download/fastchess-linux-x86_64 \
-            -O /tmp/fastchess
-          chmod +x /tmp/fastchess
-          sudo mv /tmp/fastchess /usr/local/bin/fastchess
+          wget -q https://github.com/Disservin/fastchess/releases/download/v1.7.0-alpha/fastchess-linux-x86-64.tar \
+            -O /tmp/fastchess.tar
+          tar -xf /tmp/fastchess.tar -C /tmp
+          chmod +x /tmp/fastchess-linux-x86-64/fastchess
+          sudo mv /tmp/fastchess-linux-x86-64/fastchess /usr/local/bin/fastchess
 
       - name: Run SPRT comparison
         id: sprt
         run: |
           cd scripts
           python3 compare_branches.py \
-            --base ${{ github.base_ref }} \
+            --base origin/${{ github.base_ref }} \
             --test HEAD \
             --games ${{ inputs.games || '200' }} \
             --depth ${{ inputs.depth || '5' }} \
