@@ -114,8 +114,8 @@ jobs:
           wget -q https://github.com/Disservin/fastchess/releases/download/v1.7.0-alpha/fastchess-linux-x86-64.tar \
             -O /tmp/fastchess.tar
           tar -xf /tmp/fastchess.tar -C /tmp
-          chmod +x /tmp/fastchess
-          sudo mv /tmp/fastchess /usr/local/bin/fastchess
+          chmod +x /tmp/fastchess-linux-x86-64/fastchess
+          sudo mv /tmp/fastchess-linux-x86-64/fastchess /usr/local/bin/fastchess
 
       - name: Run SPRT comparison
         id: sprt
