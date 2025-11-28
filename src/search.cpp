@@ -86,6 +86,14 @@ bool has_non_pawn_material(const Board& board, Colour colour) {
 }
 
 // =============================================================================
+// FUTILITY PRUNING
+// =============================================================================
+// At shallow depths, skip quiet moves that can't possibly improve alpha.
+// If static_eval + margin < alpha, a quiet move has no chance of raising alpha.
+constexpr int FUTILITY_MARGIN[] = {0, 100, 300}; // margins for depth 0, 1, 2
+constexpr int FUTILITY_DEPTH = 2;
+
+// =============================================================================
 // MVV-LVA: Most Valuable Victim - Least Valuable Attacker
 // =============================================================================
 // The best captures tend to be: high-value pieces captured by low-value pieces.
@@ -515,6 +523,9 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     has_searched_one = true;
   }
 
+  // Static evaluation for futility pruning (only compute at shallow depths when not in check)
+  const int static_eval = (depth <= FUTILITY_DEPTH && !in_check) ? eval(pos) : 0;
+
   MoveList moves = pseudo_legal_moves(pos);
   detail::order_moves(moves, killers, report.ply);
 
@@ -526,6 +537,17 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     pos.make_move(mv);
 
     if (is_in_check(colour_to_move, pos.board)) {
+      pos.unmake_move(mv);
+      continue;
+    }
+
+    // FUTILITY PRUNING
+    // At shallow depths, skip quiet moves that can't possibly raise alpha.
+    // Don't prune captures, promotions, or when in check.
+    // Only prune after first move to avoid falsely returning stalemate.
+    if (has_searched_one && depth <= FUTILITY_DEPTH && !in_check &&
+        !mv.captured_piece.has_value() && !mv.promotion_piece.has_value() &&
+        static_eval + FUTILITY_MARGIN[depth] <= alpha) {
       pos.unmake_move(mv);
       continue;
     }
