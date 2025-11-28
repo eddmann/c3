@@ -9,7 +9,7 @@ on:
     inputs:
       games:
         description: 'Number of games for SPRT'
-        default: '200'
+        default: '500'
       depth:
         description: 'Search depth'
         default: '5'
@@ -124,8 +124,9 @@ jobs:
           python3 compare_branches.py \
             --base origin/${{ github.base_ref }} \
             --test HEAD \
-            --games ${{ inputs.games || '200' }} \
+            --games ${{ inputs.games || '500' }} \
             --depth ${{ inputs.depth || '5' }} \
+            --openings ../tests/fixtures/openings.epd \
             --concurrency 2 \
             | tee ../sprt.txt
           exit_code=${PIPESTATUS[0]}
@@ -167,8 +168,9 @@ jobs:
             <details>
             <summary>Configuration</summary>
 
-            - Games: ${{ inputs.games || '200' }}
+            - Games: ${{ inputs.games || '500' }}
             - Depth: ${{ inputs.depth || '5' }}
+            - Openings: tests/fixtures/openings.epd (48 positions)
             - Concurrency: 2
 
             </details>
