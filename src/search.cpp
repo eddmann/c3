@@ -106,11 +106,29 @@ constexpr int FUTILITY_DEPTH = 2;
 // Parameters:
 //   - LMR_MIN_DEPTH: Don't reduce at shallow depths (tactics are critical)
 //   - LMR_MOVE_THRESHOLD: First N moves searched at full depth
-//   - LMR_REDUCTION: Depth reduction amount (conservative = 1)
+//   - Reduction amount is depth-dependent: deeper positions allow more reduction
 // =============================================================================
 constexpr std::uint8_t LMR_MIN_DEPTH = 3;
 constexpr std::size_t LMR_MOVE_THRESHOLD = 4;
-constexpr std::uint8_t LMR_REDUCTION = 1;
+
+// Compute reduction amount based on depth and move index
+// Uses a conservative formula: reduce by 1 for most cases, 2 for very late moves at depth
+std::uint8_t lmr_reduction(std::uint8_t depth, std::size_t move_index) {
+  // Base reduction of 1
+  std::uint8_t r = 1;
+
+  // Additional reduction for very late moves (beyond move 10) at deeper depths
+  if (depth >= 6 && move_index > 10) {
+    r = 2;
+  }
+
+  // Never reduce more than would leave us at depth 1
+  if (r >= depth - 1) {
+    r = static_cast<std::uint8_t>(depth > 2 ? depth - 2 : 1);
+  }
+
+  return r;
+}
 
 // Check if a move is a killer move at the given ply
 bool is_killer_move(const Move& mv, const KillerMoves& killers, std::uint8_t ply) {
@@ -601,21 +619,30 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // LMR: Check if this move qualifies for depth reduction
       const bool is_quiet = !mv.captured_piece.has_value() && !mv.promotion_piece.has_value();
       const bool is_killer = is_killer_move(mv, killers, report.ply - 1);
+      const bool at_root = (report.ply == 1); // ply was incremented, so 1 means root
 
       const bool can_reduce = depth >= LMR_MIN_DEPTH && moves_searched > LMR_MOVE_THRESHOLD &&
-                              is_quiet && !gives_check && !is_killer && !in_check;
+                              is_quiet && !gives_check && !is_killer && !in_check && !at_root;
 
       if (can_reduce) {
         // LMR: Search with reduced depth first (zero window)
-        const auto reduced_depth = static_cast<std::uint8_t>(depth - 1 - LMR_REDUCTION);
+        const auto r = lmr_reduction(depth, moves_searched);
+        const auto reduced_depth = static_cast<std::uint8_t>(depth - 1 - r);
         MoveList lmr_pv;
         eval = -alphabeta(pos, reduced_depth, -alpha - 1, -alpha, lmr_pv, tt, killers, report,
                           stopper);
 
-        // If reduced search beats alpha, re-search at full depth
+        // If reduced search beats alpha, verify with full-depth zero-window search (PVS)
         if (eval > alpha) {
-          eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
-                            killers, report, stopper);
+          MoveList verify_pv;
+          eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
+                            verify_pv, tt, killers, report, stopper);
+
+          // If still beats alpha and is within bounds, do full window search
+          if (eval > alpha && eval < beta) {
+            eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv,
+                              tt, killers, report, stopper);
+          }
         }
       } else {
         // Standard PVS: zero-window search first
