@@ -235,8 +235,7 @@ struct SearchResult {
   std::uint32_t hashfull{0}; // permille of TT usage
 };
 
-SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
-                    TranspositionTable& tt,
+SearchResult search(Position& pos, const Limits& limits, Reporter& reporter, TranspositionTable& tt,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);

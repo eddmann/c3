@@ -625,8 +625,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 // are in the final iteration (exponential growth of the tree).
 // ---------------------------------------------------------------------------
 
-SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
-                    TranspositionTable& tt,
+SearchResult search(Position& pos, const Limits& limits, Reporter& reporter, TranspositionTable& tt,
                     std::shared_ptr<std::atomic_bool> stop_signal) {
   Stopper stopper(std::move(stop_signal));
   stopper.at_depth(limits.depth);
