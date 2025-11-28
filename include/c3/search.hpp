@@ -172,6 +172,8 @@ public:
   [[nodiscard]] std::size_t usage() const { return usage_; }
   [[nodiscard]] std::size_t capacity() const { return capacity_; }
 
+  void clear();
+
   static void set_size_mb(std::size_t size_mb);
   static std::size_t size_mb();
 
@@ -233,6 +235,9 @@ struct SearchResult {
   std::uint32_t hashfull{0}; // permille of TT usage
 };
 
+SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
+                    TranspositionTable& tt,
+                    std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 SearchResult search(Position& pos, std::uint8_t depth);

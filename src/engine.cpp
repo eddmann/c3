@@ -8,6 +8,7 @@ Engine::Engine() : pos_(Position::startpos()) {}
 
 void Engine::new_game() {
   pos_ = Position::startpos();
+  tt_.clear();
 }
 
 void Engine::set_position(const Position& pos) {
@@ -31,12 +32,12 @@ void Engine::apply_moves(const std::vector<Move>& moves) {
 search::SearchResult Engine::search(const search::Limits& limits, search::Reporter& reporter,
                                     std::shared_ptr<std::atomic_bool> stop_signal) const {
   Position pos_copy = pos_;
-  return search::search(pos_copy, limits, reporter, std::move(stop_signal));
+  return search::search(pos_copy, limits, reporter, tt_, std::move(stop_signal));
 }
 
-void Engine::set_hash_size_mb(
-    std::size_t size_mb) { // NOLINT(readability-convert-member-functions-to-static)
+void Engine::set_hash_size_mb(std::size_t size_mb) {
   search::TranspositionTable::set_size_mb(size_mb);
+  tt_ = search::TranspositionTable();
 }
 
 } // namespace c3

@@ -24,6 +24,8 @@ public:
   Position& position() { return pos_; }
   const Position& position() const { return pos_; }
 
+  search::TranspositionTable& tt() { return tt_; }
+
   void new_game();
   void set_position(const Position& pos);
   void set_position_from_fen(const std::string& fen);
@@ -38,6 +40,7 @@ public:
 
 private:
   Position pos_;
+  mutable search::TranspositionTable tt_;
 };
 
 } // namespace c3

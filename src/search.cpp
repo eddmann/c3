@@ -222,6 +222,11 @@ std::size_t TranspositionTable::size_mb() {
   return TT_SIZE_MB.load(std::memory_order_acquire);
 }
 
+void TranspositionTable::clear() {
+  std::fill(entries_.begin(), entries_.end(), TTEntry{});
+  usage_ = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Killer moves
 // ---------------------------------------------------------------------------
@@ -621,13 +626,13 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 // ---------------------------------------------------------------------------
 
 SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
+                    TranspositionTable& tt,
                     std::shared_ptr<std::atomic_bool> stop_signal) {
   Stopper stopper(std::move(stop_signal));
   stopper.at_depth(limits.depth);
   stopper.at_nodes(limits.nodes);
   stopper.at_elapsed(limits.time);
 
-  TranspositionTable tt;
   KillerMoves killers;
   Report report;
 
@@ -708,11 +713,18 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
   return result;
 }
 
+SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
+                    std::shared_ptr<std::atomic_bool> stop_signal) {
+  TranspositionTable tt;
+  return search(pos, limits, reporter, tt, std::move(stop_signal));
+}
+
 SearchResult search(Position& pos, std::uint8_t depth) {
   NullReporter reporter;
   Limits limits;
   limits.depth = depth;
-  return search(pos, limits, reporter, nullptr);
+  TranspositionTable tt;
+  return search(pos, limits, reporter, tt, nullptr);
 }
 
 } // namespace c3::search
