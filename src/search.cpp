@@ -86,6 +86,15 @@ bool has_non_pawn_material(const Board& board, Colour colour) {
 }
 
 // =============================================================================
+// LATE MOVE REDUCTIONS (LMR)
+// =============================================================================
+// Later moves in the move list are less likely to be good (assuming good move
+// ordering). Search them at reduced depth first; re-search at full depth only
+// if they beat alpha.
+constexpr int LMR_MIN_DEPTH = 4;        // Don't reduce at shallow depths
+constexpr int LMR_FULL_DEPTH_MOVES = 5; // Search first N moves at full depth
+
+// =============================================================================
 // MVV-LVA: Most Valuable Victim - Least Valuable Attacker
 // =============================================================================
 // The best captures tend to be: high-value pieces captured by low-value pieces.
@@ -518,6 +527,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   MoveList moves = pseudo_legal_moves(pos);
   detail::order_moves(moves, killers, report.ply);
 
+  int moves_searched = 0;
   for (const auto& mv : moves) {
     if (tt_move.has_value() && mv == *tt_move) {
       continue;
@@ -530,23 +540,41 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       continue;
     }
 
+    const bool gives_check = is_in_check(!colour_to_move, pos.board);
+    const bool is_quiet = !mv.captured_piece.has_value() && !mv.promotion_piece.has_value();
+
     report.ply += 1;
+    moves_searched += 1;
 
     MoveList child_pv;
     int eval;
 
-    // PRINCIPAL VARIATION SEARCH (PVS)
+    // PRINCIPAL VARIATION SEARCH (PVS) with LATE MOVE REDUCTIONS (LMR)
     // After searching the first move (assumed best due to move ordering),
     // search remaining moves with a "zero window" (alpha, alpha+1). This is
     // faster but only proves "this move is worse than alpha" or "better".
     //
-    // If a move beats alpha in the zero-window search, it might be a new best
-    // move—re-search with the full window to get the true score.
+    // LMR: For late quiet moves at sufficient depth, search at reduced depth
+    // first. If the reduced search beats alpha, re-search at full depth.
     if (has_searched_one) {
       MoveList zero_window_pv;
+      int new_depth = depth - 1;
+
+      // LMR: Reduce depth for late quiet moves that don't give check
+      if (moves_searched >= LMR_FULL_DEPTH_MOVES && depth >= LMR_MIN_DEPTH && is_quiet &&
+          !in_check && !gives_check) {
+        new_depth -= 1; // Reduce by 1 ply
+      }
+
       // Zero-window: just checking if move can beat alpha
-      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
+      eval = -alphabeta(pos, static_cast<std::uint8_t>(new_depth), -alpha - 1, -alpha,
                         zero_window_pv, tt, killers, report, stopper);
+
+      // Re-search at full depth if reduced search beat alpha
+      if (eval > alpha && new_depth < depth - 1) {
+        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
+                          zero_window_pv, tt, killers, report, stopper);
+      }
 
       // Re-search with full window if zero-window found a potential improvement
       if (eval > alpha && eval < beta) {
