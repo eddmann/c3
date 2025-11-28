@@ -1,0 +1,200 @@
+name: Strength Test
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+  workflow_dispatch:
+    inputs:
+      games:
+        description: 'Number of games for SPRT'
+        default: '200'
+      depth:
+        description: 'Search depth'
+        default: '5'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Advisory-only: results posted as comments but don't block merge
+jobs:
+  perft-benchmark:
+    name: Perft Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang
+
+      - name: Run perft benchmark
+        id: perft
+        run: |
+          cd scripts
+          python3 perft_benchmark.py \
+            --base ${{ github.base_ref }} \
+            --test HEAD \
+            --threshold 5.0 \
+            | tee ../perft.txt
+          exit_code=${PIPESTATUS[0]}
+          echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
+
+      - name: Post results as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('perft.txt', 'utf8');
+            const exitCode = '${{ steps.perft.outputs.exit_code }}';
+            const status = exitCode === '0' ? 'No regressions' : 'Regression detected';
+
+            const body = `## Perft Benchmark Results
+
+            \`\`\`
+            ${output}
+            \`\`\`
+
+            **Status:** ${status}
+            `;
+
+            // Find existing comment
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.data.find(c =>
+              c.user.type === 'Bot' && c.body.includes('## Perft Benchmark Results')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
+
+  sprt-test:
+    name: SPRT Strength Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang
+
+      - name: Install fastchess
+        run: |
+          wget -q https://github.com/Disservin/fastchess/releases/latest/download/fastchess-linux-x86_64 \
+            -O /tmp/fastchess
+          chmod +x /tmp/fastchess
+          sudo mv /tmp/fastchess /usr/local/bin/fastchess
+
+      - name: Run SPRT comparison
+        id: sprt
+        run: |
+          cd scripts
+          python3 compare_branches.py \
+            --base ${{ github.base_ref }} \
+            --test HEAD \
+            --games ${{ inputs.games || '200' }} \
+            --depth ${{ inputs.depth || '5' }} \
+            --concurrency 2 \
+            | tee ../sprt.txt
+          exit_code=${PIPESTATUS[0]}
+          echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
+
+      - name: Upload PGN artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprt-pgn
+          path: Testing/fastchess/*.pgn
+          if-no-files-found: ignore
+
+      - name: Post results as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('sprt.txt', 'utf8');
+            const exitCode = '${{ steps.sprt.outputs.exit_code }}';
+
+            let status;
+            switch (exitCode) {
+              case '0': status = 'Test appears stronger or equal'; break;
+              case '1': status = 'Test appears weaker'; break;
+              case '2': status = 'Inconclusive'; break;
+              default: status = 'Error'; break;
+            }
+
+            const body = `## SPRT Strength Test Results
+
+            \`\`\`
+            ${output}
+            \`\`\`
+
+            **Status:** ${status}
+
+            <details>
+            <summary>Configuration</summary>
+
+            - Games: ${{ inputs.games || '200' }}
+            - Depth: ${{ inputs.depth || '5' }}
+            - Concurrency: 2
+
+            </details>
+            `;
+
+            // Find existing comment
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.data.find(c =>
+              c.user.type === 'Bot' && c.body.includes('## SPRT Strength Test Results')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }

@@ -117,15 +117,25 @@ def run(cmd: Iterable[str], log_path: Path | None = None) -> subprocess.Complete
       log_file.close()
 
 
-def ensure_c3_built() -> Path:
-  build_dir = ROOT / "build-release"
-  binary = build_dir / "c3"
+def build_engine(source_dir: Path, build_dir: Path) -> Path:
+  """Build c3 engine from source directory into build directory.
 
+  Args:
+    source_dir: Path to source tree containing CMakeLists.txt.
+    build_dir: Path where build artifacts will be placed.
+
+  Returns:
+    Path to the built c3 binary.
+  """
   build_dir.mkdir(parents=True, exist_ok=True)
-  run(["cmake", "-S", str(ROOT), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"])
+  run(["cmake", "-S", str(source_dir), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"])
   run(["cmake", "--build", str(build_dir), "--config", "Release", "--target", "c3"])
+  return build_dir / "c3"
 
-  return binary
+
+def ensure_c3_built() -> Path:
+  """Build c3 from current source (backwards compatible wrapper)."""
+  return build_engine(ROOT, ROOT / "build-release")
 
 
 def build_fastchess_command(args: argparse.Namespace, mode: str, pgn_path: Path) -> list[str]:
