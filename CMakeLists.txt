@@ -90,6 +90,7 @@ add_library(c3_core STATIC
   src/engine.cpp
   src/uci.cpp
   src/search.cpp
+  src/tablebase.cpp
 )
 target_compile_definitions(c3_core PUBLIC C3_TESTING)
 add_dependencies(c3_core generate_magic)

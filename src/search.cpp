@@ -27,6 +27,7 @@
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
 #include "c3/piece.hpp"
+#include "c3/tablebase.hpp"
 
 namespace c3::search {
 namespace {
@@ -416,6 +417,28 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // Draw detection: 50-move rule or threefold repetition
   if (pos.is_fifty_move_draw() || pos.is_repetition_draw(report.ply)) {
     return CENTIPAWN_DRAW;
+  }
+
+  // TABLEBASE PROBE
+  // In endgame positions with few pieces and no castling rights, we can query
+  // the tablebase for perfect knowledge of the game outcome.
+  // We only probe at sufficient depth to avoid excessive probing overhead.
+  if (tablebase::should_probe(pos, depth)) {
+    if (const auto wdl = tablebase::get_tablebase().probe_wdl(pos)) {
+      const int tb_score = tablebase::wdl_to_centipawns(*wdl);
+
+      // Adjust score based on WDL result to indicate winning/losing
+      // Win scores are capped below mate scores to not interfere with mate search
+      if (*wdl == tablebase::WdlResult::Win) {
+        return std::min(tb_score, CENTIPAWN_MAX - 100);
+      }
+      if (*wdl == tablebase::WdlResult::Loss) {
+        return std::max(tb_score, CENTIPAWN_MIN + 100);
+      }
+
+      // Draws and cursed wins/blessed losses return the tablebase score directly
+      return tb_score;
+    }
   }
 
   // Leaf node: drop into quiescence search
