@@ -9,10 +9,10 @@ on:
     inputs:
       games:
         description: 'Number of games for SPRT'
-        default: '500'
+        default: '1000'
       depth:
         description: 'Search depth'
-        default: '5'
+        default: '8'
 
 permissions:
   contents: read
@@ -124,8 +124,8 @@ jobs:
           python3 compare_branches.py \
             --base origin/${{ github.base_ref }} \
             --test HEAD \
-            --games ${{ inputs.games || '500' }} \
-            --depth ${{ inputs.depth || '5' }} \
+            --games ${{ inputs.games || '1000' }} \
+            --depth ${{ inputs.depth || '8' }} \
             --openings ../tests/fixtures/openings.epd \
             --concurrency 2 \
             | tee ../sprt.txt
@@ -168,8 +168,8 @@ jobs:
             <details>
             <summary>Configuration</summary>
 
-            - Games: ${{ inputs.games || '500' }}
-            - Depth: ${{ inputs.depth || '5' }}
+            - Games: ${{ inputs.games || '1000' }}
+            - Depth: ${{ inputs.depth || '8' }}
             - Openings: tests/fixtures/openings.epd (48 positions)
             - Concurrency: 2
 
