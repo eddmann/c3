@@ -169,7 +169,7 @@ TEST(UciSession, KiwipeteBestmoveDepth3) {
   const auto output = uci::run_script_for_test(script);
 
   EXPECT_NE(output.find("bestmove e2a6"), std::string::npos);
-  EXPECT_NE(output.find("score cp 50"), std::string::npos);
+  EXPECT_NE(output.find("score cp 52"), std::string::npos);
 }
 
 // -----------------------------------------------------------------------------

@@ -156,3 +156,137 @@ TEST(Eval, BishopPairVsTwoKnights) {
   // Bishops should be worth more than knights
   EXPECT_GT(bishop_eval, knight_eval);
 }
+
+// -----------------------------------------------------------------------------
+// King Safety - Pawn Shield
+// -----------------------------------------------------------------------------
+// Tests include enemy queen to ensure non-zero game phase (king safety matters
+// in middlegame, not endgame). This is realistic chess evaluation.
+
+TEST(KingSafety, PawnShieldIntactIsBetter) {
+  // Kingside castled with full pawn shield vs missing g-pawn
+  // Enemy queen present to make king safety relevant
+  const auto full_shield = parse("3qk3/8/8/8/8/8/5PPP/6K1 w - - 0 1");
+  const auto missing_g_pawn = parse("3qk3/8/8/8/8/8/5P1P/6K1 w - - 0 1");
+
+  EXPECT_GT(eval_king_safety(Colour::White, full_shield.board),
+            eval_king_safety(Colour::White, missing_g_pawn.board));
+}
+
+TEST(KingSafety, MissingFPawnIsWorstPenalty) {
+  // Missing f-pawn should be worse than missing g-pawn (f-pawn guards critical squares)
+  const auto missing_f_pawn = parse("3qk3/8/8/8/8/8/6PP/6K1 w - - 0 1");
+  const auto missing_g_pawn = parse("3qk3/8/8/8/8/8/5P1P/6K1 w - - 0 1");
+
+  EXPECT_LT(eval_king_safety(Colour::White, missing_f_pawn.board),
+            eval_king_safety(Colour::White, missing_g_pawn.board));
+}
+
+TEST(KingSafety, AdvancedPawnShieldIsWeaker) {
+  // Pawns on rank 2 provide better shield than pawns on rank 3
+  const auto pawns_on_rank2 = parse("3qk3/8/8/8/8/8/5PPP/6K1 w - - 0 1");
+  const auto pawns_on_rank3 = parse("3qk3/8/8/8/8/5PPP/8/6K1 w - - 0 1");
+
+  EXPECT_GT(eval_king_safety(Colour::White, pawns_on_rank2.board),
+            eval_king_safety(Colour::White, pawns_on_rank3.board));
+}
+
+TEST(KingSafety, QueensidePawnShieldWorks) {
+  // Queenside castled with full pawn shield
+  const auto full_shield = parse("4k2q/8/8/8/8/8/PPP5/2K5 w - - 0 1");
+  const auto missing_c_pawn = parse("4k2q/8/8/8/8/8/PP6/2K5 w - - 0 1");
+
+  EXPECT_GT(eval_king_safety(Colour::White, full_shield.board),
+            eval_king_safety(Colour::White, missing_c_pawn.board));
+}
+
+TEST(KingSafety, BlackPawnShieldSymmetric) {
+  // Black kingside castled with pawn shield works symmetrically
+  const auto full_shield = parse("6k1/5ppp/8/8/8/8/8/3QK3 w - - 0 1");
+  const auto missing_g_pawn = parse("6k1/5p1p/8/8/8/8/8/3QK3 w - - 0 1");
+
+  EXPECT_GT(eval_king_safety(Colour::Black, full_shield.board),
+            eval_king_safety(Colour::Black, missing_g_pawn.board));
+}
+
+// -----------------------------------------------------------------------------
+// King Safety - Open Files
+// -----------------------------------------------------------------------------
+
+TEST(KingSafety, OpenFileNearKingIsBad) {
+  // King on g-file with open g-file is dangerous
+  const auto closed_file = parse("3qk3/8/8/8/8/8/5PPP/6K1 w - - 0 1");
+  const auto open_file = parse("3qk3/8/8/8/8/8/5P1P/6K1 w - - 0 1");
+
+  EXPECT_GT(eval_king_safety(Colour::White, closed_file.board),
+            eval_king_safety(Colour::White, open_file.board));
+}
+
+TEST(KingSafety, SemiOpenFileIsBetterThanFullyOpen) {
+  // Semi-open (enemy pawn) is less dangerous than fully open
+  const auto semi_open = parse("3qk3/6p1/8/8/8/8/5P1P/6K1 w - - 0 1");
+  const auto fully_open = parse("3qk3/8/8/8/8/8/5P1P/6K1 w - - 0 1");
+
+  EXPECT_GT(eval_king_safety(Colour::White, semi_open.board),
+            eval_king_safety(Colour::White, fully_open.board));
+}
+
+// -----------------------------------------------------------------------------
+// King Safety - Attack Zone
+// -----------------------------------------------------------------------------
+
+TEST(KingSafety, EnemyPiecesNearKingIsDangerous) {
+  // Enemy queen near king is much more dangerous than far away
+  const auto queen_near = parse("4k3/8/8/8/8/5q2/5PPP/6K1 w - - 0 1");
+  const auto queen_far = parse("q3k3/8/8/8/8/8/5PPP/6K1 w - - 0 1");
+
+  EXPECT_LT(eval_king_safety(Colour::White, queen_near.board),
+            eval_king_safety(Colour::White, queen_far.board));
+}
+
+TEST(KingSafety, QueenAttackWeightedHigherThanKnight) {
+  // Queen attacking king zone is more dangerous than knight
+  // Both positions have same game phase (queen present) for fair comparison
+  const auto queen_attack = parse("4k3/8/8/8/8/5q2/5PPP/6K1 w - - 0 1");
+  const auto knight_attack = parse("3qk3/8/8/8/8/5n2/5PPP/6K1 w - - 0 1");
+
+  EXPECT_LT(eval_king_safety(Colour::White, queen_attack.board),
+            eval_king_safety(Colour::White, knight_attack.board));
+}
+
+TEST(KingSafety, MultipleAttackersCompound) {
+  // Multiple attackers near king is worse than single attacker
+  const auto single_attacker = parse("4k3/8/8/8/8/5q2/5PPP/6K1 w - - 0 1");
+  const auto multiple_attackers = parse("4k3/8/8/8/4r3/5q2/5PPP/6K1 w - - 0 1");
+
+  EXPECT_LT(eval_king_safety(Colour::White, multiple_attackers.board),
+            eval_king_safety(Colour::White, single_attacker.board));
+}
+
+// -----------------------------------------------------------------------------
+// King Safety - Tropism (Distance-based)
+// -----------------------------------------------------------------------------
+
+TEST(KingSafety, EnemyPieceCloserToKingIsWorse) {
+  // Enemy rook closer to king gives worse safety score
+  // Include enemy queen to ensure non-zero game phase
+  const auto rook_far = parse("3qk3/8/8/8/8/8/r4PPP/6K1 w - - 0 1");
+  const auto rook_close = parse("3qk3/8/8/8/8/8/4rPPP/6K1 w - - 0 1");
+
+  EXPECT_LT(eval_king_safety(Colour::White, rook_close.board),
+            eval_king_safety(Colour::White, rook_far.board));
+}
+
+TEST(KingSafety, OwnPieceCloserToEnemyKingIsGood) {
+  // Our piece closer to enemy king gives us attacking bonus
+  const auto our_queen_near = parse("4k3/4Q3/8/8/8/8/5PPP/6K1 w - - 0 1");
+  const auto our_queen_far = parse("4k3/8/8/8/8/8/5PPP/Q5K1 w - - 0 1");
+
+  // Total king safety should favor position where we threaten enemy king
+  const int near_score = eval_king_safety(Colour::White, our_queen_near.board) -
+                         eval_king_safety(Colour::Black, our_queen_near.board);
+  const int far_score = eval_king_safety(Colour::White, our_queen_far.board) -
+                        eval_king_safety(Colour::Black, our_queen_far.board);
+
+  EXPECT_GT(near_score, far_score);
+}

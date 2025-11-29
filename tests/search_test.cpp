@@ -197,12 +197,12 @@ TEST(SearchCorrectness, MatchesKiwipeteDepth3) {
   const auto result = search::search(pos, limits, reporter);
 
   EXPECT_EQ(result.depth, 3);
-  EXPECT_EQ(result.eval, 50);
+  EXPECT_EQ(result.eval, 52);
 
   const auto pv = pv_to_uci(result.pv);
   ASSERT_GE(pv.size(), 3U);
   EXPECT_EQ((std::vector<std::string>{pv.begin(), pv.begin() + 3}),
-            (std::vector<std::string>{"e2a6", "e6d5", "g2h3"}));
+            (std::vector<std::string>{"e2a6", "b4c3", "b2c3"}));
 }
 
 // -----------------------------------------------------------------------------
