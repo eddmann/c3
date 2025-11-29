@@ -64,7 +64,7 @@ def build_fastchess_command(args: argparse.Namespace, mode: str, pgn_path: Path)
       "-games", "1",
       "-concurrency", str(args.concurrency),
       "-pgnout", f"file={pgn_path}",
-      "-each", "proto=uci", *time_conf,
+      "-each", "proto=uci", *time_conf, f"timemargin={args.timemargin_ms}",
       "-recover",
   ]
 
@@ -105,6 +105,7 @@ def main() -> None:
   parser.add_argument("--concurrency", type=int, default=4, help="parallel games")
   parser.add_argument("--depth", type=int, default=3, help="fixed depth for depth mode")
   parser.add_argument("--movetime-ms", type=int, default=50, help="per-move time for movetime mode")
+  parser.add_argument("--timemargin-ms", type=int, default=50, help="time margin for movetime mode (default 50ms)")
   parser.add_argument("--mode", choices=["depth", "movetime"], default="depth",
                       help="gauntlet time control type")
   parser.add_argument("--pgn", type=Path, default=None,
