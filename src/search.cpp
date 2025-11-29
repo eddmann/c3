@@ -88,8 +88,22 @@ bool has_non_pawn_material(const Board& board, Colour colour) {
 // =============================================================================
 // FUTILITY PRUNING
 // =============================================================================
-// At shallow depths, skip quiet moves that can't possibly improve alpha.
-// If static_eval + margin < alpha, a quiet move has no chance of raising alpha.
+// At shallow depths (1-2 ply from horizon), if a position is already losing
+// by more than what a quiet move could reasonably gain, skip that move.
+//
+// The idea: quiet moves (non-captures, non-promotions) typically improve
+// a position by at most a few hundred centipawns. If we're already down
+// by more than that margin, searching the move is futile.
+//
+// Conditions:
+//   - Shallow depth (depth <= 2)
+//   - Not in check (tactical positions need full search)
+//   - Not a capture or promotion (these can swing the eval dramatically)
+//   - Already searched at least one move (avoid false stalemate detection)
+//
+// Margins increase with depth: deeper searches need larger margins because
+// there's more potential for the position to improve over multiple plies.
+// =============================================================================
 constexpr int FUTILITY_MARGIN[] = {0, 100, 300}; // margins for depth 0, 1, 2
 constexpr int FUTILITY_DEPTH = 2;
 

@@ -13,7 +13,7 @@ This project grew out of a fascination with chess programming and a desire to de
 - Bitboards with magic bitboard move generation
 - Iterative deepening with aspiration windows
 - Negamax with alpha-beta pruning and principal variation search
-- Null-move pruning, quiescence search, check extensions
+- Null-move pruning, futility pruning, quiescence search, check extensions
 - Transposition table with Zobrist hashing
 - Move ordering: TT move, MVV-LVA, killer moves
 - Material and piece-square table evaluation
@@ -23,7 +23,6 @@ This project grew out of a fascination with chess programming and a desire to de
 
 ## Roadmap
 
-- Futility pruning
 - Late-move reductions (LMR)
 - Enhanced evaluation (king safety, pawn structure, endgame patterns)
 - Opening book support

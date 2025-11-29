@@ -48,6 +48,10 @@
 //      Use narrow alpha-beta windows based on the previous iteration's score.
 //      If the score is stable, this drastically reduces the search tree.
 //
+//   7. FUTILITY PRUNING
+//      At shallow depths, skip quiet moves that can't possibly improve alpha.
+//      If static_eval + margin < alpha, the move won't help—prune it.
+//
 // =============================================================================
 
 #include <array>
