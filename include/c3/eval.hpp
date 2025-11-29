@@ -88,6 +88,7 @@ inline constexpr std::array<int, 12> PIECE_VALUES = {
 
 [[nodiscard]] int eval_material(Colour colour, const Board& board) noexcept;
 [[nodiscard]] int eval_psqt(Colour colour, const Board& board) noexcept;
+[[nodiscard]] int eval_king_safety(Colour colour, const Board& board) noexcept;
 [[nodiscard]] int eval(const Position& pos) noexcept;
 
 } // namespace c3

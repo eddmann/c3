@@ -16,7 +16,7 @@ This project grew out of a fascination with chess programming and a desire to de
 - Null-move pruning, futility pruning, quiescence search, check extensions
 - Transposition table with Zobrist hashing
 - Move ordering: TT move, MVV-LVA, killer moves
-- Material and piece-square table evaluation
+- Material, piece-square table, and king safety evaluation
 - Full UCI protocol with time management
 - GoogleTest suite with perft validation
 - Fastchess gauntlet testing with SPRT
@@ -24,7 +24,7 @@ This project grew out of a fascination with chess programming and a desire to de
 ## Roadmap
 
 - Late-move reductions (LMR)
-- Enhanced evaluation (king safety, pawn structure, endgame patterns)
+- Enhanced evaluation (pawn structure, endgame patterns)
 - Opening book support
 - Tablebase support
 - Multi-threaded search
