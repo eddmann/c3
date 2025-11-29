@@ -55,28 +55,41 @@ go depth 10
 - clang-format and clang-tidy (for formatting/linting)
 - fastchess (optional, for gauntlet testing)
 
+## Quick Start
+
+A Makefile wraps common commands. Run `make help` to see all targets:
+
+```bash
+make build      # Debug build with sanitizers
+make release    # Release build with LTO
+make test       # Run unit tests
+make fmt        # Format code
+make lint       # Build with clang-tidy
+make clean      # Clean all build directories
+```
+
 ## Building
 
 The project uses CMake presets for different build configurations:
 
-| Preset    | Purpose                        | Output             |
-| --------- | ------------------------------ | ------------------ |
-| `debug`   | Development with ASan/UBSan    | `build/c3`         |
-| `release` | Optimized with LTO             | `build-release/c3` |
-| `lint`    | Static analysis via clang-tidy | `build-tidy/`      |
+| Preset    | Purpose                        | Output             | Make target     |
+| --------- | ------------------------------ | ------------------ | --------------- |
+| `debug`   | Development with ASan/UBSan    | `build/c3`         | `make build`    |
+| `release` | Optimized with LTO             | `build-release/c3` | `make release`  |
+| `lint`    | Static analysis via clang-tidy | `build-tidy/`      | `make lint`     |
 
 ### Development (Debug + sanitizers)
 
 ```bash
-cmake --preset debug
-cmake --build --preset debug
+make build
+# or: cmake --preset debug && cmake --build --preset debug
 ```
 
 ### Production (Release + LTO)
 
 ```bash
-cmake --preset release
-cmake --build --preset release
+make release
+# or: cmake --preset release && cmake --build --preset release
 ```
 
 ### Regenerating magic bitboards
@@ -84,24 +97,22 @@ cmake --build --preset release
 The magic bitboard tables are checked in at `include/c3/magic.hpp`. To regenerate:
 
 ```bash
-cmake --preset debug -DC3_REGENERATE_MAGIC=ON
-cmake --build --preset debug
+make magic
 ```
 
 ### Running tests
 
 ```bash
-ctest --preset tests
+make test
+# or: ctest --preset tests
 ```
 
 ## Linting & Formatting
 
 ```bash
-# Format all source files
-clang-format -i $(git ls-files '*.cpp' '*.hpp')
-
-# Run clang-tidy
-cmake --preset lint && cmake --build --preset lint
+make fmt        # Format all source files
+make lint       # Run clang-tidy
+make can-release  # Run all CI checks (format, lint, test)
 ```
 
 Style: 2-space indent, 100-column limit (configured in `.clang-format`).
@@ -111,13 +122,15 @@ Style: 2-space indent, 100-column limit (configured in `.clang-format`).
 The `scripts/run_fastchess_gauntlet.py` script runs strength tests against other engines, outputting PGN files and SPRT summaries to `Testing/fastchess/`.
 
 ```bash
-# Depth-limited match
+# Quick gauntlet vs opponent
+make gauntlet OPPONENT=/path/to/engine GAMES=200
+
+# Compare HEAD vs origin/main
+make compare GAMES=500 DEPTH=8
+
+# Or call scripts directly for more options:
 python3 scripts/run_fastchess_gauntlet.py --opponent /path/to/engine --games 200 --concurrency 4 --depth 6
-
-# Fixed movetime match
 python3 scripts/run_fastchess_gauntlet.py --opponent /path/to/engine --mode movetime --movetime-ms 75
-
-# Summarize an existing PGN
 python3 scripts/run_fastchess_gauntlet.py --summarize-only tests/fixtures/fastchess_sample.pgn
 ```
 
