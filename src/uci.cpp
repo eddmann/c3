@@ -659,9 +659,9 @@ void run_loop_impl(std::istream& in,
         Position pos_copy = engine.position();
 
         search_handle.thread =
-            std::thread([pos_copy, limits, stop_signal, &out, &out_mutex]() mutable {
+            std::thread([pos_copy, limits, stop_signal, &out, &out_mutex, &engine]() mutable {
               UciReporter reporter(out, &out_mutex);
-              search::search(pos_copy, limits, reporter, stop_signal);
+              search::search(pos_copy, limits, reporter, engine.tt(), stop_signal);
 
               const auto best = reporter.best_move();
               std::scoped_lock lock(out_mutex);
