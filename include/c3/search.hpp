@@ -119,7 +119,7 @@ public:
       : stop_signal_(std::move(stop_signal)) {}
 
   void at_depth(std::optional<std::uint8_t> depth) { depth_ = depth; }
-  void at_elapsed(std::optional<std::chrono::milliseconds> elapsed) { elapsed_ = elapsed; }
+  void at_elapsed(std::optional<std::chrono::milliseconds> elapsed);
   void at_nodes(std::optional<std::uint64_t> nodes) { nodes_ = nodes; }
 
   [[nodiscard]] bool should_stop(const Report& report) const;

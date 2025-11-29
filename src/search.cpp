@@ -52,6 +52,12 @@ constexpr std::uint8_t ASPIRATION_WINDOW_MAX_RETRIES = 3; // Then fall back to f
 // Checking involves atomic loads and time queries—amortizing the cost matters.
 constexpr std::uint64_t STOPPER_NODES_MASK = 0xFF;
 
+// Safety margin for time management to prevent overshooting the time limit.
+// The engine checks time only every STOPPER_NODES_MASK nodes, and there's
+// additional overhead for UCI output after search completes. This margin
+// ensures we stop early enough to report the move within the allotted time.
+constexpr auto TIME_SAFETY_MARGIN = std::chrono::milliseconds(5);
+
 // Sanitise the PV by checking if it leads to a draw. If the PV results in a
 // fifty-move draw or repetition, truncate it and return CENTIPAWN_DRAW. This
 // prevents the engine from reporting a winning eval when the best line
@@ -162,6 +168,14 @@ std::optional<std::uint8_t> Report::moves_until_mate() const {
 // ---------------------------------------------------------------------------
 // Stopper
 // ---------------------------------------------------------------------------
+
+void Stopper::at_elapsed(std::optional<std::chrono::milliseconds> elapsed) {
+  if (elapsed && *elapsed > TIME_SAFETY_MARGIN) {
+    elapsed_ = *elapsed - TIME_SAFETY_MARGIN;
+  } else {
+    elapsed_ = elapsed;
+  }
+}
 
 bool Stopper::should_stop(const Report& report) const {
   if (stop_signal_ && stop_signal_->load(std::memory_order_relaxed)) {
