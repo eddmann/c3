@@ -27,6 +27,7 @@
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
 #include "c3/piece.hpp"
+#include "c3/tablebase.hpp"
 
 namespace c3::search {
 namespace {
@@ -446,6 +447,28 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     return CENTIPAWN_DRAW;
   }
 
+  // TABLEBASE PROBE
+  // In endgame positions with few pieces and no castling rights, we can query
+  // the tablebase for perfect knowledge of the game outcome.
+  // We only probe at sufficient depth to avoid excessive probing overhead.
+  if (tablebase::should_probe(pos, depth)) {
+    if (const auto wdl = tablebase::get_tablebase().probe_wdl(pos)) {
+      const int tb_score = tablebase::wdl_to_centipawns(*wdl);
+
+      // Adjust score based on WDL result to indicate winning/losing
+      // Win scores are capped below mate scores to not interfere with mate search
+      if (*wdl == tablebase::WdlResult::Win) {
+        return std::min(tb_score, CENTIPAWN_MAX - 100);
+      }
+      if (*wdl == tablebase::WdlResult::Loss) {
+        return std::max(tb_score, CENTIPAWN_MIN + 100);
+      }
+
+      // Draws and cursed wins/blessed losses return the tablebase score directly
+      return tb_score;
+    }
+  }
+
   // Leaf node: drop into quiescence search
   if (depth == 0) {
     if (!is_in_check(pos.colour_to_move, pos.board)) {
@@ -680,6 +703,44 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
   TranspositionTable tt;
   KillerMoves killers;
   Report report;
+
+  // ROOT TABLEBASE PROBE
+  // At the root, use DTZ probing to find the optimal move in endgame positions.
+  // DTZ gives us perfect knowledge of the game outcome and the fastest path to
+  // victory (or slowest path to defeat).
+  if (tablebase::is_probeable(pos)) {
+    // Generate legal moves by filtering pseudo-legal moves
+    MoveList legal_moves;
+    for (const auto& mv : pseudo_legal_moves(pos)) {
+      Position copy = pos;
+      copy.make_move(mv);
+      if (!is_in_check(pos.colour_to_move, copy.board)) {
+        legal_moves.push_back(mv);
+      }
+    }
+
+    if (auto root_moves = tablebase::get_tablebase().probe_root(pos, legal_moves)) {
+      if (!root_moves->empty()) {
+        const auto& best = root_moves->front();
+        const int tb_eval = tablebase::wdl_to_centipawns(best.dtz_result.wdl);
+
+        SearchResult result;
+        result.depth = 1;
+        result.eval = tb_eval;
+        result.pv = {best.move};
+        result.nodes = 1;
+        result.hashfull = 0;
+
+        // Report the tablebase result
+        report.depth = 1;
+        report.nodes = 1;
+        report.pv = std::make_pair(result.pv, tb_eval);
+        reporter.send(report);
+
+        return result;
+      }
+    }
+  }
 
   const std::uint8_t max_depth = limits.depth.has_value() ? *limits.depth : MAX_DEPTH;
 

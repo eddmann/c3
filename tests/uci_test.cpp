@@ -368,3 +368,81 @@ TEST(UciSession, ZobristCommand) {
   // Should print zobrist key
   EXPECT_NE(output.find("zobrist:"), std::string::npos);
 }
+
+// -----------------------------------------------------------------------------
+// Syzygy Tablebase UCI Options
+// -----------------------------------------------------------------------------
+
+TEST(UciParse, SetOptionSyzygyPath) {
+  const auto cmd = uci::parse_command("setoption name SyzygyPath value /path/to/syzygy");
+  ASSERT_EQ(cmd.type, uci::CommandType::SetOption);
+  ASSERT_TRUE(cmd.option.has_value());
+  EXPECT_EQ(cmd.option->name, "syzygypath");
+  EXPECT_EQ(cmd.option->value, "/path/to/syzygy");
+}
+
+TEST(UciParse, SetOptionSyzygyPathWithSpaces) {
+  const auto cmd = uci::parse_command("setoption name SyzygyPath value /path/with spaces/to/syzygy");
+  ASSERT_EQ(cmd.type, uci::CommandType::SetOption);
+  ASSERT_TRUE(cmd.option.has_value());
+  EXPECT_EQ(cmd.option->name, "syzygypath");
+  EXPECT_EQ(cmd.option->value, "/path/with spaces/to/syzygy");
+}
+
+TEST(UciParse, SetOptionSyzygyProbeDepth) {
+  const auto cmd = uci::parse_command("setoption name SyzygyProbeDepth value 5");
+  ASSERT_EQ(cmd.type, uci::CommandType::SetOption);
+  ASSERT_TRUE(cmd.option.has_value());
+  EXPECT_EQ(cmd.option->name, "syzygyprobedepth");
+  EXPECT_EQ(cmd.option->value, "5");
+}
+
+TEST(UciParse, SetOptionSyzygyProbeDepthOutOfRangeThrows) {
+  EXPECT_THROW(uci::parse_command("setoption name SyzygyProbeDepth value 256"), std::runtime_error);
+}
+
+TEST(UciParse, SetOptionSyzygy50MoveRuleTrue) {
+  const auto cmd = uci::parse_command("setoption name Syzygy50MoveRule value true");
+  ASSERT_EQ(cmd.type, uci::CommandType::SetOption);
+  ASSERT_TRUE(cmd.option.has_value());
+  EXPECT_EQ(cmd.option->name, "syzygy50moverule");
+  EXPECT_EQ(cmd.option->value, "true");
+}
+
+TEST(UciParse, SetOptionSyzygy50MoveRuleFalse) {
+  const auto cmd = uci::parse_command("setoption name Syzygy50MoveRule value false");
+  ASSERT_EQ(cmd.type, uci::CommandType::SetOption);
+  ASSERT_TRUE(cmd.option.has_value());
+  EXPECT_EQ(cmd.option->name, "syzygy50moverule");
+  EXPECT_EQ(cmd.option->value, "false");
+}
+
+TEST(UciParse, SetOptionSyzygyProbeLimit) {
+  const auto cmd = uci::parse_command("setoption name SyzygyProbeLimit value 5");
+  ASSERT_EQ(cmd.type, uci::CommandType::SetOption);
+  ASSERT_TRUE(cmd.option.has_value());
+  EXPECT_EQ(cmd.option->name, "syzygyprobelimit");
+  EXPECT_EQ(cmd.option->value, "5");
+}
+
+TEST(UciParse, SetOptionSyzygyProbeLimitBoundaries) {
+  // Valid at boundaries
+  const auto min_cmd = uci::parse_command("setoption name SyzygyProbeLimit value 0");
+  EXPECT_TRUE(min_cmd.option.has_value());
+
+  const auto max_cmd = uci::parse_command("setoption name SyzygyProbeLimit value 7");
+  EXPECT_TRUE(max_cmd.option.has_value());
+
+  // Invalid values throw
+  EXPECT_THROW(uci::parse_command("setoption name SyzygyProbeLimit value 8"), std::runtime_error);
+}
+
+TEST(UciSession, SyzygyOptionsInUciOutput) {
+  const std::vector<std::string> script = {"uci"};
+  const auto output = uci::run_script_for_test(script);
+
+  EXPECT_NE(output.find("option name SyzygyPath type string"), std::string::npos);
+  EXPECT_NE(output.find("option name SyzygyProbeDepth type spin"), std::string::npos);
+  EXPECT_NE(output.find("option name Syzygy50MoveRule type check"), std::string::npos);
+  EXPECT_NE(output.find("option name SyzygyProbeLimit type spin"), std::string::npos);
+}

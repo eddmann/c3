@@ -23,6 +23,7 @@
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
 #include "c3/search.hpp"
+#include "c3/tablebase.hpp"
 
 namespace c3::uci {
 
@@ -307,6 +308,45 @@ SetOptionCommand parse_setoption(
     } catch (...) {
       throw std::runtime_error("could not parse value for 'hash' option");
     }
+  } else if (name == "syzygypath") {
+    // SyzygyPath can be any string (path), including empty
+    // Value is not lowercased for paths - reconstruct from original parts
+    std::string path_value;
+    for (std::size_t i = 0; i < value_parts.size(); ++i) {
+      path_value += (i == 0 ? "" : " ") + value_parts[i];
+    }
+    option.value = path_value.empty() ? std::nullopt : std::make_optional(path_value);
+  } else if (name == "syzygyprobedepth") {
+    if (!option.value.has_value()) {
+      throw std::runtime_error("missing value for 'syzygyprobedepth' option");
+    }
+    try {
+      const int depth = std::stoi(*option.value);
+      if (depth < 0 || depth > 255) {
+        throw std::runtime_error("invalid value for 'syzygyprobedepth' option");
+      }
+    } catch (...) {
+      throw std::runtime_error("could not parse value for 'syzygyprobedepth' option");
+    }
+  } else if (name == "syzygy50moverule") {
+    if (!option.value.has_value()) {
+      throw std::runtime_error("missing value for 'syzygy50moverule' option");
+    }
+    if (*option.value != "true" && *option.value != "false") {
+      throw std::runtime_error("invalid value for 'syzygy50moverule' option");
+    }
+  } else if (name == "syzygyprobelimit") {
+    if (!option.value.has_value()) {
+      throw std::runtime_error("missing value for 'syzygyprobelimit' option");
+    }
+    try {
+      const int limit = std::stoi(*option.value);
+      if (limit < 0 || limit > 7) {
+        throw std::runtime_error("invalid value for 'syzygyprobelimit' option");
+      }
+    } catch (...) {
+      throw std::runtime_error("could not parse value for 'syzygyprobelimit' option");
+    }
   } else {
     throw std::runtime_error("unknown option '" + name + "'");
   }
@@ -569,6 +609,10 @@ void run_loop_impl(std::istream& in,
                    std::to_string(search::TT_DEFAULT_SIZE_MB) + " min " +
                    std::to_string(search::TT_MIN_SIZE_MB) + " max " +
                    std::to_string(search::TT_MAX_SIZE_MB));
+        write_line("option name SyzygyPath type string default <empty>");
+        write_line("option name SyzygyProbeDepth type spin default 1 min 1 max 100");
+        write_line("option name Syzygy50MoveRule type check default true");
+        write_line("option name SyzygyProbeLimit type spin default 6 min 0 max 7");
         write_line("uciok");
         break;
 
@@ -683,6 +727,17 @@ void run_loop_impl(std::istream& in,
         }
         if (cmd.option->name == "hash") {
           engine.set_hash_size_mb(std::stoull(cmd.option->value.value()));
+        } else if (cmd.option->name == "syzygypath") {
+          tablebase::Config::set_path(cmd.option->value.value_or(""));
+          tablebase::get_tablebase().init(cmd.option->value.value_or(""));
+        } else if (cmd.option->name == "syzygyprobedepth") {
+          tablebase::Config::set_probe_depth(
+              static_cast<std::uint8_t>(std::stoi(cmd.option->value.value())));
+        } else if (cmd.option->name == "syzygy50moverule") {
+          tablebase::Config::set_50_move_rule(cmd.option->value.value() == "true");
+        } else if (cmd.option->name == "syzygyprobelimit") {
+          tablebase::Config::set_probe_limit(
+              static_cast<std::uint8_t>(std::stoi(cmd.option->value.value())));
         }
         break;
 
@@ -732,6 +787,10 @@ std::string run_script_for_test(
                  std::to_string(search::TT_DEFAULT_SIZE_MB) + " min " +
                  std::to_string(search::TT_MIN_SIZE_MB) + " max " +
                  std::to_string(search::TT_MAX_SIZE_MB));
+      write_line("option name SyzygyPath type string default <empty>");
+      write_line("option name SyzygyProbeDepth type spin default 1 min 1 max 100");
+      write_line("option name Syzygy50MoveRule type check default true");
+      write_line("option name SyzygyProbeLimit type spin default 6 min 0 max 7");
       write_line("uciok");
       break;
 
@@ -819,6 +878,16 @@ std::string run_script_for_test(
     case CommandType::SetOption:
       if (cmd.option->name == "hash" && cmd.option->value.has_value()) {
         search::TranspositionTable::set_size_mb(std::stoull(*cmd.option->value));
+      } else if (cmd.option->name == "syzygypath") {
+        tablebase::Config::set_path(cmd.option->value.value_or(""));
+      } else if (cmd.option->name == "syzygyprobedepth" && cmd.option->value.has_value()) {
+        tablebase::Config::set_probe_depth(
+            static_cast<std::uint8_t>(std::stoi(*cmd.option->value)));
+      } else if (cmd.option->name == "syzygy50moverule" && cmd.option->value.has_value()) {
+        tablebase::Config::set_50_move_rule(*cmd.option->value == "true");
+      } else if (cmd.option->name == "syzygyprobelimit" && cmd.option->value.has_value()) {
+        tablebase::Config::set_probe_limit(
+            static_cast<std::uint8_t>(std::stoi(*cmd.option->value)));
       }
       break;
 
