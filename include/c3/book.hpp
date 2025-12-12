@@ -1,19 +1,42 @@
 #pragma once
 
 // =============================================================================
-// POLYGLOT OPENING BOOK SUPPORT
+// OPENING BOOKS: Playing Known Theory Instantly
 // =============================================================================
 //
-// Polyglot is an industry-standard binary format for chess opening books.
-// Each 16-byte entry contains:
-//   - 64-bit Zobrist key (Polyglot-specific, NOT the engine's Zobrist)
-//   - 16-bit encoded move
-//   - 16-bit weight (for probabilistic selection)
-//   - 32-bit learn data (often unused)
+// THE PROBLEM: Opening Move Selection
+// The opening phase of chess is well-studied—millions of grandmaster games have
+// mapped out optimal play for the first 10-20 moves. Without a book, the engine
+// must "discover" these known moves through search, wasting precious time.
 //
-// The key insight: Polyglot uses standardized Zobrist random values that differ
-// from our engine's HASH_SEED-based Zobrist table. We must compute a separate
-// "Polyglot key" for each position to probe the book.
+// THE SOLUTION: Opening Books
+// An opening book is a precomputed database of positions and their best moves.
+// When the engine recognizes a position in the book, it plays instantly—no
+// search needed. This saves time for the complex middlegame where search matters.
+//
+// WHY POLYGLOT FORMAT?
+// Polyglot is the de facto standard for chess opening books:
+//   - Binary format: compact and fast to load (16 bytes per entry)
+//   - Zobrist-based: O(log n) position lookup via binary search
+//   - Weighted moves: multiple candidate moves with popularity weights
+//   - Universal: compatible with most chess engines and GUIs
+//
+// KEY CONCEPTS:
+//
+//   1. POLYGLOT ZOBRIST
+//      Polyglot uses standardized random values (different from our engine's).
+//      We must compute a "Polyglot key" separately to probe the book.
+//
+//   2. WEIGHTED SELECTION
+//      When multiple book moves exist, weights indicate popularity/strength.
+//      Higher weight = played more often by strong players. We select
+//      probabilistically, adding variety while favoring better moves.
+//
+//   3. BOOK DEPTH
+//      Books typically cover the first 10-20 moves. Beyond that, we fall
+//      back to search. The BookDepth UCI option controls this cutoff.
+//
+// TYPICAL ELO IMPACT: +20-50 Elo (from time savings, not move quality)
 //
 // =============================================================================
 

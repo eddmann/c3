@@ -9,17 +9,42 @@
 namespace c3 {
 
 // =============================================================================
+// POLYGLOT OPENING BOOK IMPLEMENTATION
+// =============================================================================
+//
+// Flow: probe(position)
+//   └── compute_polyglot_key(position)    // Hash using Polyglot randoms
+//   └── find_entries(key)                 // Binary search O(log n)
+//   └── select_weighted(entries, seed)    // Probabilistic selection
+//   └── decode_polyglot_move(encoded)     // Convert to engine Move
+//
+// The book file is sorted by key, enabling efficient binary search.
+// Multiple entries may share a key (same position, different candidate moves).
+// =============================================================================
+
+// =============================================================================
 // POLYGLOT ZOBRIST RANDOM VALUES
 // =============================================================================
-// These are the standardized Polyglot Zobrist values. They MUST NOT be changed
-// as they ensure compatibility with all Polyglot .bin books.
 //
-// Array layout (781 values total):
-//   [0..767]   : piece_square[piece][square] - 12 pieces x 64 squares
-//                piece = kind*2 + color (kind: P=0,N=1,B=2,R=3,Q=4,K=5; color: black=0,white=1)
-//   [768..771] : castling[0..3] - white O-O, white O-O-O, black O-O, black O-O-O
-//   [772..779] : en_passant[0..7] - files a-h
-//   [780]      : side_to_move (XOR when white to move)
+// These 781 values are the STANDARDIZED Polyglot randoms. Every Polyglot-
+// compatible tool uses these exact values—they're essentially a protocol
+// specification, not implementation-specific.
+//
+// Why different from our engine's Zobrist?
+//   - Our engine uses HASH_SEED to generate unique randoms at compile time
+//   - Polyglot requires fixed values so all tools compute identical keys
+//   - Same position must produce same key across all software
+//
+// Array layout (781 values):
+//   [0..767]   : 12 piece types × 64 squares = 768 values
+//   [768..771] : 4 castling rights (WK, WQ, BK, BQ)
+//   [772..779] : 8 en passant files (a-h)
+//   [780]      : side to move (XOR when white to move)
+//
+// Piece indexing: kind*2 + color
+//   kind:  pawn=0, knight=1, bishop=2, rook=3, queen=4, king=5
+//   color: black=0, white=1
+//   Example: white knight = 1*2+1 = 3
 // =============================================================================
 
 // clang-format off
@@ -249,6 +274,17 @@ static constexpr std::array<std::size_t, 12> ENGINE_TO_POLYGLOT_PIECE = {
 // =============================================================================
 // POLYGLOT KEY COMPUTATION
 // =============================================================================
+//
+// Computes the Polyglot Zobrist hash for position lookup. This differs from
+// our engine's Position::key in two ways:
+//
+//   1. Uses POLYGLOT_RANDOM values instead of engine's Zobrist table
+//   2. En passant is ONLY hashed if a pawn can actually capture
+//      (Polyglot spec quirk—prevents key collisions for equivalent positions)
+//
+// Example: After 1.e4, the en passant square is e3, but it's only hashed
+// if Black has a pawn on d4 or f4 that could capture en passant.
+// =============================================================================
 
 std::uint64_t OpeningBook::compute_polyglot_key(const Position& pos) {
   std::uint64_t key = 0;
@@ -401,13 +437,20 @@ std::vector<PolyglotEntry> OpeningBook::find_entries(std::uint64_t key) const {
 // =============================================================================
 // MOVE DECODING
 // =============================================================================
-
+//
 // Polyglot move encoding (16 bits):
-//   bits 0-2:   to_file (0=a, 7=h)
-//   bits 3-5:   to_rank (0=1, 7=8)
-//   bits 6-8:   from_file
-//   bits 9-11:  from_rank
-//   bits 12-14: promotion (0=none, 1=N, 2=B, 3=R, 4=Q)
+//   bits 0-2:   to file   (0=a, 7=h)
+//   bits 3-5:   to rank   (0=1, 7=8)
+//   bits 6-8:   from file
+//   bits 9-11:  from rank
+//   bits 12-14: promotion (0=none, 1=knight, 2=bishop, 3=rook, 4=queen)
+//
+// CASTLING GOTCHA:
+// Polyglot encodes castling as king-to-rook (e1h1 for O-O), but our engine
+// uses king-to-destination (e1g1). We must translate:
+//   e1h1 → e1g1 (white O-O)      e8h8 → e8g8 (black O-O)
+//   e1a1 → e1c1 (white O-O-O)    e8a8 → e8c8 (black O-O-O)
+// =============================================================================
 
 std::optional<Move> OpeningBook::decode_polyglot_move(std::uint16_t encoded, const Position& pos) {
   const auto to_file = static_cast<std::uint8_t>(encoded & 0x7);
@@ -487,6 +530,24 @@ std::optional<Move> OpeningBook::decode_polyglot_move(std::uint16_t encoded, con
 
 // =============================================================================
 // WEIGHTED RANDOM SELECTION
+// =============================================================================
+//
+// When multiple book moves exist for a position, we select probabilistically
+// based on weights. Higher weight = more likely to be chosen.
+//
+// Example: Position has moves with weights [100, 50, 25]
+//   - Total weight: 175
+//   - Move 1 (weight 100): 57% chance (100/175)
+//   - Move 2 (weight 50):  29% chance (50/175)
+//   - Move 3 (weight 25):  14% chance (25/175)
+//
+// The seed (position's Zobrist key) ensures deterministic selection—
+// same position always yields same move. This is important for:
+//   - Reproducible games
+//   - Testing consistency
+//   - Analysis tools expecting stable output
+//
+// If all weights are zero, we fall back to uniform random selection.
 // =============================================================================
 
 std::optional<PolyglotEntry> OpeningBook::select_weighted(const std::vector<PolyglotEntry>& entries,

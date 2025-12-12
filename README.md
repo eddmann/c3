@@ -20,12 +20,12 @@ This project grew out of a fascination with chess programming and a desire to de
 - Full UCI protocol with time management
 - GoogleTest suite with perft validation
 - Fastchess gauntlet testing with SPRT
+- Opening book support (Polyglot .bin format)
 
 ## Roadmap
 
 - Late-move reductions (LMR)
 - Enhanced evaluation (king safety, pawn structure, endgame patterns)
-- Opening book support
 - Tablebase support
 - Multi-threaded search
 
@@ -45,6 +45,41 @@ isready
 position startpos moves e2e4 e7e5
 go depth 10
 ```
+
+## Opening Books
+
+The engine supports Polyglot (.bin) opening books for instant opening play.
+
+### UCI Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| OwnBook | check | false | Enable opening book |
+| BookFile | string | (empty) | Path to Polyglot .bin file |
+| BookDepth | spin | 20 | Max move number to use book |
+
+### Example
+
+```
+uci
+setoption name OwnBook value true
+setoption name BookFile value books/komodo.bin
+isready
+position startpos
+go movetime 1000
+```
+
+### Bundled Books
+
+The `books/` directory includes pre-downloaded opening books:
+
+| Book | Entries | Best For |
+|------|---------|----------|
+| `komodo.bin` | 578K | Comprehensive coverage |
+| `rodent.bin` | 175K | Good variety |
+| `gm2001.bin` | 30K | Fast loading |
+
+Attribution: Books sourced from [gmcheems-org/free-opening-books](https://github.com/gmcheems-org/free-opening-books).
 
 ## Prerequisites
 
