@@ -20,13 +20,13 @@ This project grew out of a fascination with chess programming and a desire to de
 - Full UCI protocol with time management
 - GoogleTest suite with perft validation
 - Fastchess gauntlet testing with SPRT
+- Syzygy tablebase support for perfect endgame play
 
 ## Roadmap
 
 - Late-move reductions (LMR)
 - Enhanced evaluation (king safety, pawn structure, endgame patterns)
 - Opening book support
-- Tablebase support
 - Multi-threaded search
 
 ## Usage
@@ -44,6 +44,21 @@ uci
 isready
 position startpos moves e2e4 e7e5
 go depth 10
+```
+
+### Tablebase Configuration
+
+Download Syzygy tablebase files (~1GB for 3-4-5 piece):
+
+```bash
+./scripts/download_syzygy.sh ./syzygy 345
+```
+
+Configure the engine to use them:
+
+```
+setoption name SyzygyPath value ./syzygy
+setoption name SyzygyProbeLimit value 6
 ```
 
 ## Prerequisites
