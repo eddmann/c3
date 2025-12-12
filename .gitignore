@@ -38,3 +38,8 @@ core
 
 .DS_Store
 Thumbs.db
+
+# Syzygy tablebase files (large, downloaded separately)
+syzygy/
+*.rtbw
+*.rtbz
