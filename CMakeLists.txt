@@ -83,6 +83,7 @@ endif()
 
 add_library(c3_core STATIC
   src/about.cpp
+  src/book.cpp
   src/eval.cpp
   src/fen.cpp
   src/position.cpp

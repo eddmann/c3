@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "c3/about.hpp"
+#include "c3/book.hpp"
 #include "c3/engine.hpp"
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
@@ -307,6 +308,24 @@ SetOptionCommand parse_setoption(
     } catch (...) {
       throw std::runtime_error("could not parse value for 'hash' option");
     }
+  } else if (name == "ownbook") {
+    // Boolean option, value should be "true" or "false" (or missing for toggle)
+    // Validation happens in the handler
+  } else if (name == "bookfile") {
+    // String option - path to book file, no validation here
+  } else if (name == "bookdepth") {
+    if (option.value.has_value()) {
+      try {
+        const int depth = std::stoi(*option.value);
+        if (depth < 0 || depth > 100) {
+          throw std::runtime_error("invalid value for 'bookdepth' option (must be 0-100)");
+        }
+      } catch (const std::invalid_argument&) {
+        throw std::runtime_error("could not parse value for 'bookdepth' option");
+      } catch (const std::out_of_range&) {
+        throw std::runtime_error("invalid value for 'bookdepth' option");
+      }
+    }
   } else {
     throw std::runtime_error("unknown option '" + name + "'");
   }
@@ -547,6 +566,11 @@ void run_loop_impl(std::istream& in,
   SearchHandle search_handle;
   std::mutex out_mutex;
 
+  // Opening book state
+  OpeningBook opening_book;
+  bool own_book_enabled = false;
+  std::uint8_t book_depth = 20;
+
   auto write_line = [&](const std::string& line) {
     std::scoped_lock lock(out_mutex);
     out << line << '\n' << std::flush;
@@ -569,6 +593,9 @@ void run_loop_impl(std::istream& in,
                    std::to_string(search::TT_DEFAULT_SIZE_MB) + " min " +
                    std::to_string(search::TT_MIN_SIZE_MB) + " max " +
                    std::to_string(search::TT_MAX_SIZE_MB));
+        write_line("option name OwnBook type check default false");
+        write_line("option name BookFile type string default <empty>");
+        write_line("option name BookDepth type spin default 20 min 0 max 100");
         write_line("uciok");
         break;
 
@@ -641,6 +668,22 @@ void run_loop_impl(std::istream& in,
 
         search_handle.stop();
 
+        // Try book move first if enabled and within book depth
+        if (own_book_enabled && opening_book.is_loaded()) {
+          const auto& pos = engine.position();
+          if (pos.full_move_counter <= book_depth) {
+            if (auto book_move = opening_book.probe(pos)) {
+              const UciMove uci_mv{
+                  .from = book_move->from,
+                  .to = book_move->to,
+                  .promotion_piece = book_move->promotion_piece,
+              };
+              write_line("bestmove " + to_uci_string(uci_mv));
+              break;
+            }
+          }
+        }
+
         search::Limits limits;
         limits.depth = cmd.go_params->depth;
         limits.nodes = cmd.go_params->nodes;
@@ -683,6 +726,23 @@ void run_loop_impl(std::istream& in,
         }
         if (cmd.option->name == "hash") {
           engine.set_hash_size_mb(std::stoull(cmd.option->value.value()));
+        } else if (cmd.option->name == "ownbook") {
+          if (cmd.option->value.has_value()) {
+            own_book_enabled = (*cmd.option->value == "true");
+          }
+        } else if (cmd.option->name == "bookfile") {
+          if (cmd.option->value.has_value() && !cmd.option->value->empty() &&
+              *cmd.option->value != "<empty>") {
+            if (!opening_book.load(*cmd.option->value)) {
+              write_line("info string Failed to load book file: " + *cmd.option->value);
+            }
+          } else {
+            opening_book.unload();
+          }
+        } else if (cmd.option->name == "bookdepth") {
+          if (cmd.option->value.has_value()) {
+            book_depth = static_cast<std::uint8_t>(std::stoi(*cmd.option->value));
+          }
         }
         break;
 

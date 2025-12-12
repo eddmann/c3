@@ -21,6 +21,7 @@ endif()
 add_executable(c3_tests
   about_test.cpp
   board_test.cpp
+  book_test.cpp
   castling_test.cpp
   engine_test.cpp
   fen_test.cpp
