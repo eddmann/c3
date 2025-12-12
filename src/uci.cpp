@@ -23,6 +23,7 @@
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
 #include "c3/search.hpp"
+#include "c3/tablebase.hpp"
 
 namespace c3::uci {
 
@@ -307,6 +308,9 @@ SetOptionCommand parse_setoption(
     } catch (...) {
       throw std::runtime_error("could not parse value for 'hash' option");
     }
+  } else if (name == "syzygypath" || name == "syzygyprobedepth" || name == "syzygyprobelimit" ||
+             name == "syzygy50moverule") {
+    // Syzygy options validated in handler
   } else {
     throw std::runtime_error("unknown option '" + name + "'");
   }
@@ -569,6 +573,10 @@ void run_loop_impl(std::istream& in,
                    std::to_string(search::TT_DEFAULT_SIZE_MB) + " min " +
                    std::to_string(search::TT_MIN_SIZE_MB) + " max " +
                    std::to_string(search::TT_MAX_SIZE_MB));
+        write_line("option name SyzygyPath type string default <empty>");
+        write_line("option name SyzygyProbeDepth type spin default 1 min 0 max 100");
+        write_line("option name SyzygyProbeLimit type spin default 7 min 0 max 7");
+        write_line("option name Syzygy50MoveRule type check default true");
         write_line("uciok");
         break;
 
@@ -683,6 +691,25 @@ void run_loop_impl(std::istream& in,
         }
         if (cmd.option->name == "hash") {
           engine.set_hash_size_mb(std::stoull(cmd.option->value.value()));
+        } else if (cmd.option->name == "syzygypath") {
+          auto config = tablebase::get_config();
+          config.path = cmd.option->value.value_or("");
+          tablebase::set_config(config);
+          tablebase::init();
+        } else if (cmd.option->name == "syzygyprobedepth") {
+          auto config = tablebase::get_config();
+          config.probe_depth =
+              static_cast<std::uint8_t>(std::stoi(cmd.option->value.value_or("1")));
+          tablebase::set_config(config);
+        } else if (cmd.option->name == "syzygyprobelimit") {
+          auto config = tablebase::get_config();
+          config.probe_limit =
+              static_cast<std::uint8_t>(std::stoi(cmd.option->value.value_or("7")));
+          tablebase::set_config(config);
+        } else if (cmd.option->name == "syzygy50moverule") {
+          auto config = tablebase::get_config();
+          config.use_50_move_rule = (to_lower(cmd.option->value.value_or("true")) == "true");
+          tablebase::set_config(config);
         }
         break;
 

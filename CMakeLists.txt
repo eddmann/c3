@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(c3 LANGUAGES CXX)
+project(c3 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -81,6 +81,30 @@ else()
   add_custom_target(generate_magic)
 endif()
 
+# Syzygy tablebase support via Fathom
+include(FetchContent)
+FetchContent_Declare(
+  fathom
+  GIT_REPOSITORY https://github.com/jdart1/Fathom.git
+  GIT_TAG master
+)
+FetchContent_MakeAvailable(fathom)
+
+add_library(fathom_lib STATIC
+  ${fathom_SOURCE_DIR}/src/tbprobe.c
+)
+target_include_directories(fathom_lib PUBLIC ${fathom_SOURCE_DIR}/src)
+set_target_properties(fathom_lib PROPERTIES
+  C_STANDARD 99
+  C_STANDARD_REQUIRED ON
+)
+if(NOT MSVC)
+  target_compile_options(fathom_lib PRIVATE -w)
+endif()
+if(CMAKE_CXX_CLANG_TIDY)
+  set_target_properties(fathom_lib PROPERTIES CXX_CLANG_TIDY "")
+endif()
+
 add_library(c3_core STATIC
   src/about.cpp
   src/eval.cpp
@@ -90,10 +114,12 @@ add_library(c3_core STATIC
   src/engine.cpp
   src/uci.cpp
   src/search.cpp
+  src/tablebase.cpp
 )
 target_compile_definitions(c3_core PUBLIC C3_TESTING)
 add_dependencies(c3_core generate_magic)
 target_include_directories(c3_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(c3_core PUBLIC fathom_lib)
 c3_apply_standard_settings(c3_core)
 
 add_executable(c3

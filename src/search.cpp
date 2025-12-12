@@ -27,6 +27,7 @@
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
 #include "c3/piece.hpp"
+#include "c3/tablebase.hpp"
 
 namespace c3::search {
 namespace {
@@ -484,6 +485,29 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     tt_move = entry->move;
   }
 
+  // SYZYGY TABLEBASE PROBE
+  // Tablebases provide perfect play for endgame positions with few pieces.
+  // Probe after TT (TT is faster) but before expensive search operations.
+  const auto tb_config = tablebase::get_config();
+  if (tablebase::is_available() && depth >= tb_config.probe_depth) {
+    const auto wdl = tablebase::probe_wdl(pos);
+    if (wdl != tablebase::WdlResult::Failed) {
+      const int tb_score = tablebase::wdl_to_score(wdl, report.ply);
+
+      if (wdl == tablebase::WdlResult::Win || wdl == tablebase::WdlResult::Loss) {
+        tt.store(pos.key, depth, eval_in(tb_score, report.ply), Bound::Exact, std::nullopt);
+        return tb_score;
+      }
+
+      if (tb_score >= beta) {
+        return beta;
+      }
+      if (tb_score <= alpha) {
+        return alpha;
+      }
+    }
+  }
+
   report.nodes += 1;
 
   const Colour colour_to_move = pos.colour_to_move;
@@ -680,6 +704,31 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
   TranspositionTable tt;
   KillerMoves killers;
   Report report;
+
+  // ROOT TABLEBASE PROBE
+  // For endgame positions where tablebases are available, we can skip
+  // the entire search and return the optimal move directly.
+  if (tablebase::is_available()) {
+    if (const auto tb_move = tablebase::probe_root_move(pos)) {
+      const auto wdl = tablebase::probe_wdl(pos);
+      const int tb_eval =
+          (wdl != tablebase::WdlResult::Failed) ? tablebase::wdl_to_score(wdl, 0) : CENTIPAWN_DRAW;
+
+      SearchResult result;
+      result.depth = 1;
+      result.eval = tb_eval;
+      result.pv = {*tb_move};
+      result.nodes = 1;
+      result.hashfull = 0;
+
+      report.depth = 1;
+      report.pv = std::make_pair(result.pv, result.eval);
+      report.tt_stats = {0, 0};
+      reporter.send(report);
+
+      return result;
+    }
+  }
 
   const std::uint8_t max_depth = limits.depth.has_value() ? *limits.depth : MAX_DEPTH;
 

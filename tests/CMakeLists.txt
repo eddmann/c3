@@ -34,6 +34,7 @@ add_executable(c3_tests
   rng_test.cpp
   movegen_test.cpp
   search_test.cpp
+  tablebase_test.cpp
   uci_test.cpp
   zobrist_test.cpp
 )
