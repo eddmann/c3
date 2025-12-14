@@ -98,7 +98,16 @@ set_target_properties(fathom_lib PROPERTIES
   C_STANDARD 99
   C_STANDARD_REQUIRED ON
 )
-if(NOT MSVC)
+# Fathom uses _mm_popcnt_u64 which requires popcnt CPU feature.
+# Suppress warnings from third-party code and enable required CPU features.
+if(MSVC)
+  # MSVC and clang-cl: enable popcnt via SSE4.2 and suppress deprecation warnings
+  target_compile_options(fathom_lib PRIVATE /W0 /D_CRT_SECURE_NO_WARNINGS)
+  if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    # clang-cl needs explicit popcnt enablement
+    target_compile_options(fathom_lib PRIVATE -mpopcnt -msse4.2)
+  endif()
+else()
   target_compile_options(fathom_lib PRIVATE -w)
 endif()
 if(CMAKE_CXX_CLANG_TIDY)
