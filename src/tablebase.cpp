@@ -55,9 +55,13 @@ std::uint8_t init() {
   return 0;
 }
 
-bool is_available() { return g_initialized.load() && g_max_pieces.load() > 0; }
+bool is_available() {
+  return g_initialized.load() && g_max_pieces.load() > 0;
+}
 
-std::uint8_t max_pieces() { return g_max_pieces.load(); }
+std::uint8_t max_pieces() {
+  return g_max_pieces.load();
+}
 
 void free() {
   if (g_initialized.load()) {
@@ -94,13 +98,11 @@ WdlResult probe_wdl(const Position& pos) {
 
   const unsigned rule50 = config.use_50_move_rule ? pos.half_move_clock : 0;
   const unsigned castling = 0;
-  const unsigned ep =
-      pos.en_passant_square.has_value() ? pos.en_passant_square->index() : 0;
+  const unsigned ep = pos.en_passant_square.has_value() ? pos.en_passant_square->index() : 0;
   const bool turn = (pos.colour_to_move == Colour::White);
 
-  const unsigned result =
-      tb_probe_wdl(white, black, kings, queens, rooks, bishops, knights, pawns, rule50, castling,
-                   ep, turn);
+  const unsigned result = tb_probe_wdl(white, black, kings, queens, rooks, bishops, knights, pawns,
+                                       rule50, castling, ep, turn);
 
   if (result == TB_RESULT_FAILED) {
     return WdlResult::Failed;
@@ -136,14 +138,12 @@ std::optional<Move> probe_root_move(const Position& pos) {
 
   const unsigned rule50 = config.use_50_move_rule ? pos.half_move_clock : 0;
   const unsigned castling = 0;
-  const unsigned ep =
-      pos.en_passant_square.has_value() ? pos.en_passant_square->index() : 0;
+  const unsigned ep = pos.en_passant_square.has_value() ? pos.en_passant_square->index() : 0;
   const bool turn = (pos.colour_to_move == Colour::White);
 
   unsigned results[TB_MAX_MOVES];
-  const unsigned result =
-      tb_probe_root(white, black, kings, queens, rooks, bishops, knights, pawns, rule50, castling,
-                    ep, turn, results);
+  const unsigned result = tb_probe_root(white, black, kings, queens, rooks, bishops, knights, pawns,
+                                        rule50, castling, ep, turn, results);
 
   if (result == TB_RESULT_FAILED) {
     return std::nullopt;

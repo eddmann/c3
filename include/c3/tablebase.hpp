@@ -64,10 +64,10 @@ enum class WdlResult : std::uint8_t {
 
 // Configuration for tablebase probing (set via UCI options)
 struct Config {
-  std::string path;              // Directory containing Syzygy files (.rtbw, .rtbz)
-  std::uint8_t probe_depth{1};   // Minimum search depth before probing TBs
-  std::uint8_t probe_limit{7};   // Max piece count to probe (saves time in complex positions)
-  bool use_50_move_rule{true};   // Whether DTZ respects the 50-move draw rule
+  std::string path;            // Directory containing Syzygy files (.rtbw, .rtbz)
+  std::uint8_t probe_depth{1}; // Minimum search depth before probing TBs
+  std::uint8_t probe_limit{7}; // Max piece count to probe (saves time in complex positions)
+  bool use_50_move_rule{true}; // Whether DTZ respects the 50-move draw rule
 };
 
 // Score constant for TB wins (below mate threshold, above any material)
