@@ -166,7 +166,7 @@ TEST_F(BookLoadingTest, LoadNonexistentFile) {
 
 TEST_F(BookLoadingTest, LoadEmptyFile) {
   const auto path = test_dir_ / "empty.bin";
-  std::ofstream(path, std::ios::binary); // Create empty file
+  { std::ofstream file(path, std::ios::binary); } // Create empty file
 
   OpeningBook book;
   EXPECT_TRUE(book.load(path));
