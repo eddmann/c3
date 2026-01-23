@@ -1,6 +1,7 @@
 build/
 build-*/
 cmake-build-*/
+bot/lichess-bot/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

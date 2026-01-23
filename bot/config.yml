@@ -1,0 +1,72 @@
+token: ""                          # Set via LICHESS_BOT_TOKEN env var
+url: "https://lichess.org/"        # Lichess base URL
+
+engine:
+  dir: "../../build-release"       # Relative to lichess-bot directory
+  name: "c3"
+  protocol: "uci"
+  ponder: false
+
+  uci_options:
+    Hash: 256
+
+  draw_or_resign:
+    resign_enabled: false
+    offer_draw_enabled: true
+    offer_draw_score: 0
+    offer_draw_moves: 10
+    offer_draw_pieces: 10
+
+  online_moves:
+    max_out_of_book_moves: 10
+    max_retries: 2
+    chessdb_book:
+      enabled: false
+    lichess_cloud_analysis:
+      enabled: false
+    lichess_opening_explorer:
+      enabled: false
+    online_egtb:
+      enabled: false
+
+  lichess_bot_tbs:
+    syzygy:
+      enabled: false
+    gaviota:
+      enabled: false
+
+  silence_stderr: false
+
+abort_time: 30
+fake_think_time: false
+rate_limiting_delay: 0
+move_overhead: 1000
+
+challenge:
+  concurrency: 1
+  sort_by: "best"
+  accept_bot: true
+  only_bot: false
+  max_increment: 180
+  min_increment: 0
+  max_base: 10800
+  min_base: 0
+  variants:
+    - standard
+  time_controls:
+    - bullet
+    - blitz
+    - rapid
+    - classical
+  modes:
+    - casual
+    - rated
+
+greeting:
+  hello: "Hi! I'm {me}, a C3 chess engine. Good luck!"
+  goodbye: "Good game!"
+  hello_spectators: "Hi! I'm {me}, a C3 chess engine."
+  goodbye_spectators: "Thanks for watching!"
+
+matchmaking:
+  allow_matchmaking: false
