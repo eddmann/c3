@@ -47,20 +47,7 @@ void assert_pseudo_legal_move_count(std::string_view fen, std::size_t count) {
 }
 
 void assert_legal_move_count(std::string_view fen, std::size_t count) {
-  Position pos = parse_fen(fen);
-  std::size_t legal = 0;
-
-  for (const auto& mv : pseudo_legal_moves(pos)) {
-    pos.make_move(mv);
-
-    if (!is_in_check(pos.opponent_colour(), pos.board)) {
-      ++legal;
-    }
-
-    pos.unmake_move(mv);
-  }
-
-  EXPECT_EQ(legal, count) << fen;
+  EXPECT_EQ(legal_moves(parse_fen(fen)).size(), count) << fen;
 }
 
 std::size_t moves_from_square(const MoveList& moves, Square from) {
@@ -225,6 +212,15 @@ TEST(Movegen, LegalMoveCountInCheckmateIsZero) {
 
 TEST(Movegen, LegalMoveCountInCheckIsLimited) {
   assert_legal_move_count("rnbqkbnr/1pp1p1pp/p2p1p2/1B6/8/4P3/PPPP1PPP/RNBQK1NR b KQq - 0 1", 7);
+}
+
+TEST(Movegen, LegalMovesRejectMovesByAPinnedPiece) {
+  // The knight on e2 is the only thing between the king on e1 and the rook on
+  // e8, so every knight move is pseudo-legal yet none of them is legal.
+  const Position pos = parse_fen("4r3/8/8/8/8/8/4N3/4K3 w - - 0 1");
+
+  EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::E2), 6);
+  EXPECT_EQ(moves_from_square(legal_moves(pos), Square::E2), 0);
 }
 
 TEST(Movegen, WhitePawnMoves) {

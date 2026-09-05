@@ -515,6 +515,57 @@ MoveList pseudo_legal_noisy_moves(const Position& pos) {
 }
 
 // =============================================================================
+// PSEUDO-LEGAL THEN FILTER: FROM CANDIDATE MOVES TO LEGAL MOVES
+// =============================================================================
+// A pseudo-legal move obeys the movement rules of its piece but may still be
+// illegal, because it leaves (or puts) its own king under attack. There are two
+// ways to weed those out:
+//
+//   1. Never generate them. Before generating, work out which of our pieces are
+//      pinned against the king and along which ray each may still move, plus,
+//      when we are in check, the squares that block or capture the checker.
+//      Nothing illegal is ever produced, but the bookkeeping is substantial and
+//      easy to get subtly wrong (en passant alone has two ways to expose a king).
+//
+//   2. Generate everything, then play each move and ask whether our king ended
+//      up attacked. That is what this engine does: one make/unmake and one
+//      is_in_check per candidate move, and the rules live in exactly one place.
+//
+// The trade-off is speed for simplicity. Option 2 pays a make/unmake for moves
+// that turn out to be illegal (a handful per position in practice, since pins
+// are rare) and calls is_in_check for every candidate. For an engine written to
+// be read, that is a good deal: correctness here is worth far more than the few
+// percent, and the search recoups some of it by pruning most branches before
+// their moves are ever filtered.
+// =============================================================================
+
+namespace {
+
+// Filters in place. Every move is taken back, so `pos` is left exactly as found.
+MoveList filter_to_legal(Position& pos) {
+  MoveList moves = pseudo_legal_moves(pos);
+
+  std::erase_if(moves, [&pos](const Move& mv) {
+    pos.make_move(mv);
+    // make_move has flipped the side to move, so the mover is now the opponent.
+    const bool leaves_own_king_attacked = is_in_check(pos.opponent_colour(), pos.board);
+    pos.unmake_move(mv);
+    return leaves_own_king_attacked;
+  });
+
+  return moves;
+}
+
+} // namespace
+
+MoveList legal_moves(const Position& pos) {
+  // The filter has to play moves out on a board, so it works on a copy and
+  // leaves the caller's position untouched.
+  Position working = pos;
+  return filter_to_legal(working);
+}
+
+// =============================================================================
 // PERFT: Performance Test / Move Generation Validation
 // =============================================================================
 // Perft counts all leaf nodes at a given depth. It's the gold standard for
@@ -531,16 +582,20 @@ std::uint64_t perft(Position& pos, std::uint8_t depth) {
     return 1;
   }
 
+  const MoveList moves = filter_to_legal(pos);
+
+  // Bulk counting: at depth 1 every legal move is itself a leaf, so the size of
+  // the list is the answer. Since most of a perft tree lives at its last ply,
+  // skipping a make/unmake and a recursive call per leaf saves real time.
+  if (depth == 1) {
+    return moves.size();
+  }
+
   std::uint64_t nodes = 0;
 
-  for (const auto& mv : pseudo_legal_moves(pos)) {
+  for (const auto& mv : moves) {
     pos.make_move(mv);
-
-    // Filter out moves that leave own king in check (pseudo-legal → legal)
-    if (!is_in_check(pos.opponent_colour(), pos.board)) {
-      nodes += perft(pos, static_cast<std::uint8_t>(depth - 1));
-    }
-
+    nodes += perft(pos, static_cast<std::uint8_t>(depth - 1));
     pos.unmake_move(mv);
   }
 

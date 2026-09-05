@@ -15,6 +15,7 @@ using MoveList = std::vector<Move>;
 
 MoveList pseudo_legal_moves(const Position& pos);
 MoveList pseudo_legal_noisy_moves(const Position& pos);
+MoveList legal_moves(const Position& pos);
 std::uint64_t perft(Position& pos, std::uint8_t depth);
 
 } // namespace c3
