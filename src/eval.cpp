@@ -59,8 +59,8 @@ namespace {
 // piece values in eval.hpp. They were chosen over tuned tables (such as
 // PeSTO's) because every number in them is explainable to a human: the knight
 // table is literally "how many squares does a knight cover from here", and the
-// king tables spell out castling. Two deliberate deviations from the published
-// tables:
+// king tables spell out castling. Three deliberate deviations from the
+// published set:
 //
 //   - The published queen table has three rows whose right half does not mirror
 //     its left half, an artifact of hand-typing. We mirror the left half onto
@@ -68,172 +68,146 @@ namespace {
 //     positions that are strategically identical—always score the same.
 //   - The published set only distinguishes middlegame from endgame for the
 //     king. We keep that for the pieces (a knight likes the centre whenever it
-//     is on the board) but add an endgame pawn table, because a pawn's job
-//     changes completely once the pieces are gone: it stops fighting for the
-//     centre and starts running for promotion.
+//     is on the board) but add an endgame pawn table of our own, because a
+//     pawn's job changes completely once the pieces are gone: it stops fighting
+//     for the centre and starts running for promotion.
+//   - The published set has one list of piece values. PIECE_VALUES_ENDGAME in
+//     eval.hpp is ours too, so that the taper can reprice a pawn as the board
+//     empties.
 // =============================================================================
 
 using PieceSquareTable = std::array<int, 64>;
 
-// clang-format off
-constexpr std::array<PieceSquareTable, 6> MIDDLEGAME_TABLES = {{
-    // PAWN: reward advancement, reward the big centre (d4/e4), and discourage
-    // pushing the pawns in front of a castled king (the -20s on d2/e2 mean the
-    // engine prefers to advance the centre pawns rather than its own shelter).
-    {
-         0,   0,   0,   0,   0,   0,   0,   0,
-        50,  50,  50,  50,  50,  50,  50,  50,
-        10,  10,  20,  30,  30,  20,  10,  10,
-         5,   5,  10,  25,  25,  10,   5,   5,
-         0,   0,   0,  20,  20,   0,   0,   0,
-         5,  -5, -10,   0,   0, -10,  -5,   5,
-         5,  10,  10, -20, -20,  10,  10,   5,
-         0,   0,   0,   0,   0,   0,   0,   0,
-    },
-    // KNIGHT: "a knight on the rim is dim". The numbers track how many squares a
-    // knight attacks from each square: 8 in the centre, 4 on an edge, 2 in a corner.
-    {
-        -50, -40, -30, -30, -30, -30, -40, -50,
-        -40, -20,   0,   0,   0,   0, -20, -40,
-        -30,   0,  10,  15,  15,  10,   0, -30,
-        -30,   5,  15,  20,  20,  15,   5, -30,
-        -30,   0,  15,  20,  20,  15,   0, -30,
-        -30,   5,  10,  15,  15,  10,   5, -30,
-        -40, -20,   0,   5,   5,   0, -20, -40,
-        -50, -40, -30, -30, -30, -30, -40, -50,
-    },
-    // BISHOP: long diagonals are everything; the edges halve a bishop's reach.
-    // The +10 row on rank 3 rewards the fianchetto and the classic Bd3/Bc4 posts.
-    {
-        -20, -10, -10, -10, -10, -10, -10, -20,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,  10,  10,   5,   0, -10,
-        -10,   5,   5,  10,  10,   5,   5, -10,
-        -10,   0,  10,  10,  10,  10,   0, -10,
-        -10,  10,  10,  10,  10,  10,  10, -10,
-        -10,   5,   0,   0,   0,   0,   5, -10,
-        -20, -10, -10, -10, -10, -10, -10, -20,
-    },
-    // ROOK: the 7th rank is the prize (it attacks pawns and cages the king).
-    // The small d1/e1 bonus nudges rooks towards the central files after castling.
-    {
-         0,   0,   0,   0,   0,   0,   0,   0,
-         5,  10,  10,  10,  10,  10,  10,   5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-         0,   0,   0,   5,   5,   0,   0,   0,
-    },
-    // QUEEN: mildly prefers the centre, and mostly just avoids the edges and
-    // corners where she is easy to harass with tempo.
-    {
-        -20, -10, -10,  -5,  -5, -10, -10, -20,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,   5,   5,   5,   0, -10,
-         -5,   0,   5,   5,   5,   5,   0,  -5,
-          0,   0,   5,   5,   5,   5,   0,   0,
-        -10,   5,   5,   5,   5,   5,   5, -10,
-        -10,   0,   5,   0,   0,   5,   0, -10,
-        -20, -10, -10,  -5,  -5, -10, -10, -20,
-    },
-    // KING (middlegame): with enemy pieces swarming, the king wants a roof over
-    // its head. Every square from rank 3 upwards is heavily punished; the +30 on
-    // b1/g1 and +20 on the corner squares are where castling actually lands.
-    {
-        -30, -40, -40, -50, -50, -40, -40, -30,
-        -30, -40, -40, -50, -50, -40, -40, -30,
-        -30, -40, -40, -50, -50, -40, -40, -30,
-        -30, -40, -40, -50, -50, -40, -40, -30,
-        -20, -30, -30, -40, -40, -30, -30, -20,
-        -10, -20, -20, -20, -20, -20, -20, -10,
-         20,  20,   0,   0,   0,   0,  20,  20,
-         20,  30,  10,   0,   0,  10,  30,  20,
-    },
-}};
+// -----------------------------------------------------------------------------
+// Phase-independent tables: a knight's reach, a bishop's diagonals, a rook's
+// files and a queen's centralisation do not change when the queens come off, so
+// these four tables are declared once and used by BOTH phases below. Only the
+// pawn and the king get a second table, because only their jobs change.
+// -----------------------------------------------------------------------------
 
-constexpr std::array<PieceSquareTable, 6> ENDGAME_TABLES = {{
-    // PAWN (endgame): with the pieces gone, a pawn's only ambition is to queen,
-    // so the bonus depends on the rank alone. Which file it stands on no longer
-    // matters, and there is no castled king left whose shelter must be kept.
-    {
-          0,   0,   0,   0,   0,   0,   0,   0,
-         80,  80,  80,  80,  80,  80,  80,  80,
-         50,  50,  50,  50,  50,  50,  50,  50,
-         30,  30,  30,  30,  30,  30,  30,  30,
-         15,  15,  15,  15,  15,  15,  15,  15,
-          5,   5,   5,   5,   5,   5,   5,   5,
-          0,   0,   0,   0,   0,   0,   0,   0,
-          0,   0,   0,   0,   0,   0,   0,   0,
-    },
-    // KNIGHT: a knight's reach does not depend on the game phase, so the
-    // middlegame table is reused verbatim. Same for the bishop, rook and queen.
-    {
-        -50, -40, -30, -30, -30, -30, -40, -50,
-        -40, -20,   0,   0,   0,   0, -20, -40,
-        -30,   0,  10,  15,  15,  10,   0, -30,
-        -30,   5,  15,  20,  20,  15,   5, -30,
-        -30,   0,  15,  20,  20,  15,   0, -30,
-        -30,   5,  10,  15,  15,  10,   5, -30,
-        -40, -20,   0,   5,   5,   0, -20, -40,
-        -50, -40, -30, -30, -30, -30, -40, -50,
-    },
-    // BISHOP
-    {
-        -20, -10, -10, -10, -10, -10, -10, -20,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,  10,  10,   5,   0, -10,
-        -10,   5,   5,  10,  10,   5,   5, -10,
-        -10,   0,  10,  10,  10,  10,   0, -10,
-        -10,  10,  10,  10,  10,  10,  10, -10,
-        -10,   5,   0,   0,   0,   0,   5, -10,
-        -20, -10, -10, -10, -10, -10, -10, -20,
-    },
-    // ROOK
-    {
-         0,   0,   0,   0,   0,   0,   0,   0,
-         5,  10,  10,  10,  10,  10,  10,   5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-        -5,   0,   0,   0,   0,   0,   0,  -5,
-         0,   0,   0,   5,   5,   0,   0,   0,
-    },
-    // QUEEN
-    {
-        -20, -10, -10,  -5,  -5, -10, -10, -20,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,   5,   5,   5,   0, -10,
-         -5,   0,   5,   5,   5,   5,   0,  -5,
-          0,   0,   5,   5,   5,   5,   0,   0,
-        -10,   5,   5,   5,   5,   5,   5, -10,
-        -10,   0,   5,   0,   0,   5,   0, -10,
-        -20, -10, -10,  -5,  -5, -10, -10, -20,
-    },
-    // KING (endgame): the mirror image of the middlegame table. With no enemy
-    // queen left to fear, a centralised king supports its own pawns, blocks the
-    // enemy king and shepherds passers home, while a king stuck on h1 is simply
-    // out of play. Driving the defending king towards a corner is also exactly
-    // how K+Q and K+R deliver mate, so the same table teaches both sides.
-    {
-        -50, -40, -30, -20, -20, -30, -40, -50,
-        -30, -20, -10,   0,   0, -10, -20, -30,
-        -30, -10,  20,  30,  30,  20, -10, -30,
-        -30, -10,  30,  40,  40,  30, -10, -30,
-        -30, -10,  30,  40,  40,  30, -10, -30,
-        -30, -10,  20,  30,  30,  20, -10, -30,
-        -30, -30,   0,   0,   0,   0, -30, -30,
-        -50, -30, -30, -30, -30, -30, -30, -50,
-    },
-}};
+// clang-format off
+
+// KNIGHT: "a knight on the rim is dim". The numbers track how many squares a
+// knight attacks from each square: 8 in the centre, 4 on an edge, 2 in a corner.
+constexpr PieceSquareTable KNIGHT_TABLE = {
+    -50, -40, -30, -30, -30, -30, -40, -50,
+    -40, -20,   0,   0,   0,   0, -20, -40,
+    -30,   0,  10,  15,  15,  10,   0, -30,
+    -30,   5,  15,  20,  20,  15,   5, -30,
+    -30,   0,  15,  20,  20,  15,   0, -30,
+    -30,   5,  10,  15,  15,  10,   5, -30,
+    -40, -20,   0,   5,   5,   0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50,
+};
+
+// BISHOP: long diagonals are everything; the edges halve a bishop's reach.
+// The +10 row on rank 3 rewards the fianchetto and the classic Bd3/Bc4 posts.
+constexpr PieceSquareTable BISHOP_TABLE = {
+    -20, -10, -10, -10, -10, -10, -10, -20,
+    -10,   0,   0,   0,   0,   0,   0, -10,
+    -10,   0,   5,  10,  10,   5,   0, -10,
+    -10,   5,   5,  10,  10,   5,   5, -10,
+    -10,   0,  10,  10,  10,  10,   0, -10,
+    -10,  10,  10,  10,  10,  10,  10, -10,
+    -10,   5,   0,   0,   0,   0,   5, -10,
+    -20, -10, -10, -10, -10, -10, -10, -20,
+};
+
+// ROOK: the 7th rank is the prize (it attacks pawns and cages the king).
+// The small d1/e1 bonus nudges rooks towards the central files after castling.
+constexpr PieceSquareTable ROOK_TABLE = {
+     0,   0,   0,   0,   0,   0,   0,   0,
+     5,  10,  10,  10,  10,  10,  10,   5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+     0,   0,   0,   5,   5,   0,   0,   0,
+};
+
+// QUEEN: mildly prefers the centre, and mostly just avoids the edges and
+// corners where she is easy to harass with tempo.
+constexpr PieceSquareTable QUEEN_TABLE = {
+    -20, -10, -10,  -5,  -5, -10, -10, -20,
+    -10,   0,   0,   0,   0,   0,   0, -10,
+    -10,   0,   5,   5,   5,   5,   0, -10,
+     -5,   0,   5,   5,   5,   5,   0,  -5,
+      0,   0,   5,   5,   5,   5,   0,   0,
+    -10,   5,   5,   5,   5,   5,   5, -10,
+    -10,   0,   5,   0,   0,   5,   0, -10,
+    -20, -10, -10,  -5,  -5, -10, -10, -20,
+};
+
+// PAWN (middlegame): reward advancement, reward the big centre (d4/e4), and
+// discourage pushing the pawns in front of a castled king (the -20s on d2/e2
+// mean the engine advances its centre pawns rather than its own shelter).
+constexpr PieceSquareTable MIDDLEGAME_PAWN_TABLE = {
+     0,   0,   0,   0,   0,   0,   0,   0,
+    50,  50,  50,  50,  50,  50,  50,  50,
+    10,  10,  20,  30,  30,  20,  10,  10,
+     5,   5,  10,  25,  25,  10,   5,   5,
+     0,   0,   0,  20,  20,   0,   0,   0,
+     5,  -5, -10,   0,   0, -10,  -5,   5,
+     5,  10,  10, -20, -20,  10,  10,   5,
+     0,   0,   0,   0,   0,   0,   0,   0,
+};
+
+// PAWN (endgame): with the pieces gone, a pawn's only ambition is to queen, so
+// the bonus depends on the rank alone. Which file it stands on no longer
+// matters, and there is no castled king left whose shelter must be kept.
+constexpr PieceSquareTable ENDGAME_PAWN_TABLE = {
+      0,   0,   0,   0,   0,   0,   0,   0,
+     80,  80,  80,  80,  80,  80,  80,  80,
+     50,  50,  50,  50,  50,  50,  50,  50,
+     30,  30,  30,  30,  30,  30,  30,  30,
+     15,  15,  15,  15,  15,  15,  15,  15,
+      5,   5,   5,   5,   5,   5,   5,   5,
+      0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,
+};
+
+// KING (middlegame): with enemy pieces swarming, the king wants a roof over its
+// head. Every square from rank 3 upwards is heavily punished; the +30 on b1/g1
+// and +20 on the corner squares are where castling actually lands.
+constexpr PieceSquareTable MIDDLEGAME_KING_TABLE = {
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -20, -30, -30, -40, -40, -30, -30, -20,
+    -10, -20, -20, -20, -20, -20, -20, -10,
+     20,  20,   0,   0,   0,   0,  20,  20,
+     20,  30,  10,   0,   0,  10,  30,  20,
+};
+
+// KING (endgame): the opposite advice to the middlegame table. With no enemy
+// queen left to fear, a centralised king supports its own pawns, blocks the
+// enemy king and shepherds passers home, while a king stuck on h1 is simply out
+// of play. Driving the defending king towards a corner is also exactly how K+Q
+// and K+R deliver mate, so the same table teaches both sides of that ending.
+constexpr PieceSquareTable ENDGAME_KING_TABLE = {
+    -50, -40, -30, -20, -20, -30, -40, -50,
+    -30, -20, -10,   0,   0, -10, -20, -30,
+    -30, -10,  20,  30,  30,  20, -10, -30,
+    -30, -10,  30,  40,  40,  30, -10, -30,
+    -30, -10,  30,  40,  40,  30, -10, -30,
+    -30, -10,  20,  30,  30,  20, -10, -30,
+    -30, -30,   0,   0,   0,   0, -30, -30,
+    -50, -30, -30, -30, -30, -30, -30, -50,
+};
 // clang-format on
 
-constexpr std::array<std::array<PieceSquareTable, 6>, 2> PIECE_SQUARE_BASE = {
-    MIDDLEGAME_TABLES,
-    ENDGAME_TABLES,
-};
+// The two sets the taper blends between, in piece order (P, N, B, R, Q, K).
+// Four of the six entries are literally the same table in both rows, which is
+// what makes "these pieces are phase-independent" a fact rather than a promise.
+constexpr std::array<std::array<PieceSquareTable, 6>, 2> PIECE_SQUARE_BASE = {{
+    // Middlegame
+    {MIDDLEGAME_PAWN_TABLE, KNIGHT_TABLE, BISHOP_TABLE, ROOK_TABLE, QUEEN_TABLE,
+     MIDDLEGAME_KING_TABLE},
+    // Endgame
+    {ENDGAME_PAWN_TABLE, KNIGHT_TABLE, BISHOP_TABLE, ROOK_TABLE, QUEEN_TABLE, ENDGAME_KING_TABLE},
+}};
 
 // =============================================================================
 // RANK FLIP TABLE
@@ -259,7 +233,9 @@ constexpr std::array<std::array<std::size_t, 64>, 2> RANK_FLIP_TABLE = {{
          8,  9, 10, 11, 12, 13, 14, 15,
          0,  1,  2,  3,  4,  5,  6,  7,
     }},
-    // Black
+    // Black: the identity mapping. Read in memory order the tables already run
+    // from Black's home rank outwards, so slot N is exactly what a black piece
+    // standing on square N deserves—no translation needed.
     {{
          0,  1,  2,  3,  4,  5,  6,  7,
          8,  9, 10, 11, 12, 13, 14, 15,
@@ -274,7 +250,14 @@ constexpr std::array<std::array<std::size_t, 64>, 2> RANK_FLIP_TABLE = {{
 // clang-format on
 
 // Fold the base tables into a lookup indexed by [phase][piece][square] at
-// compile time, so evaluation never pays for the flipping at run time.
+// compile time, so the rank flipping above costs nothing at run time.
+//
+// That is a small saving next to the real cost: eval() walks both piece lists
+// twice, once per phase, so a tapered evaluation is roughly twice the work of a
+// single-phase one. We take that hit deliberately—reading two independent
+// component scores is much easier to follow than the usual trick of updating a
+// packed (middlegame, endgame) pair incrementally inside make_move, which is
+// where a later performance pass would take this.
 constexpr std::array<std::array<PieceSquareTable, 12>, 2> build_psqt() {
   std::array<std::array<PieceSquareTable, 12>, 2> psqt{};
 
@@ -310,6 +293,15 @@ int count_of(const Board& board, Piece piece) noexcept {
   return static_cast<int>(board.count_pieces(piece));
 }
 
+// Two bishops are only a "pair" when they cover different square colours—that
+// is what makes them able to hit every square on the board. Two bishops on one
+// colour (which promotions can produce) still leave half the board untouched,
+// so they earn nothing extra.
+bool has_bishop_pair(const Board& board, Colour side) noexcept {
+  const Bitboard bishops = board.pieces(bishop(side));
+  return (bishops & LIGHT_SQUARES) != 0 && (bishops & DARK_SQUARES) != 0;
+}
+
 } // namespace
 
 // Non-pawn material left on the board, on the 24-point scale described in eval.hpp.
@@ -334,14 +326,16 @@ int game_phase(const Board& board) noexcept {
 //   - K vs K            nothing to mate with
 //   - K+N vs K          a lone knight cannot cover the squares a mate needs
 //   - K+B vs K          a lone bishop only ever controls half the board
-//   - K+B vs K+B        with both bishops on the same colour squares, the
-//                       defending king lives on the other colour untouchably
+//   - one minor each    K+B vs K+B (same or opposite colours), K+B vs K+N and
+//                       K+N vs K+N are all drawn: one minor piece plus a king
+//                       simply cannot corner a king that is not helping
 //   - K+N+N vs K        two knights cannot FORCE mate: mating positions exist,
-//                       but the defender can always sidestep them. Strictly
-//                       this is "cannot be forced" rather than "cannot happen",
-//                       so scoring it as a draw is a deliberate simplification
-//                       we share with most engines—it costs nothing real and
-//                       stops the search chasing a mate that is not there.
+//                       but the defender can always sidestep them
+//
+// The last two entries are "cannot be forced" rather than "cannot happen"—a
+// helpless opponent could still walk into mate. Scoring them as draws is a
+// deliberate simplification we share with most engines: it costs nothing real
+// and stops the search chasing a mate that correct defence always avoids.
 //
 // Anything with a pawn (it can promote), a rook or a queen is winnable, so those
 // positions are rejected up front.
@@ -368,19 +362,18 @@ bool has_insufficient_material(const Board& board) noexcept {
     return true;
   }
 
+  // One minor each: bishop against bishop (whatever colours they run on),
+  // bishop against knight or knight against knight are all drawn.
+  if (white_minors == 1 && black_minors == 1) {
+    return true;
+  }
+
   // Two knights against a bare king.
   if (white_knights == 2 && white_bishops == 0 && black_minors == 0) {
     return true;
   }
   if (black_knights == 2 && black_bishops == 0 && white_minors == 0) {
     return true;
-  }
-
-  // One bishop each, both travelling on the same colour squares: the defending
-  // king simply keeps to the other colour, where no bishop can ever reach it.
-  if (white_bishops == 1 && black_bishops == 1 && white_knights == 0 && black_knights == 0) {
-    const Bitboard bishops = board.pieces(Piece::WB) | board.pieces(Piece::BB);
-    return (bishops & LIGHT_SQUARES) == bishops || (bishops & DARK_SQUARES) == bishops;
   }
 
   return false;
@@ -395,7 +388,7 @@ int eval_material(Colour colour, const Board& board, Phase phase) noexcept {
     total += values[static_cast<std::size_t>(piece)] * count_of(board, piece);
   }
 
-  if (count_of(board, bishop(colour)) >= 2) {
+  if (has_bishop_pair(board, colour)) {
     total += phase == Phase::Middlegame ? BISHOP_PAIR_MIDDLEGAME : BISHOP_PAIR_ENDGAME;
   }
 

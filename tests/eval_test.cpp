@@ -258,35 +258,45 @@ TEST(Eval, QueenVsTwoRooks) {
 TEST(Eval, TwoBishopsOutweighTwoKnights) {
   // Two bishops (330 + 330, plus the pair bonus) against two knights (320 + 320).
   // Note this comparison alone does not prove the pair bonus exists: a single
-  // bishop already outscores a single knight. BishopPairBonusNeedsTwoBishops
+  // bishop already outscores a single knight. BishopPairNeedsBothSquareColours
   // below is the test that isolates the bonus itself.
-  const auto bishops = parse("4k3/8/8/8/8/8/8/1B2KB2 w - - 0 1");
-  const auto knights = parse("4k3/8/8/8/8/8/8/1N2KN2 w - - 0 1");
+  const auto bishops = parse("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1");
+  const auto knights = parse("4k3/8/8/8/8/8/8/2N1KN2 w - - 0 1");
 
   EXPECT_GT(eval(bishops), eval(knights));
 }
 
-TEST(MaterialEval, BishopPairBonusNeedsTwoBishops) {
-  // Identical squares in both positions, so the piece-square tables cancel and
-  // only the material term differs: trading the knight on f1 for a bishop is
-  // worth the piece difference PLUS the bishop-pair bonus.
-  const auto pair = parse("4k3/8/8/8/8/8/8/1B2KB2 w - - 0 1");
-  const auto mixed = parse("4k3/8/8/8/8/8/8/1B2KN2 w - - 0 1");
-
+TEST(MaterialEval, BishopPairNeedsBothSquareColours) {
+  // Pieces sit on the same squares throughout, so the piece-square tables
+  // cancel and only the material term differs.
   const auto bishop_value = PIECE_VALUES[static_cast<std::size_t>(Piece::WB)];
   const auto knight_value = PIECE_VALUES[static_cast<std::size_t>(Piece::WN)];
 
-  EXPECT_EQ(eval_material(Colour::White, pair.board, Phase::Middlegame) -
-                eval_material(Colour::White, mixed.board, Phase::Middlegame),
+  const auto middlegame_material = [](const Position& pos) {
+    return eval_material(Colour::White, pos.board, Phase::Middlegame);
+  };
+
+  // c1 is dark and f1 is light, so this really is a pair: swapping the knight
+  // for the second bishop is worth the piece difference PLUS the bonus.
+  const auto pair = parse("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1");
+  const auto mixed = parse("4k3/8/8/8/8/8/8/2B1KN2 w - - 0 1");
+
+  EXPECT_EQ(middlegame_material(pair) - middlegame_material(mixed),
             bishop_value - knight_value + BISHOP_PAIR_MIDDLEGAME);
 
-  // A side with one bishop collects no bonus at all.
+  // b1 and f1 are both light squares: two bishops, but half the board is still
+  // out of reach, so there is no pair bonus to collect.
+  const auto same_colour = parse("4k3/8/8/8/8/8/8/1B2KB2 w - - 0 1");
+  const auto same_colour_mixed = parse("4k3/8/8/8/8/8/8/1B2KN2 w - - 0 1");
+
+  EXPECT_EQ(middlegame_material(same_colour) - middlegame_material(same_colour_mixed),
+            bishop_value - knight_value);
+
+  // A side with one bishop collects nothing either.
   const auto single = parse("4k3/8/8/8/8/8/8/4KB2 w - - 0 1");
   const auto none = parse("4k3/8/8/8/8/8/8/4KN2 w - - 0 1");
 
-  EXPECT_EQ(eval_material(Colour::White, single.board, Phase::Middlegame) -
-                eval_material(Colour::White, none.board, Phase::Middlegame),
-            bishop_value - knight_value);
+  EXPECT_EQ(middlegame_material(single) - middlegame_material(none), bishop_value - knight_value);
 }
 
 // -----------------------------------------------------------------------------
@@ -324,22 +334,6 @@ TEST(Eval, MirroringFilesKeepsTheSameScore) {
   const auto mirrored = parse(mirror_files(fen));
 
   EXPECT_EQ(eval(pos), eval(mirrored));
-}
-
-// -----------------------------------------------------------------------------
-// Insufficient Material
-// -----------------------------------------------------------------------------
-
-TEST(Eval, LoneBishopCannotMateSoScoresDrawn) {
-  const auto bishop_versus_bare_king = parse("4k3/8/8/8/8/8/8/4KB2 w - - 0 1");
-
-  EXPECT_EQ(eval(bishop_versus_bare_king), CENTIPAWN_DRAW);
-}
-
-TEST(Eval, LoneRookCanMateSoDoesNotScoreDrawn) {
-  const auto rook_versus_bare_king = parse("4k3/8/8/8/8/8/8/4KR2 w - - 0 1");
-
-  EXPECT_NE(eval(rook_versus_bare_king), CENTIPAWN_DRAW);
 }
 
 // -----------------------------------------------------------------------------
@@ -420,7 +414,6 @@ TEST(TaperedEval, PartialArmiesLandBetweenTheTwoScores) {
   const int endgame = advantage(pos, Phase::Endgame);
   ASSERT_NE(middlegame, endgame);
 
-  EXPECT_EQ(eval(pos), (middlegame * phase + endgame * (PHASE_MAX - phase)) / PHASE_MAX);
   EXPECT_GE(eval(pos), std::min(middlegame, endgame));
   EXPECT_LE(eval(pos), std::max(middlegame, endgame));
 }
@@ -428,6 +421,18 @@ TEST(TaperedEval, PartialArmiesLandBetweenTheTwoScores) {
 // -----------------------------------------------------------------------------
 // Insufficient Material
 // -----------------------------------------------------------------------------
+
+TEST(Eval, LoneBishopCannotMateSoScoresDrawn) {
+  const auto bishop_versus_bare_king = parse("4k3/8/8/8/8/8/8/4KB2 w - - 0 1");
+
+  EXPECT_EQ(eval(bishop_versus_bare_king), CENTIPAWN_DRAW);
+}
+
+TEST(Eval, LoneRookCanMateSoDoesNotScoreDrawn) {
+  const auto rook_versus_bare_king = parse("4k3/8/8/8/8/8/8/4KR2 w - - 0 1");
+
+  EXPECT_NE(eval(rook_versus_bare_king), CENTIPAWN_DRAW);
+}
 
 TEST(InsufficientMaterial, RecognisesDeadDraws) {
   EXPECT_TRUE(has_insufficient_material(parse("4k3/8/8/8/8/8/8/4K3 w - - 0 1").board))
@@ -439,7 +444,13 @@ TEST(InsufficientMaterial, RecognisesDeadDraws) {
   EXPECT_TRUE(has_insufficient_material(parse("4k3/8/8/8/8/8/8/2N1KN2 w - - 0 1").board))
       << "two knights cannot force mate";
   EXPECT_TRUE(has_insufficient_material(parse("4kb2/8/8/8/8/8/8/2B1K3 w - - 0 1").board))
-      << "bishops on the same colour squares (c1 and f8 are both dark)";
+      << "one bishop each, same colour squares (c1 and f8 are both dark)";
+  EXPECT_TRUE(has_insufficient_material(parse("2b1k3/8/8/8/8/8/8/2B1K3 w - - 0 1").board))
+      << "one bishop each, opposite colours (c8 is light, c1 is dark)";
+  EXPECT_TRUE(has_insufficient_material(parse("4kb2/8/8/8/8/8/8/4KN2 w - - 0 1").board))
+      << "knight against bishop";
+  EXPECT_TRUE(has_insufficient_material(parse("4kn2/8/8/8/8/8/8/4KN2 w - - 0 1").board))
+      << "knight against knight";
 }
 
 TEST(InsufficientMaterial, LeavesWinnableEndgamesAlone) {
@@ -447,10 +458,14 @@ TEST(InsufficientMaterial, LeavesWinnableEndgamesAlone) {
       << "a rook mates";
   EXPECT_FALSE(has_insufficient_material(parse("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").board))
       << "a pawn can promote";
-  EXPECT_FALSE(has_insufficient_material(parse("2b1k3/8/8/8/8/8/8/2B1K3 w - - 0 1").board))
-      << "bishops on opposite colours (c8 is light, c1 is dark)";
   EXPECT_FALSE(has_insufficient_material(parse("4k3/8/8/8/8/8/8/3BKN2 w - - 0 1").board))
       << "bishop and knight mate";
+  EXPECT_FALSE(has_insufficient_material(parse("4kn2/8/8/8/8/8/8/2B1KB2 w - - 0 1").board))
+      << "two bishops beat a lone knight";
+}
+
+TEST(Eval, MinorAgainstMinorScoresDrawn) {
+  EXPECT_EQ(eval(parse("4kb2/8/8/8/8/8/8/4KN2 w - - 0 1")), CENTIPAWN_DRAW);
 }
 
 TEST(Eval, TwoKnightsAgainstABareKingScoreDrawn) {

@@ -130,10 +130,11 @@ enum class Phase : std::size_t { Middlegame, Endgame };
 // for MVV-LVA capture ordering ("most valuable victim, least valuable
 // attacker"), which is why it keeps its 12-entry shape.
 //
-// PIECE_VALUES_ENDGAME nudges the numbers for a bare board: a pawn is worth
-// more once it has a realistic chance of queening, and the long-range pieces
-// gain a little as the board opens up. Minor pieces stay put—they are the
-// yardstick everything else is measured against.
+// PIECE_VALUES_ENDGAME is our own addition—the published set has a single list
+// of values—and nudges the numbers for a bare board: a pawn is worth more once
+// it has a realistic chance of queening, and the long-range pieces gain a little
+// as the board opens up. Minor pieces stay put; they are the yardstick
+// everything else is measured against.
 // =============================================================================
 
 inline constexpr std::array<int, 12> PIECE_VALUES = {
