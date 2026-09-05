@@ -1640,18 +1640,6 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   return alpha;
 }
 
-int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
-                      TranspositionTable& tt, KillerMoves& killers, Report& report,
-                      const Stopper& stopper) {
-  SearchContext ctx;
-  ctx.killers = killers;
-
-  const int eval = alphabeta(pos, depth, alpha, beta, pv, tt, ctx, report, stopper);
-
-  killers = ctx.killers;
-  return eval;
-}
-
 // ---------------------------------------------------------------------------
 // ITERATIVE DEEPENING
 // ---------------------------------------------------------------------------

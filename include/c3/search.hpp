@@ -828,15 +828,6 @@ int quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, Report& r
 int alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
               TranspositionTable& tt, SearchContext& ctx, Report& report, const Stopper& stopper,
               const std::optional<Move>& previous_move = std::nullopt);
-
-// The spelling from before killers, history and counter-moves were bundled into
-// a SearchContext, kept for one cycle so callers written against it still
-// compile. It searches with a context of its own, seeded from `killers` and
-// copied back afterwards, which means the history and counter-move tables that
-// context builds are discarded when the call returns—so this is the slower way
-// to search, and new code should take a SearchContext.
-int alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
-              TranspositionTable& tt, KillerMoves& killers, Report& report, const Stopper& stopper);
 } // namespace detail
 
 } // namespace c3::search

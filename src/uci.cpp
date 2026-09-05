@@ -1342,12 +1342,13 @@ std::string run_script_for_test(
       search::Report report;
       search::Stopper stopper;
       search::TranspositionTable tt;
-      search::KillerMoves killers;
+      // Everything one search learns about move ordering, plus the per-ply
+      // scratch rows the recursion writes into instead of its own stack frames.
+      search::SearchContext ctx;
       MoveList pv;
 
-      const int eval_final =
-          search::detail::alphabeta(pos, limits.depth.value_or(1), CENTIPAWN_MIN, CENTIPAWN_MAX, pv,
-                                    tt, killers, report, stopper);
+      const int eval_final = search::detail::alphabeta(pos, limits.depth.value_or(1), CENTIPAWN_MIN,
+                                                       CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
       report.depth = limits.depth.value_or(1);
       report.pv = std::make_pair(pv, eval_final);
