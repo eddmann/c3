@@ -80,8 +80,6 @@ constexpr std::size_t MIN_SIZE_MB = TT_MIN_SIZE_MB;
 constexpr std::size_t MAX_SIZE_MB = TT_MAX_SIZE_MB;
 constexpr std::size_t DEFAULT_SIZE_MB = TT_DEFAULT_SIZE_MB;
 
-std::atomic<std::size_t> TT_SIZE_MB{DEFAULT_SIZE_MB};
-
 // Check if a side has any pieces besides pawns.
 // Used in null-move pruning: don't prune in pawn-only endgames (zugzwang risk).
 bool has_non_pawn_material(const Board& board, Colour colour) {
@@ -295,7 +293,7 @@ std::optional<Move> decode_tt_move(std::uint16_t packed, const MoveList& moves) 
 // ---------------------------------------------------------------------------
 
 TranspositionTable::TranspositionTable() {
-  allocate(size_mb());
+  allocate(DEFAULT_SIZE_MB);
 }
 
 TranspositionTable::TranspositionTable(std::size_t size_mb) {
@@ -415,17 +413,6 @@ void TranspositionTable::store(std::uint64_t key, std::uint8_t depth, int eval, 
   entry.packed_move = move_to_keep;
   entry.bound_and_generation =
       static_cast<std::uint8_t>(static_cast<std::uint8_t>(bound) | (generation_ << 2U));
-}
-
-void TranspositionTable::set_size_mb(std::size_t size_mb) {
-  if (size_mb < MIN_SIZE_MB || size_mb > MAX_SIZE_MB) {
-    throw std::invalid_argument("invalid transposition table size");
-  }
-  TT_SIZE_MB.store(size_mb, std::memory_order_release);
-}
-
-std::size_t TranspositionTable::size_mb() {
-  return TT_SIZE_MB.load(std::memory_order_acquire);
 }
 
 // ---------------------------------------------------------------------------
@@ -967,9 +954,9 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
 
 SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal) {
-  // A table built here and thrown away when the function returns. Convenient,
-  // but it means this search starts from zero knowledge and pays the whole
-  // allocation cost up front—see the header for why an engine should not.
+  // Test-only: a table built here and thrown away when the function returns.
+  // This search starts from zero knowledge and pays the whole allocation cost
+  // up front—see the header for why nothing that plays chess may use it.
   TranspositionTable tt;
   return search(pos, tt, limits, reporter, std::move(stop_signal));
 }

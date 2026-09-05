@@ -2,10 +2,15 @@
 
 #include <chrono>
 #include <cstdint>
+#include <istream>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <ostream>
 #include <sstream>
+#include <streambuf>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "c3/uci.hpp"
@@ -725,4 +730,182 @@ TEST(UciLoop, EveryLineIsAValidUciCommand) {
                        line == "uciok" || line == "readyok";
     EXPECT_TRUE(valid) << "not a UCI line: " << line << '\n' << output;
   }
+}
+
+// -----------------------------------------------------------------------------
+// The Engine's transposition table, seen through the loop
+// -----------------------------------------------------------------------------
+//
+// These tests need a search to run to its full depth, which `run_uci` cannot
+// give them: it hands the loop the whole script at once, so the next command
+// arrives microseconds after `go` and the `stop()` it performs cuts the search
+// off just after its depth-1 report. A real GUI does not do that—it waits for
+// `bestmove` before sending anything else—so the harness below paces the
+// session the same way.
+// -----------------------------------------------------------------------------
+
+namespace {
+
+// An output sink both the loop's search thread and the test read, so every
+// access goes through one mutex.
+class RecordingSink : public std::streambuf {
+public:
+  [[nodiscard]] std::string text() const {
+    const std::scoped_lock lock(mutex_);
+    return text_;
+  }
+
+  [[nodiscard]] std::size_t bestmove_count() const {
+    const std::scoped_lock lock(mutex_);
+    std::size_t count = 0;
+    for (std::size_t at = text_.find("bestmove "); at != std::string::npos;
+         at = text_.find("bestmove ", at + 1)) {
+      count += 1;
+    }
+    return count;
+  }
+
+protected:
+  int_type overflow(int_type ch) override {
+    if (ch != traits_type::eof()) {
+      const std::scoped_lock lock(mutex_);
+      text_.push_back(static_cast<char>(ch));
+    }
+    return ch;
+  }
+
+  std::streamsize xsputn(const char* data, std::streamsize size) override {
+    const std::scoped_lock lock(mutex_);
+    text_.append(data, static_cast<std::size_t>(size));
+    return size;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::string text_;
+};
+
+// Releases one command at a time, and never the command after a `go` until
+// that `go` has been answered with a `bestmove`.
+class PacedInput : public std::streambuf {
+public:
+  PacedInput(std::vector<std::string> commands, const RecordingSink& sink)
+      : commands_(std::move(commands)), sink_(&sink) {}
+
+protected:
+  int_type underflow() override {
+    if (gptr() < egptr()) {
+      return traits_type::to_int_type(*gptr());
+    }
+
+    if (next_ == commands_.size()) {
+      return traits_type::eof();
+    }
+
+    // Bounded so a search that never answers fails the test instead of
+    // hanging the whole suite.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (sink_->bestmove_count() < searches_started_ &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    line_ = commands_[next_] + "\n";
+    if (commands_[next_].rfind("go", 0) == 0) {
+      ++searches_started_;
+    }
+    ++next_;
+
+    setg(line_.data(), line_.data(), line_.data() + line_.size());
+    return traits_type::to_int_type(line_[0]);
+  }
+
+private:
+  std::vector<std::string> commands_;
+  const RecordingSink* sink_;
+  std::string line_;
+  std::size_t next_{0};
+  std::size_t searches_started_{0};
+};
+
+std::string run_uci_paced(const std::vector<std::string>& commands) {
+  RecordingSink sink;
+  std::ostream out(&sink);
+  PacedInput input(commands, sink);
+  std::istream in(&input);
+
+  uci::run_loop(in, out);
+
+  return sink.text();
+}
+
+// Node count from the last `info depth` line of each search, in order: one
+// entry per `bestmove`, which is one entry per `go`.
+std::vector<std::uint64_t> node_counts_per_search(const std::string& output) {
+  std::vector<std::uint64_t> counts;
+  std::uint64_t latest = 0;
+
+  for (const auto& line : split_lines(output)) {
+    if (line.rfind("info depth ", 0) == 0) {
+      const auto nodes = line.find(" nodes ");
+      if (nodes != std::string::npos) {
+        std::istringstream value(line.substr(nodes + std::string(" nodes ").size()));
+        value >> latest;
+      }
+      continue;
+    }
+
+    if (line.rfind("bestmove ", 0) == 0) {
+      counts.push_back(latest);
+      latest = 0;
+    }
+  }
+
+  return counts;
+}
+
+// Deep enough that a warm table saves an obvious amount of work, shallow
+// enough to stay quick in a Debug build with sanitisers on.
+constexpr auto WARM_TABLE_GO = "go depth 6";
+
+} // namespace
+
+TEST(UciLoop, SecondGoReusesTheTableTheFirstOneFilled) {
+  // The loop must search through the Engine's table rather than build a
+  // throwaway one per `go`. When it does, the second search of the same
+  // position starts from everything the first one learned and costs a
+  // fraction of the nodes.
+  const auto output = run_uci_paced({"position startpos", WARM_TABLE_GO, WARM_TABLE_GO, "quit"});
+
+  const auto counts = node_counts_per_search(output);
+  ASSERT_EQ(counts.size(), 2U) << output;
+  ASSERT_GT(counts[0], 0U) << output;
+  EXPECT_LT(counts[1], counts[0] / 2) << output;
+}
+
+TEST(UciLoop, HashOptionStopsTheSearchBeforeResizingTheTable) {
+  // Resizing frees the memory the search is reading, so the search must be
+  // joined before the table is touched. The visible consequence is that the
+  // interrupted `go` still gets its one `bestmove`, and the session survives
+  // to answer afterwards.
+  const auto output = run_uci("position startpos\ngo infinite\nsetoption name Hash value 1\n"
+                              "isready\nquit\n");
+
+  const auto bestmoves = lines_starting_with(output, "bestmove ");
+  ASSERT_EQ(bestmoves.size(), 1U) << output;
+  EXPECT_EQ(bestmoves[0].find("(none)"), std::string::npos) << output;
+  EXPECT_NE(output.find("readyok"), std::string::npos) << output;
+}
+
+TEST(UciLoop, NewGameForgetsWhatTheTableLearned) {
+  // `ucinewgame` says the next position belongs to a different game, so the
+  // stored scores describe a tree we will never visit again. After it the
+  // search has to pay full price once more.
+  const auto output = run_uci_paced({"position startpos", WARM_TABLE_GO, "ucinewgame",
+                                     "position startpos", WARM_TABLE_GO, "quit"});
+
+  const auto counts = node_counts_per_search(output);
+  ASSERT_EQ(counts.size(), 2U) << output;
+  ASSERT_GT(counts[0], 0U) << output;
+  EXPECT_GT(counts[1], counts[0] / 2) << output;
 }

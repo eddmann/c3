@@ -838,8 +838,19 @@ std::optional<std::chrono::milliseconds> resolve_time_limit(const GoParams& para
 // allocate its transposition table. Holding the first legal move of the root
 // position in reserve means the only way to answer `bestmove (none)` is the
 // honest one: there is no legal move at all (checkmate or stalemate).
+//
+// THE TABLE IS BORROWED, NOT OWNED. `tt` belongs to the loop's Engine and is
+// captured by reference so that what this search learns is still there for the
+// next move—the whole reason the table is persistent. Three things make that
+// safe, and all three are the caller's job:
+//   1. The Engine is declared BEFORE the SearchHandle in run_loop_impl, so the
+//      handle's destructor joins this thread while the table is still alive.
+//   2. Every command that could disturb the table (`ucinewgame`, `setoption
+//      name Hash`) stops the search first, on the main thread.
+//   3. Only one search thread exists at a time, so the table has exactly one
+//      writer.
 void start_search(SearchHandle& handle, const GoParams& params, const Position& root,
-                  std::ostream& out, std::mutex& out_mutex) {
+                  search::TranspositionTable& tt, std::ostream& out, std::mutex& out_mutex) {
   search::Limits limits;
   limits.depth = params.depth;
   limits.nodes = params.nodes;
@@ -853,8 +864,8 @@ void start_search(SearchHandle& handle, const GoParams& params, const Position& 
   auto gate = std::make_shared<SearchGate>();
   Position pos_copy = root;
 
-  handle.thread =
-      std::thread([pos_copy, limits, stop_signal, gate, fallback_move, &out, &out_mutex]() mutable {
+  handle.thread = std::thread(
+      [pos_copy, limits, stop_signal, gate, fallback_move, &tt, &out, &out_mutex]() mutable {
         // An exception escaping a std::thread calls std::terminate, so this body
         // swallows everything: a failed search costs us one move, a terminated
         // process costs us the game.
@@ -873,7 +884,7 @@ void start_search(SearchHandle& handle, const GoParams& params, const Position& 
 
           try {
             GatedUciReporter reporter(out, &out_mutex, *gate);
-            search::search(pos_copy, limits, reporter, stop_signal);
+            search::search(pos_copy, tt, limits, reporter, stop_signal);
             searched_move = reporter.best_move();
           } catch (const std::exception& ex) {
             // Most plausibly std::bad_alloc while sizing the transposition table
@@ -904,8 +915,9 @@ void run_loop_impl(std::istream& in,
                    std::ostream& out) { // NOLINT(readability-function-cognitive-complexity)
   // DECLARATION ORDER MATTERS: locals are destroyed in reverse, so the search
   // handle (which joins the search thread) must be declared last. The thread
-  // writes to `out` while holding `out_mutex`; destroying either before the
-  // join would leave it writing through dead objects.
+  // writes to `out` while holding `out_mutex`, and it searches through the
+  // Engine's transposition table; destroying any of the three before the join
+  // would leave it working through dead objects.
   std::mutex out_mutex;
   Engine engine;
   SearchHandle search_handle;
@@ -1008,7 +1020,8 @@ void run_loop_impl(std::istream& in,
           throw std::runtime_error("missing go parameters");
         }
         search_handle.stop();
-        start_search(search_handle, *cmd.go_params, engine.position(), out, out_mutex);
+        start_search(search_handle, *cmd.go_params, engine.position(), engine.transposition_table(),
+                     out, out_mutex);
         break;
 
       case CommandType::SetOption:
@@ -1016,6 +1029,11 @@ void run_loop_impl(std::istream& in,
           throw std::runtime_error("missing option payload");
         }
         if (cmd.option->name == "hash") {
+          // Resizing frees the storage the running search is reading and
+          // writing, so the search has to be gone first—and it has to be gone
+          // before we touch the table, not merely asked to stop. stop() joins,
+          // so once it returns this thread is the table's only user.
+          search_handle.stop();
           engine.set_hash_size_mb(std::stoull(cmd.option->value.value()));
         }
         break;
@@ -1158,9 +1176,9 @@ std::string run_script_for_test(
     }
 
     case CommandType::SetOption:
-      if (cmd.option->name == "hash" && cmd.option->value.has_value()) {
-        search::TranspositionTable::set_size_mb(std::stoull(*cmd.option->value));
-      }
+      // Nothing to do: this harness builds its own table for each `go`, so
+      // there is no persistent table whose size could be changed. The parser
+      // has already validated the value, which is all these tests check.
       break;
 
     case CommandType::NoOp:

@@ -40,13 +40,6 @@ search::SearchResult Engine::search(const search::Limits& limits, search::Report
 
 void Engine::set_hash_size_mb(std::size_t size_mb) {
   tt_.resize(size_mb);
-
-  // TRANSITIONAL. The UCI `go` handler does not yet search through this
-  // Engine's table—it still builds a throwaway one per move—so resizing our
-  // own table would leave "setoption name Hash" with no visible effect there.
-  // Moving the process-wide default too keeps the option honest until UCI is
-  // wired to the Engine, at which point this line should go.
-  search::TranspositionTable::set_size_mb(size_mb);
 }
 
 } // namespace c3

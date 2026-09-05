@@ -264,6 +264,9 @@ inline constexpr std::uint8_t TT_REPLACEMENT_DEPTH_SLACK = 4;
 
 class TranspositionTable {
 public:
+  // Sized at TT_DEFAULT_SIZE_MB. There is deliberately no process-wide "current
+  // size" to inherit instead: the only table whose size a user can change is
+  // the one an Engine owns, and that one is resized through resize().
   TranspositionTable();
   explicit TranspositionTable(std::size_t size_mb);
 
@@ -301,12 +304,6 @@ public:
 
   // Fill level in permille (0-1000), the unit UCI's `hashfull` expects.
   [[nodiscard]] std::uint32_t hashfull() const;
-
-  // Default size applied to newly constructed tables. This is a convenience
-  // for code paths that build their own throwaway table; a table owned by an
-  // Engine is sized through resize() instead.
-  static void set_size_mb(std::size_t size_mb);
-  static std::size_t size_mb();
 
 private:
   void allocate(std::size_t size_mb);
@@ -374,9 +371,12 @@ struct SearchResult {
 SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 
-// Convenience/test entry point: builds a throwaway table for this one search.
-// Handy in tests and one-shot tools, but a real engine should not pay the
-// allocation on every move—use the overload above.
+// TEST-ONLY convenience entry point: builds a throwaway table for this one
+// search and destroys it on return. It exists so a test can say "search this
+// position" without owning a table, and it is the wrong thing for anything
+// that plays chess—it pays the whole allocation on every call and starts from
+// zero knowledge every time. Nothing on the UCI path uses it; the frontend
+// searches through the Engine's own table.
 SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 SearchResult search(Position& pos, std::uint8_t depth);
