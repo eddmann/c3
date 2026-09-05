@@ -1,8 +1,8 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <initializer_list>
-#include <stdexcept>
 
 #include "c3/colour.hpp"
 #include "c3/square.hpp"
@@ -15,6 +15,60 @@ enum class CastlingRight : std::uint8_t {
   BlackKing = 4,
   BlackQueen = 8,
 };
+
+// =============================================================================
+// CASTLING RIGHTS MASK: losing rights without branching
+// =============================================================================
+//
+// Only six squares can ever cost a side its castling rights:
+//
+//   e1 / e8   the king's home square — once the king leaves, both of its
+//             rights are gone forever
+//   a1 / h1   the white rooks' home squares
+//   a8 / h8   the black rooks' home squares
+//
+// A right dies whether the piece moved away from the square or was captured on
+// it, so the same rule applies to a move's from-square and to-square alike.
+// (Capturing a rook on h8 ends black's king-side right just as surely as moving
+// that rook does.)
+//
+// Rather than asking "is this a corner? which one?" on every move, we precompute
+// for each of the 64 squares the rights that SURVIVE a move touching it, then:
+//
+//   rights &= CASTLING_RIGHTS_MASK[move.from];
+//   rights &= CASTLING_RIGHTS_MASK[move.to];
+//
+// The other 58 squares hold 0b1111 and therefore change nothing, so the update
+// is two unconditional ANDs with no special cases to forget. This is the
+// standard technique in production engines.
+//
+// Masking the to-square against e1/e8 looks too eager—surely a rook landing on
+// e1 should not end white's rights?—but it cannot do harm: while a right is
+// still held the king is standing on that square, so nothing can move onto it,
+// and once the king has left the right is already gone. Position::from_fen
+// enforces exactly that invariant, rejecting rights that no king and rook back up.
+inline constexpr std::array<std::uint8_t, 64> CASTLING_RIGHTS_MASK = [] {
+  constexpr std::uint8_t ALL = 0b1111;
+  std::array<std::uint8_t, 64> masks{};
+  masks.fill(ALL);
+
+  const auto clear = [&masks](Square square, CastlingRight right) {
+    masks[square.index()] =
+        static_cast<std::uint8_t>(masks[square.index()] & ~static_cast<std::uint8_t>(right));
+  };
+
+  clear(Square::A1, CastlingRight::WhiteQueen);
+  clear(Square::H1, CastlingRight::WhiteKing);
+  clear(Square::E1, CastlingRight::WhiteQueen);
+  clear(Square::E1, CastlingRight::WhiteKing);
+
+  clear(Square::A8, CastlingRight::BlackQueen);
+  clear(Square::H8, CastlingRight::BlackKing);
+  clear(Square::E8, CastlingRight::BlackQueen);
+  clear(Square::E8, CastlingRight::BlackKing);
+
+  return masks;
+}();
 
 class CastlingRights {
 public:
@@ -52,23 +106,10 @@ public:
     }
   }
 
-  void remove_for_square(Square square) {
-    switch (square.index()) {
-    case 0: // a1
-      remove(CastlingRight::WhiteQueen);
-      break;
-    case 7: // h1
-      remove(CastlingRight::WhiteKing);
-      break;
-    case 56: // a8
-      remove(CastlingRight::BlackQueen);
-      break;
-    case 63: // h8
-      remove(CastlingRight::BlackKing);
-      break;
-    default:
-      throw std::invalid_argument("cannot remove castling rights for square");
-    }
+  // Drops whatever rights a move touching this square costs; a no-op for the
+  // squares castling does not care about, so callers apply it unconditionally.
+  constexpr void remove_for_square(Square square) {
+    mask_ = static_cast<std::uint8_t>(mask_ & CASTLING_RIGHTS_MASK[square.index()]);
   }
 
   constexpr std::uint8_t value() const { return mask_; }
