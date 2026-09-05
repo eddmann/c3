@@ -634,6 +634,98 @@ TEST(SearchQuiescence, FindsAMateThatOnlyAppearsInsideTheCaptureSearch) {
       << "the mate behind the capture was hidden by a stand-pat in check";
 }
 
+namespace {
+
+// How many noisy moves a position offers, and how many of those are promotions
+// to a queen. The two numbers are what "quiescence searches only queen
+// promotions" means, expressed in the position's own terms rather than as a
+// node count somebody wrote down once.
+struct NoisyMoveCounts {
+  std::size_t total{0};
+  std::size_t queen_promotions{0};
+};
+
+NoisyMoveCounts count_noisy_moves(const Position& pos) {
+  NoisyMoveCounts counts;
+  for (const auto& mv : pseudo_legal_noisy_moves(pos)) {
+    ++counts.total;
+    if (mv.promotion_piece == queen(pos.colour_to_move)) {
+      ++counts.queen_promotions;
+    }
+  }
+  return counts;
+}
+
+// Every noisy move in these positions is a promotion by the same pawn, and
+// nothing can recapture on the promotion square, so quiescence visits exactly
+// one node per promotion it decides to search and the node count IS the count
+// of promotions searched.
+void expect_only_queen_promotions_searched(std::string_view fen) {
+  Position pos = parse(fen);
+  const auto counts = count_noisy_moves(pos);
+  ASSERT_GT(counts.queen_promotions, 0U);
+  ASSERT_LT(counts.queen_promotions, counts.total) << "the position must offer underpromotions";
+
+  search::SearchContext filtered;
+  search::SearchContext unfiltered;
+  unfiltered.quiescence_pruning_enabled = false;
+
+  // A full window, so delta pruning cannot fire and the only filter at work is
+  // the one being tested.
+  EXPECT_EQ(quiesce(pos, unfiltered).nodes, counts.total)
+      << "unfiltered, every promotion is searched";
+  EXPECT_EQ(quiesce(pos, filtered).nodes, counts.queen_promotions)
+      << "filtered, only the queen promotions are";
+}
+
+} // namespace
+
+TEST(SearchQuiescence, SearchesOnlyQueenPromotions) {
+  // A pawn pushing to the last rank...
+  expect_only_queen_promotions_searched("8/1P6/8/8/8/8/8/k5K1 w - - 0 1");
+}
+
+TEST(SearchQuiescence, SearchesOnlyQueenCapturePromotions) {
+  // ...and a pawn capturing its way there. The rule looks at the piece the pawn
+  // becomes, not at whether it took something on the way, so bxa8=Q is searched
+  // and bxa8=N is not—and the rook is captured either way.
+  expect_only_queen_promotions_searched("rn5k/1P6/8/8/8/8/8/6K1 w - - 0 1");
+}
+
+TEST(SearchQuiescence, PruningCutsDownACaptureHeavyPosition) {
+  // Delta pruning and the SEE filter have no output of their own; what they
+  // change is how much of the capture tree gets walked. So the measurement is
+  // the same position searched twice, with them on and off.
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  search::SearchContext pruning;
+  search::SearchContext everything;
+  everything.quiescence_pruning_enabled = false;
+
+  // A narrow window around the static evaluation, which is what quiescence is
+  // called with in a real search and what gives delta pruning an alpha worth
+  // measuring against.
+  const int centre = eval(pos);
+  const auto with_pruning = quiesce(pos, pruning, centre - 50, centre + 50);
+  const auto without_pruning = quiesce(pos, everything, centre - 50, centre + 50);
+
+  EXPECT_LT(with_pruning.nodes, without_pruning.nodes)
+      << "delta and SEE pruning should be cutting captures out of the search";
+}
+
+TEST(SearchQuiescence, StillFindsMatesWithPruningOn) {
+  // Pruning is allowed to skip captures that cannot change the score; it is not
+  // allowed to lose a mate. Both of these run with the switches at their
+  // defaults—the settings a real search uses.
+  Position mated = parse("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1");
+  EXPECT_LE(quiesce(mated).eval, -CENTIPAWN_MATE_THRESHOLD);
+
+  Position mate_in_two =
+      parse("r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 1");
+  const auto result = search::search(mate_in_two, 4);
+  EXPECT_LE(result.eval, -CENTIPAWN_MATE_THRESHOLD) << "black is mated and the search must say so";
+}
+
 // Transposition table layout, move packing and replacement ---------------------
 
 TEST(TranspositionTable, PacksEntriesIntoSixteenBytes) {

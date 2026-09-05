@@ -131,6 +131,51 @@ constexpr std::array<int, 3> FUTILITY_MARGIN = {0, 100, 300}; // margins for dep
 constexpr int FUTILITY_DEPTH = 2;
 
 // =============================================================================
+// DELTA PRUNING
+// =============================================================================
+// Futility pruning's idea, moved into quiescence. There the moves all capture
+// something, so the question is not "can a quiet move help?" but "can THIS
+// capture help?", and the most optimistic answer is exactly computable: the
+// side to move keeps its stand-pat score and wins the whole victim, free.
+//
+//     stand_pat + what the capture wins + margin < alpha  ->  skip it
+//
+// If even that best case does not reach alpha, searching the capture cannot
+// change this node's score. The margin is the admission that "stand pat plus
+// the victim" is not really the ceiling—a recapture can be answered, a check
+// can follow—so two hundred centipawns of benefit of the doubt are added
+// before anything is thrown away.
+//
+// TWO EXEMPTIONS, both places where the arithmetic stops describing the
+// position:
+//   - IN CHECK. There is no stand-pat score to build on, because the side to
+//     move is not allowed to stand pat.
+//   - LATE ENDGAMES. With no pieces left beyond pawns, a single promotion is
+//     worth more than the entire margin, and a static evaluation that has not
+//     seen the pawn race is a poor thing to prune on. The classic condition,
+//     and the one place delta pruning is known to lose games.
+//
+// FAILURE MODE: like every form of pruning, this is a claim about material
+// made where material is not the point. A capture that walks into a mating net
+// or a perpetual is pruned on the grounds that it does not win enough wood.
+// =============================================================================
+constexpr int DELTA_PRUNING_MARGIN = 200;
+
+// What a noisy move wins at its most optimistic: the piece it takes, plus the
+// difference between the piece a promoting pawn becomes and the pawn itself.
+int optimistic_gain(const Move& mv) {
+  int gain = 0;
+  if (mv.captured_piece.has_value()) {
+    gain += PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)];
+  }
+  if (mv.promotion_piece.has_value()) {
+    gain += PIECE_VALUES[static_cast<std::size_t>(*mv.promotion_piece)] -
+            PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  }
+  return gain;
+}
+
+// =============================================================================
 // LATE MOVE REDUCTIONS (LMR)
 // =============================================================================
 // Move ordering is a claim: the moves at the front of the list are the ones
@@ -1099,9 +1144,11 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
   const Colour colour_to_move = pos.colour_to_move;
   const bool in_check = is_in_check(colour_to_move, pos.board);
 
+  int stand_pat = 0;
+
   if (!in_check) {
     // Stand-pat: static evaluation as the fallback
-    const int stand_pat = eval(pos);
+    stand_pat = eval(pos);
 
     // Beta cutoff: position is already too good, opponent won't allow this
     if (stand_pat >= beta) {
@@ -1111,6 +1158,15 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
     // Update alpha: we can always achieve at least the stand-pat score
     alpha = std::max(alpha, stand_pat);
   }
+
+  // Delta pruning is arithmetic about material, and in a position where the
+  // only material left is pawns a promotion outweighs the whole margin. See
+  // DELTA PRUNING for why this is where it is switched off.
+  const bool late_endgame = !has_non_pawn_material(pos.board, colour_to_move);
+
+  // Everything below is a bet that a capture cannot matter; a check makes every
+  // move matter, so none of it applies there.
+  const bool prune = ctx.quiescence_pruning_enabled && !in_check;
 
   // Normally only the noisy moves (captures and promotions); in check, every
   // legal reply, because the check has to be answered and the answer is often a
@@ -1127,6 +1183,36 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
 
   for (std::size_t i = 0; i < moves.size(); ++i) {
     const Move mv = ordering.select(i);
+
+    // ONLY QUEEN PROMOTIONS
+    // A promotion is generated four times over, once per piece the pawn can
+    // become, and three of those are almost always the wrong answer: if
+    // promoting is good at all, the queen is what makes it good. The capture is
+    // not lost with them—bxa8=Q takes the same rook bxa8=N would—so quiescence
+    // sees the same material either way, three times cheaper.
+    //
+    // What IS given up is the underpromotion that is brilliant for a reason
+    // material cannot see: the knight check that forks, the rook that promotes
+    // to avoid stalemating the opponent. Those are left to the main search,
+    // which generates all four and is where a tactic that subtle belongs.
+    if (prune && mv.promotion_piece.has_value() && *mv.promotion_piece != queen(colour_to_move)) {
+      continue;
+    }
+
+    // DELTA PRUNING: even winning the victim outright would not reach alpha.
+    if (prune && !late_endgame && stand_pat + optimistic_gain(mv) + DELTA_PRUNING_MARGIN < alpha) {
+      continue;
+    }
+
+    // LOSING CAPTURES: the exchange on that square comes out badly however it
+    // is played, so searching it only rediscovers that. MVV-LVA cannot tell—it
+    // ranks QxP above every quiet move whether or not the pawn is defended—and
+    // this is the check it is missing. Only strictly losing captures go: an
+    // even trade (SEE == 0) may still be exactly the move that resolves the
+    // position, which is what quiescence is for.
+    if (prune && detail::see(pos, mv) < 0) {
+      continue;
+    }
 
     pos.make_move(mv);
 

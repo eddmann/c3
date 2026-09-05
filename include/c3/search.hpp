@@ -611,6 +611,12 @@ public:
   // question that always answers "yes" in a real game.
   bool reductions_enabled{true};
 
+  // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
+  // the underpromotion filter in quiescence all change how much work is done
+  // and (deliberately) a little of what is seen, so the only way to measure
+  // them is to run with and without. Nothing on the UCI path writes it.
+  bool quiescence_pruning_enabled{true};
+
   // The scratch row for a node at `ply`. Rows live for the whole search and are
   // reused by every node that visits that ply, so a reference into one stays
   // valid across the recursion below it—which is exactly what alphabeta relies
