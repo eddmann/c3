@@ -14,21 +14,33 @@
 //   - squares_[64]: Array mapping each square to its piece (mailbox)
 //   - pieces_[12]:  Bitboard for each piece type (WP, WN, WB, WR, WQ, WK, BP...)
 //   - colours_[2]:  Bitboard for all white pieces, all black pieces
+//   - occupancy_:   Bitboard for every occupied square, of either colour
 //
 // The mailbox array answers "what's on this square?" instantly. The bitboards
 // answer "where are all pieces of type X?" instantly. We maintain both in sync.
 //
+// occupancy_ is the union of the two colour bitboards. It is stored rather than
+// recomputed on demand because every sliding-piece attack lookup (magic
+// bitboards) needs it, for every rook, bishop and queen, on every node of the
+// search. The OR it replaces is cheap, but not doing it at all is cheaper, and
+// keeping it current costs one extra bitwise op inside put_piece/remove_piece.
+//
 // Why not just one representation?
 //   - Mailbox alone: Finding all knights requires scanning 64 squares
 //   - Bitboards alone: Finding what's on E4 requires checking 12 bitboards
-//   - Hybrid: Both operations are O(1) at the cost of ~200 bytes extra memory
+//   - Hybrid: Both operations are O(1), for one extra copy of the position
 //
-// The memory cost is negligible; the speed gain is significant.
+// A Board is 248 bytes: 128 for the mailbox (std::optional<Piece> is 2 bytes
+// now that Piece is a single byte—it used to be 8, which alone made a Board
+// 624 bytes), 96 for the per-piece bitboards, 16 for the colour bitboards and 8
+// for the occupancy. Small enough that copying one is cheap and several fit in
+// L1 alongside everything else the search is touching.
 //
 // =============================================================================
 
 #include <array>
 #include <bit>
+#include <cassert>
 #include <cstdint>
 #include <optional>
 
@@ -54,13 +66,23 @@ public:
     return static_cast<std::uint32_t>(std::popcount(pieces(piece)));
   }
 
+  // Precondition: the square is empty. Dropping a piece onto an occupant would
+  // overwrite the mailbox entry while leaving the displaced piece's bit set in
+  // its own bitboard—a "phantom" piece that the mailbox denies and the bitboards
+  // insist on. Such a desync typically only surfaces plies later, in an
+  // unrelated evaluation or attack lookup, so Debug builds abort here instead.
+  // Release builds do not check: the assert is the whole enforcement, so callers
+  // that mean to replace a piece must remove_piece first either way.
   void put_piece(Piece piece, Square square) noexcept {
+    assert(!has_piece_at(square) && "put_piece expects an empty square");
+
     const auto idx = piece_index(piece);
     const auto colour_idx = colour_index(colour(piece));
 
     squares_[square.index()] = piece;
     pieces_[idx] |= square;
     colours_[colour_idx] |= square;
+    occupancy_ |= square;
   }
 
   [[nodiscard]] std::optional<Piece> piece_at(Square square) const noexcept {
@@ -70,8 +92,13 @@ public:
     return piece_at(square).has_value();
   }
 
+  // Precondition: the square is occupied. Clearing an empty square is always a
+  // caller error—unmaking a move that was never made, or removing the same
+  // capture twice—so Debug builds abort rather than let the mistake pass as a
+  // silent no-op. Release builds still no-op instead of corrupting the bitboards.
   void remove_piece(Square square) noexcept {
     const auto maybe_piece = piece_at(square);
+    assert(maybe_piece.has_value() && "remove_piece expects an occupied square");
     if (!maybe_piece.has_value()) {
       return;
     }
@@ -82,9 +109,10 @@ public:
     squares_[square.index()] = std::nullopt;
     pieces_[idx] &= ~Bitboard(square);
     colours_[colour_idx] &= ~Bitboard(square);
+    occupancy_ &= ~Bitboard(square);
   }
 
-  [[nodiscard]] Bitboard occupancy() const noexcept { return colours_[0] | colours_[1]; }
+  [[nodiscard]] Bitboard occupancy() const noexcept { return occupancy_; }
   [[nodiscard]] bool has_occupancy_at(Bitboard squares) const noexcept {
     return (occupancy() & squares) != 0;
   }
@@ -98,13 +126,14 @@ private:
     return static_cast<std::size_t>(colour);
   }
 
-  // The three representations below are kept in sync by put_piece/remove_piece.
+  // The four representations below are kept in sync by put_piece/remove_piece.
   // This redundancy is intentional: different queries are fast with different
   // representations, and the synchronization cost is minimal.
 
   std::array<std::optional<Piece>, 64> squares_{}; // Mailbox: square → piece
   std::array<Bitboard, 12> pieces_{};              // Bitboard per piece type
-  std::array<Bitboard, 2> colours_{};              // Bitboard per color
+  std::array<Bitboard, 2> colours_{};              // Bitboard per colour
+  Bitboard occupancy_{};                           // Union of both colour bitboards
 };
 
 } // namespace c3

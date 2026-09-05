@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bit>
+#include <cassert>
 #include <cstdint>
 #include <optional>
 #include <ostream>
@@ -144,8 +145,18 @@ public:
                                                            : other.rank() - rank());
   }
 
+  /// One rank forward from the mover's point of view: up the board for white,
+  /// down for black.
+  ///
+  /// Callers must know a rank is there to step onto. A pawn is never on the rank
+  /// it would advance off (it promoted instead), so an out-of-range step means a
+  /// caller lost track of which piece it was walking, and the wrapped index would
+  /// quietly name a square on the opposite edge of the board. Debug builds stop
+  /// at the offending call instead.
   [[nodiscard]] constexpr Square advance(Colour colour) const noexcept {
-    return colour == Colour::White ? Square(index_ + 8) : Square(index_ - 8);
+    const int target = colour == Colour::White ? index_ + 8 : index_ - 8;
+    assert(target >= 0 && target < 64 && "advance stepped off the board");
+    return Square(static_cast<std::uint8_t>(target));
   }
 
   [[nodiscard]] constexpr bool is_back_rank() const noexcept {

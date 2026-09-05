@@ -20,7 +20,7 @@ namespace detail {
 struct HistoryEntry {
   CastlingRights castling_rights;
   std::optional<Square> en_passant_square;
-  std::uint8_t half_move_clock;
+  std::uint16_t half_move_clock;
   std::uint64_t key;
 };
 
@@ -29,21 +29,34 @@ struct HistoryEntry {
 // FEN-aware position container.
 class Position {
 public:
-  inline static constexpr std::size_t MAX_HISTORY = 256;
+  // How many plies of history to allocate up front. This is a hint, not a limit:
+  // the history stack is a vector and is free to grow past it. There is no
+  // honest upper bound to assert—a long game (games of 300+ moves exist) plus a
+  // deep search stacked on top of it can legitimately reach any figure we might
+  // pick, and a wrong cap turns a rare but legal game into a crash.
+  inline static constexpr std::size_t HISTORY_RESERVE = 1024;
+
+  // Deprecated spelling of HISTORY_RESERVE, kept for one cycle so branches
+  // written against the old name still compile. It never was a maximum: the
+  // history stack may grow past it. Prefer HISTORY_RESERVE.
+  inline static constexpr std::size_t MAX_HISTORY = HISTORY_RESERVE;
 
   Board board{};
   Colour colour_to_move{Colour::White};
   CastlingRights castling_rights{CastlingRights::none()};
   std::optional<Square> en_passant_square{};
-  std::uint8_t half_move_clock{0};
-  std::uint8_t full_move_counter{1};
+  // Both clocks are 16-bit: the half-move clock is reset by every capture and
+  // pawn move but a null-move search can still push it past 255, and the full
+  // move counter simply outgrows a byte in any long game.
+  std::uint16_t half_move_clock{0};
+  std::uint16_t full_move_counter{1};
   std::uint64_t key{0};
 
   Position();
 
   Position(Board board, Colour colour_to_move, CastlingRights castling_rights,
-           std::optional<Square> en_passant_square, std::uint8_t half_move_clock,
-           std::uint8_t full_move_counter);
+           std::optional<Square> en_passant_square, std::uint16_t half_move_clock,
+           std::uint16_t full_move_counter);
 
   // Parse a FEN string into a Position, throwing std::runtime_error on error.
   static Position from_fen(std::string_view fen);

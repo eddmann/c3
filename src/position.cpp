@@ -52,17 +52,17 @@ constexpr std::size_t piece_index(Piece piece) {
 } // namespace
 
 Position::Position() {
-  history_.reserve(MAX_HISTORY);
+  history_.reserve(HISTORY_RESERVE);
   key = compute_key();
 }
 
 Position::Position(Board board_, Colour colour_to_move_, CastlingRights castling_rights_,
-                   std::optional<Square> en_passant_square_, std::uint8_t half_move_clock_,
-                   std::uint8_t full_move_counter_)
+                   std::optional<Square> en_passant_square_, std::uint16_t half_move_clock_,
+                   std::uint16_t full_move_counter_)
     : board(board_), colour_to_move(colour_to_move_), castling_rights(castling_rights_),
       en_passant_square(en_passant_square_), half_move_clock(half_move_clock_),
       full_move_counter(full_move_counter_) {
-  history_.reserve(MAX_HISTORY);
+  history_.reserve(HISTORY_RESERVE);
   key = compute_key();
 }
 
@@ -113,6 +113,10 @@ std::uint64_t Position::compute_key() const {
 // =============================================================================
 
 void Position::make_move(const Move& mv) {
+  // A legal game never captures a king; this catches a broken legality filter.
+  assert((!mv.captured_piece.has_value() || !is_king(*mv.captured_piece)) &&
+         "move captures a king");
+
   // Save state that can't be derived from the move alone.
   // This enables unmake_move to restore the exact previous position.
   const detail::HistoryEntry history{
@@ -122,7 +126,6 @@ void Position::make_move(const Move& mv) {
       .key = key,
   };
   history_.push_back(history);
-  assert(history_.size() <= MAX_HISTORY);
 
   if (en_passant_square.has_value() &&
       en_passant_sources(*en_passant_square, colour_to_move, board) != 0) {
@@ -151,41 +154,38 @@ void Position::make_move(const Move& mv) {
     }
   }
 
-  if (is_king(mv.piece)) {
-    castling_rights.remove_for_colour(colour_to_move);
+  // Castling is encoded as a two-square king move; the rook has to be walked
+  // across separately. (is_castling() already implies the piece is a king.)
+  if (mv.is_castling()) {
+    const Piece rook_piece = rook(colour_to_move);
 
-    if (mv.is_castling()) {
-      const Piece rook_piece = rook(colour_to_move);
+    if (mv.to == Square::C1 || mv.to == Square::C8) {
+      const Square rook_to = Square::from_file_and_rank(3, mv.to.rank());
+      const Square rook_from = Square::from_file_and_rank(0, mv.to.rank());
 
-      if (mv.to == Square::C1 || mv.to == Square::C8) {
-        const Square rook_to = Square::from_file_and_rank(3, mv.to.rank());
-        const Square rook_from = Square::from_file_and_rank(0, mv.to.rank());
+      board.put_piece(rook_piece, rook_to);
+      board.remove_piece(rook_from);
 
-        board.put_piece(rook_piece, rook_to);
-        board.remove_piece(rook_from);
+      key ^= ZOBRIST.piece_square[piece_index(rook_piece)][rook_to.index()];
+      key ^= ZOBRIST.piece_square[piece_index(rook_piece)][rook_from.index()];
+    } else if (mv.to == Square::G1 || mv.to == Square::G8) {
+      const Square rook_to = Square::from_file_and_rank(5, mv.to.rank());
+      const Square rook_from = Square::from_file_and_rank(7, mv.to.rank());
 
-        key ^= ZOBRIST.piece_square[piece_index(rook_piece)][rook_to.index()];
-        key ^= ZOBRIST.piece_square[piece_index(rook_piece)][rook_from.index()];
-      } else if (mv.to == Square::G1 || mv.to == Square::G8) {
-        const Square rook_to = Square::from_file_and_rank(5, mv.to.rank());
-        const Square rook_from = Square::from_file_and_rank(7, mv.to.rank());
+      board.put_piece(rook_piece, rook_to);
+      board.remove_piece(rook_from);
 
-        board.put_piece(rook_piece, rook_to);
-        board.remove_piece(rook_from);
-
-        key ^= ZOBRIST.piece_square[piece_index(rook_piece)][rook_to.index()];
-        key ^= ZOBRIST.piece_square[piece_index(rook_piece)][rook_from.index()];
-      }
+      key ^= ZOBRIST.piece_square[piece_index(rook_piece)][rook_to.index()];
+      key ^= ZOBRIST.piece_square[piece_index(rook_piece)][rook_from.index()];
     }
   }
 
-  if (mv.from.is_corner()) {
-    castling_rights.remove_for_square(mv.from);
-  }
-
-  if (mv.to.is_corner()) {
-    castling_rights.remove_for_square(mv.to);
-  }
+  // A move touching e1/e8 (the king leaving home) or a1/h1/a8/h8 (a rook
+  // leaving, or being captured on, its home corner) costs the matching rights.
+  // CASTLING_RIGHTS_MASK encodes all six cases, so both ends of every move are
+  // masked unconditionally—no "is this a rook move?" special cases to forget.
+  castling_rights.remove_for_square(mv.from);
+  castling_rights.remove_for_square(mv.to);
 
   key ^= ZOBRIST.castling_rights[castling_rights.value()];
   key ^= ZOBRIST.castling_rights[history.castling_rights.value()];
@@ -273,7 +273,6 @@ void Position::make_null_move() {
       .key = key,
   };
   history_.push_back(history);
-  assert(history_.size() <= MAX_HISTORY);
 
   if (en_passant_square.has_value() &&
       en_passant_sources(*en_passant_square, colour_to_move, board) != 0) {

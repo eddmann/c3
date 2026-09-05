@@ -396,4 +396,33 @@ TEST(Position, ZobristKeyStaysInSyncDuringMoveUndo) {
 
   EXPECT_EQ(pos.key, initial);
 }
+
+// Move is the hottest small object in the engine, so its size is pinned by a
+// test as well as by the static_assert in move.hpp.
+TEST(Move, StaysSmallEnoughToPackIntoACacheLine) {
+  EXPECT_LE(sizeof(Move), 8U);
+}
+
+// A long game followed by a deep search produces more plies of history than any
+// fixed cap can promise, so the history stack must simply be allowed to grow.
+// The half-move clock has to survive the same stretch without wrapping.
+TEST(Position, HistoryGrowsPastTheReserveWithoutTrippingAnInvariant) {
+  Position pos = Position::startpos();
+  const auto initial_key = pos.key;
+
+  // Deliberately past HISTORY_RESERVE, so the vector really does reallocate.
+  constexpr int PLIES = static_cast<int>(Position::HISTORY_RESERVE) + 16;
+  for (int ply = 0; ply < PLIES; ++ply) {
+    pos.make_null_move();
+  }
+
+  EXPECT_EQ(pos.half_move_clock, PLIES);
+
+  for (int ply = 0; ply < PLIES; ++ply) {
+    pos.unmake_null_move();
+  }
+
+  EXPECT_EQ(pos.half_move_clock, 0);
+  EXPECT_EQ(pos.key, initial_key);
+}
 // NOLINTEND(modernize-use-designated-initializers)
