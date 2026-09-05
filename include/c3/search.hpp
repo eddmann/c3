@@ -29,7 +29,8 @@
 //   2. TRANSPOSITION TABLE
 //      Cache evaluated positions. Chess has many transpositions (different
 //      move orders reaching the same position). Without caching, we'd waste
-//      time re-evaluating identical positions.
+//      time re-evaluating identical positions. The table lives longer than a
+//      single search so that knowledge carries over from move to move.
 //
 //   3. KILLER MOVES
 //      Track quiet moves that caused beta cutoffs at each ply. These moves
@@ -124,11 +125,22 @@ public:
 
   [[nodiscard]] bool should_stop(const Report& report) const;
 
+  // Stopping is a one-way door: once any limit has been hit, every score the
+  // search is still computing is the score of a tree we abandoned half-way,
+  // and must never be written to the transposition table or reported. Latching
+  // also makes the answer cheap and stable—should_stop() only consults the
+  // clock every 256 nodes, so without a latch it would flip back to "keep
+  // going" on the very next node.
+  [[nodiscard]] bool has_stopped() const { return stopped_; }
+
 private:
   std::shared_ptr<std::atomic_bool> stop_signal_{};
   std::optional<std::uint8_t> depth_{};
   std::optional<std::chrono::milliseconds> elapsed_{};
   std::optional<std::uint64_t> nodes_{};
+  // Written from the single searching thread; `mutable` so the latch can be
+  // set from the logically-const should_stop().
+  mutable bool stopped_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -153,35 +165,132 @@ private:
 // When we probe the TT, we can use these bounds to prune:
 //   - If TT says "at least X" and X ≥ beta, we can cut off
 //   - If TT says "at most X" and X ≤ alpha, we can cut off
+//
+// WHY THE TABLE OUTLIVES A SINGLE `go`
+// Allocating and zeroing a 64 MB table costs tens of milliseconds, and a
+// 256 MB one costs hundreds. Doing that at the start of every move burns
+// thinking time before the clock even starts. Worse, it throws away work:
+// after the opponent replies we are usually two plies deeper into the SAME
+// tree we just searched, so most of what we learned is still true. The table
+// therefore belongs to the Engine, not to one call of search(). It is only
+// wiped when a genuinely unrelated game starts (`ucinewgame`) or when the
+// user changes the Hash size.
+//
+// GENERATIONS ("AGE")
+// Because the table survives across moves, it fills up with entries from
+// searches that are now several plies in the past. Those entries are still
+// usable (the score for a position does not go stale), but they are much less
+// likely to be visited again, so they are the first thing we are willing to
+// overwrite. Each entry records the generation — a small counter bumped once
+// per search by new_search() — in which it was written. "Older generation"
+// then becomes a cheap synonym for "probably dead weight".
+//
+// PACKING
+// A table's value comes from how many positions it holds, so bytes per entry
+// translate directly into playing strength. This entry is squeezed into 16
+// bytes: a 64 MB table now holds 4,194,304 positions where the old 56-byte
+// entry left room for only 1,048,576 once the capacity was rounded down to a
+// power of two—four times the memory, four times the knowledge. Sixteen bytes
+// also means four entries per 64-byte cache line, so a probe usually pulls in
+// its neighbours for free. The squeeze costs nothing real: scores fit in an
+// int16 (mate is ±10000), depth fits in a byte (MAX_DEPTH is 255), and a move
+// fits in 16 bits because a chess move is just "from square, to square, maybe
+// a promotion piece".
+//
+// VALIDATING THE TT MOVE
+// The 16 bits we read back may not describe a move of THIS position at all.
+// Two positions share a slot whenever their keys collide, and although 64-bit
+// keys make that rare it is not impossible. Playing such a move—moving a piece
+// that is not there, capturing on a square that is empty—would corrupt the
+// board beyond repair, and the search would carry on happily on a nonsense
+// position. So decoding never trusts the bits: decode_tt_move() looks for a
+// move with that from/to/promotion in the position's OWN generated move list
+// and returns nothing if there is none. Reconstruction and validation are the
+// same step, and as a bonus the reconstructed Move carries the captured piece
+// and en-passant flag that the 16 bits did not store.
 // ---------------------------------------------------------------------------
 
-enum class Bound { Exact, Lower, Upper };
+enum class Bound : std::uint8_t { Exact, Lower, Upper };
+
+// A packed move of all-zero bits means "this entry has no move". Every real
+// move sets a "present" flag bit, so a freshly zeroed slot can never be
+// mistaken for the move a1-a1.
+inline constexpr std::uint16_t TT_NO_MOVE = 0;
+
+// Pack a move into 16 bits: from square (6 bits), to square (6 bits),
+// promotion piece (3 bits, 0 = none), plus a "present" flag in the top bit.
+[[nodiscard]] std::uint16_t encode_tt_move(const Move& mv);
+
+// Rebuild a full Move from 16 packed bits by finding it in `moves`, the
+// position's own pseudo-legal move list. Returns nullopt when no move matches,
+// which is exactly the validation we need before touching the board.
+[[nodiscard]] std::optional<Move> decode_tt_move(std::uint16_t packed, const MoveList& moves);
 
 struct TTEntry {
-  std::uint64_t key{0};       // Zobrist key (for collision detection)
-  std::uint8_t depth{0};      // Search depth (deeper = more reliable)
-  int eval{0};                // Evaluation score (may need ply adjustment)
-  Bound bound{Bound::Exact};  // Type of bound (see above)
-  std::optional<Move> move{}; // Best move found (for move ordering)
+  std::uint64_t key{0};                  // Zobrist key (for collision detection)
+  std::int16_t score{0};                 // Evaluation score (mate scores are ply-adjusted)
+  std::uint16_t packed_move{TT_NO_MOVE}; // Best move found, packed (for move ordering)
+  std::uint8_t depth{0};                 // Search depth (deeper = more reliable)
+  std::uint8_t bound_and_generation{0};  // Bound in bits 0-1, generation in bits 2-7
+  std::uint16_t reserved{0};             // Spare bits; keeps the 16-byte layout explicit
+
+  [[nodiscard]] Bound bound() const { return static_cast<Bound>(bound_and_generation & 0b11U); }
+  [[nodiscard]] std::uint8_t generation() const {
+    return static_cast<std::uint8_t>(bound_and_generation >> 2U);
+  }
+  [[nodiscard]] bool has_move() const { return packed_move != TT_NO_MOVE; }
 };
+
+// The whole point of the packing exercise: two entries per 32 bytes.
+static_assert(sizeof(TTEntry) == 16, "TTEntry must stay packed into 16 bytes");
+
+// Generations are stored in 6 bits, so the counter wraps after 64 searches.
+// Wrapping is harmless: an entry 64 searches old looks "current" again, which
+// costs us one missed replacement, never a wrong score.
+inline constexpr std::uint8_t TT_GENERATION_LIMIT = 64;
 
 class TranspositionTable {
 public:
   TranspositionTable();
+  explicit TranspositionTable(std::size_t size_mb);
 
   [[nodiscard]] const TTEntry* probe(std::uint64_t key) const;
   void store(std::uint64_t key, std::uint8_t depth, int eval, Bound bound,
-             std::optional<Move> move);
+             std::uint16_t packed_move);
 
+  // Forget everything. Used when a new, unrelated game starts: entries from
+  // the previous game are not wrong, they are simply about positions we will
+  // never see again, and keeping them only wastes slots.
+  void clear();
+
+  // Change the table's size in megabytes. Reallocates and clears, so this is
+  // the expensive operation the persistent table exists to avoid doing often.
+  void resize(std::size_t size_mb);
+
+  // Called once per search: bumps the generation so every entry written from
+  // now on is marked "current" and everything already in the table becomes a
+  // preferred replacement candidate.
+  void new_search();
+
+  [[nodiscard]] std::uint8_t generation() const { return generation_; }
   [[nodiscard]] std::size_t usage() const { return usage_; }
   [[nodiscard]] std::size_t capacity() const { return capacity_; }
 
+  // Fill level in permille (0-1000), the unit UCI's `hashfull` expects.
+  [[nodiscard]] std::uint32_t hashfull() const;
+
+  // Default size applied to newly constructed tables. This is a convenience
+  // for code paths that build their own throwaway table; a table owned by an
+  // Engine is sized through resize() instead.
   static void set_size_mb(std::size_t size_mb);
   static std::size_t size_mb();
 
 private:
+  void allocate(std::size_t size_mb);
+
   std::size_t capacity_{0};
   std::size_t usage_{0};
+  std::uint8_t generation_{0};
   std::vector<TTEntry> entries_;
 };
 
@@ -237,13 +346,22 @@ struct SearchResult {
   std::uint32_t hashfull{0}; // permille of TT usage
 };
 
+// Primary entry point: the caller owns the transposition table, so knowledge
+// gathered while searching one move is still there for the next one.
+SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits, Reporter& reporter,
+                    std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
+
+// Convenience/test entry point: builds a throwaway table for this one search.
+// Handy in tests and one-shot tools, but a real engine should not pay the
+// allocation on every move—use the overload above.
 SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 SearchResult search(Position& pos, std::uint8_t depth);
 
 // Exposed for tests
 namespace detail {
-void order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply);
+void order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
+                 const std::optional<Move>& hash_move = std::nullopt);
 void order_quiescence_moves(MoveList& moves);
 int alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
               TranspositionTable& tt, KillerMoves& killers, Report& report, const Stopper& stopper);

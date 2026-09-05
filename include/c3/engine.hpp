@@ -32,12 +32,24 @@ public:
   void apply_moves(const std::vector<Move>& moves);
 
   search::SearchResult search(const search::Limits& limits, search::Reporter& reporter,
-                              std::shared_ptr<std::atomic_bool> stop_signal = nullptr) const;
+                              std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 
+  // Resizing throws away the table's contents, so this is deliberately an
+  // explicit user action ("setoption name Hash") rather than something the
+  // search does per move.
   void set_hash_size_mb(std::size_t size_mb);
+
+  // Exposed so callers (and tests) can inspect or reuse the persistent table.
+  search::TranspositionTable& transposition_table() { return tt_; }
+  const search::TranspositionTable& transposition_table() const { return tt_; }
 
 private:
   Position pos_;
+
+  // The transposition table belongs to the Engine, not to a single search:
+  // it is expensive to allocate and the knowledge in it stays valid from one
+  // move to the next. new_game() is the only thing that clears it.
+  search::TranspositionTable tt_;
 };
 
 } // namespace c3

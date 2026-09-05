@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -233,4 +234,70 @@ TEST(Engine, SetHashSizeWorks) {
   const auto result = engine.search(limits, reporter);
   EXPECT_GE(result.depth, 1);
   EXPECT_FALSE(result.pv.empty());
+}
+
+TEST(Engine, SetHashSizeResizesTheTableImmediately) {
+  Engine engine;
+
+  engine.set_hash_size_mb(search::TT_MIN_SIZE_MB);
+  const auto small = engine.transposition_table().capacity();
+
+  engine.set_hash_size_mb(search::TT_MIN_SIZE_MB * 4);
+  EXPECT_EQ(engine.transposition_table().capacity(), small * 4);
+
+  EXPECT_THROW(engine.set_hash_size_mb(0), std::invalid_argument);
+}
+
+// -----------------------------------------------------------------------------
+// Transposition table persistence
+// -----------------------------------------------------------------------------
+
+TEST(Engine, TranspositionTablePersistsBetweenSearches) {
+  // The table belongs to the Engine, not to one search: what the first `go`
+  // learned about a position is still there for the second one. This is why
+  // no allocation happens per move, and why the second search starts with a
+  // ready-made best move for the root instead of guessing.
+  Engine engine;
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 4;
+
+  engine.search(limits, reporter);
+
+  const auto& tt = engine.transposition_table();
+  const auto* const after_first = tt.probe(engine.position().key);
+  ASSERT_NE(after_first, nullptr) << "first search stored nothing for the root";
+  ASSERT_TRUE(after_first->has_move());
+
+  const auto stored_move =
+      search::decode_tt_move(after_first->packed_move, pseudo_legal_moves(engine.position()));
+  ASSERT_TRUE(stored_move.has_value());
+
+  const auto second = engine.search(limits, reporter);
+
+  // The entry survived the second search, and the second search agreed with it.
+  const auto* const after_second = tt.probe(engine.position().key);
+  ASSERT_NE(after_second, nullptr);
+  ASSERT_FALSE(second.pv.empty());
+  EXPECT_EQ(second.pv[0], *stored_move);
+}
+
+TEST(Engine, NewGameClearsTranspositionTable) {
+  Engine engine;
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 3;
+
+  engine.search(limits, reporter);
+  ASSERT_GT(engine.transposition_table().usage(), 0U);
+
+  const auto capacity_before = engine.transposition_table().capacity();
+  engine.new_game();
+
+  EXPECT_EQ(engine.transposition_table().usage(), 0U);
+  EXPECT_EQ(engine.transposition_table().probe(engine.position().key), nullptr);
+  // Clearing forgets the contents but keeps the (expensive) allocation.
+  EXPECT_EQ(engine.transposition_table().capacity(), capacity_before);
 }
