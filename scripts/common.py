@@ -123,7 +123,12 @@ def build_engine(source_dir: Path, build_dir: Path) -> Path:
     Path to the built c3 binary.
   """
   build_dir.mkdir(parents=True, exist_ok=True)
-  run(["cmake", "-S", str(source_dir), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"])
+  # C3_BUILD_TESTS=OFF keeps these throwaway engine builds from configuring the
+  # test suite, which would otherwise download GoogleTest once per branch.
+  run([
+      "cmake", "-S", str(source_dir), "-B", str(build_dir),
+      "-DCMAKE_BUILD_TYPE=Release", "-DC3_BUILD_TESTS=OFF",
+  ])
   run(["cmake", "--build", str(build_dir), "--config", "Release", "--target", "c3"])
   return build_dir / "c3"
 
@@ -147,14 +152,46 @@ def elo_from_score(score: float) -> float:
   return 400 * math.log10(score / (1 - score))
 
 
-def elo_error(score: float, games: int) -> float:
-  """Calculate standard error of Elo estimate using delta method."""
+def expected_score(elo: float) -> float:
+  """Convert an Elo difference into the expected score (0-1) it implies."""
+  return 1.0 / (1.0 + 10 ** (-elo / 400.0))
+
+
+def score_variance(wins: int, draws: int, losses: int) -> float:
+  """Per-game variance of the score for an observed W/D/L distribution.
+
+  A draw is not "half a win": treating a game as three outcomes rather than a
+  coin flip matters because draws sit at (or near) the mean and so contribute
+  almost no variance. Engine matches are draw heavy, which is why the binomial
+  approximation overstates the uncertainty of the Elo estimate.
+  """
+  games = wins + draws + losses
+  if games == 0:
+    return 0.0
+  mean = (wins + 0.5 * draws) / games
+  p_win, p_draw, p_loss = wins / games, draws / games, losses / games
+  return (
+      p_win * (1 - mean) ** 2
+      + p_draw * (0.5 - mean) ** 2
+      + p_loss * (0 - mean) ** 2
+  )
+
+
+def elo_error(wins: int, draws: int, losses: int) -> float:
+  """Standard error of the Elo estimate, accounting for draws.
+
+  The standard error of the mean score is sqrt(variance / games); the delta
+  method turns that into Elo via the derivative of the Elo formula.
+  """
+  games = wins + draws + losses
   if games == 0:
     return float("inf")
-  p = min(max(score, 1e-6), 1 - 1e-6)
-  var = p * (1 - p) / games
-  deriv = 400 / (math.log(10) * p * (1 - p))
-  return deriv * math.sqrt(var)
+  var = score_variance(wins, draws, losses)
+  if var == 0:
+    return 0.0
+  mean = min(max((wins + 0.5 * draws) / games, 1e-6), 1 - 1e-6)
+  deriv = 400 / (math.log(10) * mean * (1 - mean))
+  return deriv * math.sqrt(var / games)
 
 
 def los(score: float, games: int) -> float:
@@ -171,6 +208,39 @@ def los(score: float, games: int) -> float:
     return 1.0 if p > 0.5 else 0.0
   z = (p - 0.5) / math.sqrt(var)
   return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+
+def llr(wins: int, draws: int, losses: int, elo0: float, elo1: float) -> float:
+  """Generalised SPRT log-likelihood ratio for H0: elo=elo0 vs H1: elo=elo1.
+
+  This is the statistic fishtest and cutechess report while a test runs. The
+  match score over N games is approximately normal with mean N*s and variance
+  N*var, so the ratio of the two likelihoods collapses to
+
+    LLR = N * (s1 - s0) * (2*mean - s0 - s1) / (2 * var)
+
+  where s0/s1 are the expected scores implied by elo0/elo1 and var is the
+  per-game score variance of the observed W/D/L distribution.
+
+  Positive values favour H1 (the test engine is at least elo1 stronger),
+  negative values favour H0. Compare it against sprt_bounds() to decide.
+  """
+  games = wins + draws + losses
+  if games == 0:
+    return 0.0
+  var = score_variance(wins, draws, losses)
+  if var == 0:
+    # An unbeaten (or winless) run has no observed spread; fall back to the
+    # variance of a single decisive game so the ratio stays finite.
+    var = 1.0 / (4 * games)
+  mean = (wins + 0.5 * draws) / games
+  s0, s1 = expected_score(elo0), expected_score(elo1)
+  return games * (s1 - s0) * (2 * mean - s0 - s1) / (2 * var)
+
+
+def sprt_bounds(alpha: float = 0.05, beta: float = 0.05) -> tuple[float, float]:
+  """Wald's LLR bounds: below the lower accept H0, above the upper accept H1."""
+  return math.log(beta / (1 - alpha)), math.log((1 - beta) / alpha)
 
 
 # Git utilities for branch comparison scripts

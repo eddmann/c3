@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Run a fastchess gauntlet between c3 and another engine,
-and produce a compact SPRT-style summary.
+Run a fastchess gauntlet between c3 and another engine, and produce a compact
+summary: score, draw-aware Elo error bar, LOS and the SPRT log-likelihood ratio
+for the hypotheses given by --elo0/--elo1.
 
 Two modes are supported:
   * depth: fixed search depth (default depth=3)
@@ -32,8 +33,10 @@ from common import (
     ensure_fastchess_available,
     elo_from_score,
     elo_error,
+    llr,
     los,
     parse_pgn_results,
+    sprt_bounds,
 )
 
 
@@ -71,13 +74,22 @@ def build_fastchess_command(args: argparse.Namespace, mode: str, pgn_path: Path)
   return cmd
 
 
-def write_summary(pgn_path: Path, summary_path: Path, label: str, opponent_name: str) -> str:
+def write_summary(
+    pgn_path: Path,
+    summary_path: Path,
+    label: str,
+    opponent_name: str,
+    elo0: float = 0.0,
+    elo1: float = 5.0,
+) -> str:
   wins_a, wins_b, draws = parse_pgn_results(pgn_path, name_a="c3")
   games = wins_a + wins_b + draws
   score = (wins_a + 0.5 * draws) / games if games else 0.5
   elo = elo_from_score(score)
-  err = elo_error(score, games)
+  err = elo_error(wins_a, draws, wins_b)
   likelihood = los(score, games)
+  ratio = llr(wins_a, draws, wins_b, elo0, elo1)
+  lower, upper = sprt_bounds()
 
   summary = (
       f"=== {label} ===\n"
@@ -87,6 +99,7 @@ def write_summary(pgn_path: Path, summary_path: Path, label: str, opponent_name:
       f"Score: {score:.3f}\n"
       f"Elo diff: {elo:+.1f} +/- {err:.1f}\n"
       f"LOS: {likelihood*100:.1f}%\n"
+      f"LLR: {ratio:.2f} ({lower:.2f}, {upper:.2f}) [{elo0:.2f}, {elo1:.2f}]\n"
   )
 
   summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,6 +128,10 @@ def main() -> None:
   parser.add_argument("--summary", type=Path, default=None,
                       help="summary output path (default: timestamped in Testing/fastchess/)")
   parser.add_argument("--summarize-only", type=Path, help="skip fastchess run, just summarize given PGN")
+  parser.add_argument("--elo0", type=float, default=0.0,
+                      help="SPRT null hypothesis in Elo for the reported LLR (default: 0)")
+  parser.add_argument("--elo1", type=float, default=5.0,
+                      help="SPRT alternative hypothesis in Elo for the reported LLR (default: 5)")
 
   args = parser.parse_args()
 
@@ -142,7 +159,8 @@ def main() -> None:
     if not args.summarize_only.exists():
       parser.error(f"PGN file not found: {args.summarize_only}")
     opponent_name = args.opponent_name or "opponent"
-    print(write_summary(args.summarize_only, args.summary, label="summary", opponent_name=opponent_name))
+    print(write_summary(args.summarize_only, args.summary, label="summary",
+                        opponent_name=opponent_name, elo0=args.elo0, elo1=args.elo1))
     return
 
   if not args.opponent:
@@ -160,7 +178,8 @@ def main() -> None:
   if not args.pgn.exists() or args.pgn.stat().st_size == 0:
     raise RuntimeError(f"fastchess did not create PGN file: {args.pgn}")
 
-  summary = write_summary(args.pgn, args.summary, label=f"fastchess ({args.mode})", opponent_name=opponent_name)
+  summary = write_summary(args.pgn, args.summary, label=f"fastchess ({args.mode})",
+                          opponent_name=opponent_name, elo0=args.elo0, elo1=args.elo1)
   print(summary)
 
 

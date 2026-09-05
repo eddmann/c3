@@ -2,15 +2,16 @@
 """
 Benchmark perft performance between two git branches to detect regressions.
 
-Runs perft on standard positions and compares NPS (nodes per second)
-between base and test versions.
+Runs perft on standard positions, checks the node counts against their known
+values, and compares NPS (nodes per second) between base and test versions.
+Each position is timed several times and the fastest run is used.
 
 Examples:
   # Compare HEAD against main branch
   python3 scripts/perft_benchmark.py --base main --test HEAD
 
   # With threshold
-  python3 scripts/perft_benchmark.py --base main --test HEAD --threshold 5.0
+  python3 scripts/perft_benchmark.py --base main --test HEAD --threshold 15.0
 
   # CI mode (structured output)
   python3 scripts/perft_benchmark.py --base main --test HEAD --ci
@@ -34,24 +35,34 @@ from common import (
 )
 
 
-# Standard benchmark positions: (name, fen, depth)
+# Standard benchmark positions: (name, fen, depth, expected_nodes).
+# Expected node counts come from the Chess Programming Wiki's perft results; a
+# mismatch means move generation is broken, which makes any NPS number
+# meaningless, so the benchmark refuses to compare speeds in that case.
 BENCHMARK_POSITIONS = [
     (
         "startpos",
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         5,
+        4865609,
     ),
     (
         "kiwipete",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
         4,
+        4085603,
     ),
     (
         "tricky",
         "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
         5,
+        674624,
     ),
 ]
+
+# Timings on shared CI runners wander by several percent between runs, so each
+# position is measured a few times and only the fastest run counts.
+RUNS_PER_POSITION = 3
 
 
 @dataclass
@@ -65,13 +76,22 @@ class PerftResult:
   nps: int
 
 
-def run_perft(engine_path: Path, name: str, fen: str, depth: int) -> PerftResult:
-  """Run perft via UCI and parse results.
+def run_perft(
+    engine_path: Path,
+    name: str,
+    fen: str,
+    depth: int,
+    expected_nodes: int,
+) -> PerftResult:
+  """Run perft via UCI, verify the node count and parse the timings.
 
   The engine outputs:
     nodes: <count>
     time: <ms> ms
     nps: <nps>
+
+  Raises:
+    RuntimeError: If the output cannot be parsed or the node count is wrong.
   """
   commands = f"position fen {fen}\nperft {depth}\nquit\n"
 
@@ -92,23 +112,34 @@ def run_perft(engine_path: Path, name: str, fen: str, depth: int) -> PerftResult
   if not all([nodes_match, time_match, nps_match]):
     raise RuntimeError(f"Failed to parse perft output: {output}")
 
+  nodes = int(nodes_match.group(1))
+  if nodes != expected_nodes:
+    raise RuntimeError(
+        f"{engine_path}: perft({depth}) on '{name}' returned {nodes} nodes, "
+        f"expected {expected_nodes} - move generation is incorrect"
+    )
+
   return PerftResult(
       name=name,
       depth=depth,
-      nodes=int(nodes_match.group(1)),
+      nodes=nodes,
       time_ms=int(time_match.group(1)),
       nps=int(nps_match.group(1)),
   )
 
 
-def benchmark_engine(engine_path: Path, positions: list[tuple[str, str, int]]) -> list[PerftResult]:
-  """Run full benchmark suite on engine."""
+def benchmark_engine(
+    engine_path: Path,
+    positions: list[tuple[str, str, int, int]],
+    runs: int = RUNS_PER_POSITION,
+) -> list[PerftResult]:
+  """Run the full benchmark suite on an engine, keeping the fastest run each."""
   results = []
-  for name, fen, depth in positions:
-    result = run_perft(engine_path, name, fen, depth)
-    results.append(result)
-    nps_str = format_nps(result.nps)
-    print(f"  {name} (d{depth}): {nps_str} ({result.time_ms}ms)")
+  for name, fen, depth, expected_nodes in positions:
+    attempts = [run_perft(engine_path, name, fen, depth, expected_nodes) for _ in range(runs)]
+    best = max(attempts, key=lambda attempt: attempt.nps)
+    results.append(best)
+    print(f"  {name} (d{depth}): {format_nps(best.nps)} ({best.time_ms}ms, best of {runs})")
   return results
 
 
@@ -223,8 +254,18 @@ def main() -> None:
   parser.add_argument(
       "--threshold",
       type=float,
-      default=5.0,
-      help="Regression threshold percentage (default: 5.0)",
+      default=10.0,
+      help=(
+          "Regression threshold percentage (default: 10.0). Shared CI runners "
+          "vary by more than 5%% between runs, so a tighter threshold reports "
+          "noise as a regression."
+      ),
+  )
+  parser.add_argument(
+      "--runs",
+      type=int,
+      default=RUNS_PER_POSITION,
+      help=f"Timed runs per position, best one counts (default: {RUNS_PER_POSITION})",
   )
   parser.add_argument(
       "--ci",
@@ -236,6 +277,8 @@ def main() -> None:
   # Validate arguments
   if args.threshold < 0:
     parser.error("--threshold must be non-negative")
+  if args.runs <= 0:
+    parser.error("--runs must be positive")
 
   worktrees_to_clean: list[Path] = []
 
@@ -267,10 +310,10 @@ def main() -> None:
 
       # Run benchmarks
       print(f"\nBenchmarking base ({base_ref})...")
-      base_results = benchmark_engine(base_engine, BENCHMARK_POSITIONS)
+      base_results = benchmark_engine(base_engine, BENCHMARK_POSITIONS, args.runs)
 
       print(f"\nBenchmarking test ({test_ref})...")
-      test_results = benchmark_engine(test_engine, BENCHMARK_POSITIONS)
+      test_results = benchmark_engine(test_engine, BENCHMARK_POSITIONS, args.runs)
 
       # Generate summary
       print()
