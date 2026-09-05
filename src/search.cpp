@@ -214,6 +214,14 @@ int optimistic_gain(const Move& mv) {
 //     expensive: an error there changes the move we play, while an error in a
 //     zero-window node usually only costs a re-search.
 //
+// AND WHAT THE TABLE ENDS UP BELIEVING. A move that fails low after a reduced
+// search is never looked at again, so the node's score—and the upper bound it
+// writes to the transposition table—is stamped with the node's FULL depth even
+// though part of the tree behind it was searched shallower. That is the
+// standard optimism: the bound is treated as if it had been earned at full
+// depth, and a later search that trusts it inherits whatever the reduction
+// missed. It is the price of the saving, and it is why the exemptions matter.
+//
 // FAILURE MODE: TACTICAL BLINDNESS. A quiet move can be a quiet SACRIFICE
 // setup, a mating net, a zugzwang move—brilliant precisely because it looks
 // like nothing. Reduced by three plies, its refutation-or-vindication may lie
@@ -225,8 +233,12 @@ int optimistic_gain(const Move& mv) {
 
 constexpr std::uint8_t LMR_MIN_DEPTH = 3;
 
-// The first three moves searched at a node are never reduced.
-constexpr std::size_t LMR_MIN_MOVE_NUMBER = 3;
+// How many moves at the front of a node's list are searched at full depth. The
+// name says what the number IS rather than where it is compared: the first
+// three moves searched are never reduced, so the fourth is the first that can
+// be. Spelling it as a minimum move number invited the off-by-one of reading it
+// as "the first reduced move is number 3".
+constexpr std::size_t LMR_UNREDUCED_MOVES = 3;
 
 constexpr double LMR_BASE = 0.75;
 constexpr double LMR_DIVISOR = 2.25;
@@ -660,6 +672,12 @@ std::optional<Move> CounterMoves::probe(const Move& previous) const {
 
 void CounterMoves::store(const Move& previous, const Move& refutation) {
   moves_[static_cast<std::size_t>(previous.piece)][previous.to.index()] = refutation;
+}
+
+void CounterMoves::clear() {
+  for (auto& by_piece : moves_) {
+    by_piece.fill(std::nullopt);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,8 +1529,9 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // check for whether the move GIVES check is last because it costs a scan
       // of the board and the cheap conditions usually decide the question.
       std::uint8_t reduction = 0;
-      if (depth >= LMR_MIN_DEPTH && moves_searched > LMR_MIN_MOVE_NUMBER && is_quiet(mv) &&
-          !in_check && !ordering.is_refutation(mv) && !is_in_check(pos.colour_to_move, pos.board)) {
+      if (ctx.reductions_enabled && depth >= LMR_MIN_DEPTH &&
+          moves_searched > LMR_UNREDUCED_MOVES && is_quiet(mv) && !in_check &&
+          !ordering.is_refutation(mv) && !is_in_check(pos.colour_to_move, pos.board)) {
         reduction = lmr_reduction(depth, moves_searched, is_pv_node);
 
         // Never reduce into quiescence: a move searched at depth 0 is a move

@@ -355,30 +355,33 @@ TEST(SearchReductions, GrowWithDepthAndMoveNumber) {
 
 TEST(SearchReductions, SearchLateQuietMovesShallower) {
   // Reductions have no output of their own; the only thing they change is how
-  // much work a search does. Measured in this Debug build, the starting
-  // position at depth 6 cost about 26,000 nodes when every move was searched at
-  // full depth and about 11,500 once late quiet moves were reduced, under the
-  // evaluation of the time. Adding pawn-structure, king-safety and mobility
-  // terms reshaped the tree to about 20,700 reduced nodes, so the ceiling below
-  // is deliberately generous. A ceiling pinned to one evaluation is a weak
-  // test; a proper version compares the same search with reductions switched
-  // on and off, which needs a test-only toggle in the search context.
-  Position pos = Position::startpos();
+  // much work a search does. This used to be pinned to an absolute node
+  // ceiling, which measured the evaluation function as much as the reductions
+  // and had to be loosened every time a term was added. The honest measurement
+  // is the same search twice, with reductions on and off.
+  const auto search_startpos = [](bool reductions_enabled) {
+    Position pos = Position::startpos();
 
-  search::SearchContext ctx;
-  search::TranspositionTable tt(8);
-  search::Report report;
-  search::Stopper stopper;
-  MoveList pv;
+    search::SearchContext ctx;
+    ctx.reductions_enabled = reductions_enabled;
+    search::TranspositionTable tt(8);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
 
-  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+    search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+    return std::make_pair(report.nodes, pv_to_uci(pv));
+  };
 
-  EXPECT_LT(report.nodes, 30'000U) << "late quiet moves should not be costing full depth";
+  const auto [reduced_nodes, reduced_pv] = search_startpos(true);
+  const auto [full_nodes, full_pv] = search_startpos(false);
+
+  EXPECT_LT(reduced_nodes, full_nodes) << "late quiet moves should not be costing full depth";
 
   // ...and the shallower search still comes back with a real line, not with
   // whatever a reduced search happened to leave behind.
-  ASSERT_FALSE(pv.empty());
-  EXPECT_GE(pv.size(), 2U);
+  ASSERT_FALSE(reduced_pv.empty());
+  EXPECT_GE(reduced_pv.size(), 2U);
 }
 
 TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
@@ -399,6 +402,16 @@ TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
   // A different piece landing there does not.
   const auto other_piece = make_move(Piece::BN, "f6", "d5");
   EXPECT_FALSE(counters.probe(other_piece).has_value());
+}
+
+TEST(SearchCounterMoves, ClearForgetsEverything) {
+  search::CounterMoves counters;
+  const auto previous = make_move(Piece::BP, "d7", "d5");
+  counters.store(previous, make_move(Piece::WP, "e4", "e5"));
+  ASSERT_TRUE(counters.probe(previous).has_value());
+
+  counters.clear();
+  EXPECT_FALSE(counters.probe(previous).has_value());
 }
 
 TEST(SearchCounterMoves, ASearchFillsTheTable) {

@@ -507,6 +507,12 @@ public:
   [[nodiscard]] std::optional<Move> probe(const Move& previous) const;
   void store(const Move& previous, const Move& refutation);
 
+  // Forget every refutation. A SearchContext is built fresh for each search, so
+  // the search itself never needs this; it is here because HistoryTable has it,
+  // and a pair of tables that are cleared in different ways is a trap for
+  // whoever eventually decides to carry one of them between moves.
+  void clear();
+
 private:
   std::array<std::array<std::optional<Move>, 64>, 12> moves_{};
 };
@@ -589,6 +595,11 @@ struct MoveScratch {
 
 // Everything one ply of the main search needs, on top of the above: the line it
 // reports to its parent, and the quiet moves it has already tried.
+//
+// searched_quiets is value-initialised, and here that costs nothing worth
+// counting: the row is zeroed once when the context is built, not—as it was
+// when it lived in alphabeta's frame—a quarter of a kilobyte written at every
+// single node for the sake of entries the node was about to overwrite anyway.
 struct PlyScratch {
   MoveScratch ordering;
   MoveList pv;
