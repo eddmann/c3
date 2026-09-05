@@ -163,7 +163,7 @@ def write_comparison_summary(
   score = (wins_test + 0.5 * draws) / games
   elo = elo_from_score(score)
   err = elo_error(wins_test, draws, wins_base)
-  likelihood = los(score, games)
+  likelihood = los(wins_test, draws, wins_base)
   lower, upper = sprt_bounds(ALPHA, BETA)
 
   # Prefer fastchess's own running LLR; recompute it from the PGN when the log
@@ -364,13 +364,15 @@ def main() -> None:
       )
       try:
         run(cmd, log_path=log_path)
-      except subprocess.CalledProcessError:
-        # Print log content on failure to help debug
+      except subprocess.CalledProcessError as error:
+        # Do not throw away a decided test because the last game crashed: show
+        # the log, then summarise whatever games reached the PGN. If none did,
+        # write_comparison_summary() reports the error exit code itself.
+        print(f"Warning: fastchess exited with code {error.returncode}", file=sys.stderr)
         if log_path.exists():
           print("=== Fastchess log ===")
           print(log_path.read_text())
           print("=== End log ===")
-        raise
 
       # Generate summary
       summary, exit_code = write_comparison_summary(

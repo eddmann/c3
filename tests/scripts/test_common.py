@@ -19,6 +19,7 @@ from common import (  # noqa: E402 - path setup has to happen first
     elo_error,
     expected_score,
     llr,
+    los,
     score_variance,
     sprt_bounds,
 )
@@ -66,8 +67,35 @@ class EloErrorTest(unittest.TestCase):
   def test_no_games_is_unbounded(self) -> None:
     self.assertEqual(elo_error(0, 0, 0), float("inf"))
 
-  def test_all_draws_pin_the_estimate(self) -> None:
-    self.assertEqual(elo_error(0, 100, 0), 0.0)
+  def test_all_draws_still_report_an_error_bar(self) -> None:
+    # Nothing was observed about the spread, so the variance is floored at one
+    # decisive game shared over the sample:
+    #   400 / (ln(10) * 0.25) * sqrt(0.25 / 100 / 100) = 3.47 Elo
+    self.assertAlmostEqual(elo_error(0, 100, 0), 3.47, places=2)
+
+  def test_unbeaten_run_is_not_reported_as_certain(self) -> None:
+    self.assertGreater(elo_error(100, 0, 0), 100.0)
+
+
+class LosTest(unittest.TestCase):
+
+  def test_hand_calculated_probability(self) -> None:
+    # 30/50/20: mean 0.55, standard error sqrt(0.1225 / 100) = 0.035,
+    # z = 0.05 / 0.035 = 1.4286, and Phi(1.4286) = 0.9234.
+    self.assertAlmostEqual(los(30, 50, 20), 0.9234, places=4)
+
+  def test_draws_sharpen_the_estimate(self) -> None:
+    # Same 0.55 score, but an all-decisive run is noisier and less convincing.
+    self.assertGreater(los(30, 50, 20), los(55, 0, 45))
+
+  def test_all_draws_are_a_coin_flip(self) -> None:
+    self.assertEqual(los(0, 100, 0), 0.5)
+
+  def test_unbeaten_run_is_superior(self) -> None:
+    self.assertEqual(los(100, 0, 0), 1.0)
+
+  def test_no_games_is_a_coin_flip(self) -> None:
+    self.assertEqual(los(0, 0, 0), 0.5)
 
 
 class LlrTest(unittest.TestCase):
@@ -75,6 +103,12 @@ class LlrTest(unittest.TestCase):
   def test_clear_win_favours_h1(self) -> None:
     # 100 wins, 100 draws, no losses: a 0.75 score is well past elo1 = 5.
     self.assertGreater(llr(100, 100, 0, elo0=0.0, elo1=5.0), sprt_bounds()[1])
+
+  def test_clear_win_matches_hand_calculation(self) -> None:
+    # N = 200, mean = 0.75, var = 0.5*(0.25)^2 + 0.5*(0.25)^2 = 0.0625,
+    # s0 = 0.5 and s1 = 0.5071951, so
+    #   LLR = 200 * (s1 - s0) * (2*0.75 - s0 - s1) / (2 * 0.0625) = 5.6732
+    self.assertAlmostEqual(llr(100, 100, 0, elo0=0.0, elo1=5.0), 5.6732, places=3)
 
   def test_equal_wins_and_losses_is_neutral(self) -> None:
     # Exactly on H0, so the ratio sits at (just below) zero.
@@ -86,6 +120,20 @@ class LlrTest(unittest.TestCase):
 
   def test_no_games_yields_no_evidence(self) -> None:
     self.assertEqual(llr(0, 0, 0, elo0=0.0, elo1=5.0), 0.0)
+
+  def test_all_draws_never_accept_h0(self) -> None:
+    # A drawn run says nothing about a 5 Elo difference. With a fallback
+    # variance that shrank with the sample the ratio grew as N^2, so 200
+    # straight draws crossed the H0 bound (-4.14) and 1000 reached -103.
+    self.assertGreater(llr(0, 200, 0, elo0=0.0, elo1=5.0), sprt_bounds()[0])
+    self.assertGreater(llr(0, 1000, 0, elo0=0.0, elo1=5.0), sprt_bounds()[0])
+
+  def test_degenerate_evidence_grows_linearly(self) -> None:
+    self.assertAlmostEqual(
+        llr(0, 1000, 0, elo0=0.0, elo1=5.0),
+        5 * llr(0, 200, 0, elo0=0.0, elo1=5.0),
+        places=9,
+    )
 
   def test_evidence_accumulates_with_games(self) -> None:
     few = llr(30, 50, 20, elo0=0.0, elo1=5.0)

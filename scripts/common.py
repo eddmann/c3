@@ -182,31 +182,39 @@ def elo_error(wins: int, draws: int, losses: int) -> float:
 
   The standard error of the mean score is sqrt(variance / games); the delta
   method turns that into Elo via the derivative of the Elo formula.
+
+  The variance is floored at one decisive game's worth of spread (0.25) shared
+  over the sample, so a run with no observed spread at all - every game drawn,
+  or an unbeaten engine - reports an honest error bar instead of "+/- 0.0".
   """
   games = wins + draws + losses
   if games == 0:
     return float("inf")
-  var = score_variance(wins, draws, losses)
-  if var == 0:
-    return 0.0
-  mean = min(max((wins + 0.5 * draws) / games, 1e-6), 1 - 1e-6)
+  var = max(score_variance(wins, draws, losses), 0.25 / games)
+  # Clamped like elo_from_score() so both agree about a perfect score.
+  mean = min(max((wins + 0.5 * draws) / games, 1e-4), 1 - 1e-4)
   deriv = 400 / (math.log(10) * mean * (1 - mean))
   return deriv * math.sqrt(var / games)
 
 
-def los(score: float, games: int) -> float:
+def los(wins: int, draws: int, losses: int) -> float:
   """Calculate Likelihood of Superiority.
 
-  Returns the probability that the true strength difference is > 0,
-  using the cumulative normal distribution.
+  Returns the probability that the true strength difference is > 0, using the
+  cumulative normal distribution. The standard error comes from the W/D/L
+  variance rather than a coin-flip one, so draws do not inflate it.
   """
+  games = wins + draws + losses
   if games == 0:
     return 0.5
-  p = score
-  var = p * (1 - p) / games
+  mean = (wins + 0.5 * draws) / games
+  var = score_variance(wins, draws, losses) / games
   if var == 0:
-    return 1.0 if p > 0.5 else 0.0
-  z = (p - 0.5) / math.sqrt(var)
+    # No spread at all: the score itself is the whole answer.
+    if mean == 0.5:
+      return 0.5
+    return 1.0 if mean > 0.5 else 0.0
+  z = (mean - 0.5) / math.sqrt(var)
   return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 
@@ -230,9 +238,12 @@ def llr(wins: int, draws: int, losses: int, elo0: float, elo1: float) -> float:
     return 0.0
   var = score_variance(wins, draws, losses)
   if var == 0:
-    # An unbeaten (or winless) run has no observed spread; fall back to the
-    # variance of a single decisive game so the ratio stays finite.
-    var = 1.0 / (4 * games)
+    # A run with no observed spread (every game drawn, or an unbeaten engine)
+    # falls back to the variance of a single decisive game. It has to be a
+    # constant: a fallback that shrinks with the sample, such as 1/(4N), makes
+    # the ratio grow as N^2 instead of N, and 200 straight draws then cross the
+    # H0 bound on evidence that says nothing about a 5 Elo difference.
+    var = 0.25
   mean = (wins + 0.5 * draws) / games
   s0, s1 = expected_score(elo0), expected_score(elo1)
   return games * (s1 - s0) * (2 * mean - s0 - s1) / (2 * var)

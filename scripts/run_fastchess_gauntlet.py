@@ -87,7 +87,7 @@ def write_summary(
   score = (wins_a + 0.5 * draws) / games if games else 0.5
   elo = elo_from_score(score)
   err = elo_error(wins_a, draws, wins_b)
-  likelihood = los(score, games)
+  likelihood = los(wins_a, draws, wins_b)
   ratio = llr(wins_a, draws, wins_b, elo0, elo1)
   lower, upper = sprt_bounds()
 
