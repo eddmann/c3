@@ -316,6 +316,68 @@ TEST(SearchHistory, PenalisesQuietMovesTriedBeforeTheCutoff) {
   EXPECT_GT(penalised, 0) << "the quiet moves tried before it must be penalised";
 }
 
+// Late move reductions ---------------------------------------------------------
+
+TEST(SearchReductions, GrowWithDepthAndMoveNumber) {
+  const auto reduction = [](std::uint8_t depth, std::size_t move_number, bool is_pv_node) {
+    return static_cast<int>(search::detail::lmr_reduction(depth, move_number, is_pv_node));
+  };
+
+  // floor(0.75 + ln(depth) * ln(move number) / 2.25), the shape the table is
+  // built from. Spot values rather than a reimplementation of the formula:
+  // a test that recomputes what it is testing proves nothing.
+  EXPECT_EQ(reduction(3, 4, false), 1);
+  EXPECT_EQ(reduction(8, 8, false), 2);
+  EXPECT_EQ(reduction(16, 16, false), 4);
+
+  // A PV node gives up one ply less than the zero-window nodes around it.
+  EXPECT_EQ(reduction(16, 16, true), 3);
+  EXPECT_EQ(reduction(8, 8, true), 1);
+
+  // ln(1) = 0, so depth 1 reduces nothing however late the move; and a
+  // reduction is never negative.
+  EXPECT_EQ(reduction(1, 60, false), 0);
+  EXPECT_EQ(reduction(3, 4, true), 0);
+
+  // Monotone in both arguments: deeper searches can spare more, and the further
+  // down the list ordering put a move the less it is believed.
+  for (std::uint8_t depth = 3; depth < 32; ++depth) {
+    for (std::size_t move_number = 4; move_number < 32; ++move_number) {
+      EXPECT_GE(reduction(depth, move_number, false), reduction(depth - 1, move_number, false));
+      EXPECT_GE(reduction(depth, move_number, false), reduction(depth, move_number - 1, false));
+    }
+  }
+
+  // Out-of-range arguments are clamped, not wrapped: the reduction stops
+  // growing rather than folding back to zero.
+  EXPECT_EQ(reduction(255, 250, false), reduction(63, 63, false));
+}
+
+TEST(SearchReductions, SearchLateQuietMovesShallower) {
+  // Reductions have no output of their own; the only thing they change is how
+  // much work a search does. Measured in this Debug build, the starting
+  // position at depth 6 costs about 26,000 nodes when every move is searched at
+  // full depth and about 11,500 once late quiet moves are reduced. The ceiling
+  // sits between the two and far enough from both that retuning the evaluation
+  // can move the number around without making the test lie.
+  Position pos = Position::startpos();
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(8);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  EXPECT_LT(report.nodes, 18'000U) << "late quiet moves should not be costing full depth";
+
+  // ...and the shallower search still comes back with a real line, not with
+  // whatever a reduced search happened to leave behind.
+  ASSERT_FALSE(pv.empty());
+  EXPECT_GE(pv.size(), 2U);
+}
+
 TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
   search::CounterMoves counters;
   const auto previous = make_move(Piece::BP, "d7", "d5");

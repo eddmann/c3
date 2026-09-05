@@ -132,8 +132,89 @@ bool has_non_pawn_material(const Board& board, Colour colour) {
 // Margins increase with depth: deeper searches need larger margins because
 // there's more potential for the position to improve over multiple plies.
 // =============================================================================
-constexpr int FUTILITY_MARGIN[] = {0, 100, 300}; // margins for depth 0, 1, 2
+constexpr std::array<int, 3> FUTILITY_MARGIN = {0, 100, 300}; // margins for depth 0, 1, 2
 constexpr int FUTILITY_DEPTH = 2;
+
+// =============================================================================
+// LATE MOVE REDUCTIONS (LMR)
+// =============================================================================
+// Move ordering is a claim: the moves at the front of the list are the ones
+// worth looking at. Alpha-beta only exploits half of that claim—it searches the
+// promising moves first and hopes for a cutoff. LMR exploits the other half: if
+// we really believe a quiet move ranked twentieth is unlikely to be best, we
+// should not spend the same depth on it as on the first move.
+//
+// So a late quiet move is searched SHALLOWER, with a zero window. Almost always
+// it fails low, which is what ordering predicted, and the node has bought a
+// whole subtree at a fraction of the price. When it does not—when the reduced
+// search beats alpha—the move is searched again at full depth, and if it is
+// still inside the window, once more with the full window to get its true score
+// and its line. Being wrong therefore costs a re-search, not a wrong answer,
+// which is why reductions can be aggressive in a way that pruning cannot.
+//
+// THE SHAPE OF THE TABLE
+//   reduction = floor(0.75 + ln(depth) * ln(move number) / 2.25)
+// Both logs matter. Deeper searches can afford to give up more plies, because
+// what is left is still a real search; and confidence that a move is bad grows
+// with how far down the list ordering put it, but only slowly—the fiftieth move
+// is not ten times more hopeless than the fifth. The constants are the ones the
+// engines that measured them settled on.
+//
+// WHO IS EXEMPT, AND WHY
+//   - The first few moves. The whole point is that they are the likely best.
+//   - Captures and promotions. Material swings are exactly what a shallow
+//     search mishandles.
+//   - Moves made or given in check. A forcing line is short and must be seen
+//     to its end; reducing it is how an engine walks into a mate it had time
+//     to see.
+//   - Killers and counter-moves. These are quiet moves the search has specific
+//     evidence for, and evidence is what reductions are supposed to respect.
+//   - PV nodes reduce one ply less. A PV node's job is to produce the true
+//     score and the line behind it, and it is the node whose mistakes are most
+//     expensive: an error there changes the move we play, while an error in a
+//     zero-window node usually only costs a re-search.
+//
+// FAILURE MODE: TACTICAL BLINDNESS. A quiet move can be a quiet SACRIFICE
+// setup, a mating net, a zugzwang move—brilliant precisely because it looks
+// like nothing. Reduced by three plies, its refutation-or-vindication may lie
+// past the horizon, the reduced search fails low, and nothing triggers the
+// re-search that would have found it. The exemptions above are the cheap
+// insurance against the common cases; the rest is a bet that the moves ordering
+// ranks last are usually as bad as they look, and it is a bet that pays.
+// =============================================================================
+
+constexpr std::uint8_t LMR_MIN_DEPTH = 3;
+
+// The first three moves searched at a node are never reduced.
+constexpr std::size_t LMR_MIN_MOVE_NUMBER = 3;
+
+constexpr double LMR_BASE = 0.75;
+constexpr double LMR_DIVISOR = 2.25;
+
+// The table is consulted with clamped indices, so these bound the arithmetic,
+// not the search: beyond them the reduction simply stops growing.
+constexpr std::size_t LMR_TABLE_DEPTHS = 64;
+constexpr std::size_t LMR_TABLE_MOVES = 64;
+
+// Logarithms are not constexpr in this standard, so the table is filled once at
+// start-up rather than at compile time. It is read-only from then on.
+struct LmrTable {
+  std::array<std::array<std::uint8_t, LMR_TABLE_MOVES>, LMR_TABLE_DEPTHS> reductions{};
+
+  LmrTable() {
+    for (std::size_t depth = 1; depth < LMR_TABLE_DEPTHS; ++depth) {
+      for (std::size_t move_number = 1; move_number < LMR_TABLE_MOVES; ++move_number) {
+        const double reduction =
+            LMR_BASE + (std::log(static_cast<double>(depth)) *
+                        std::log(static_cast<double>(move_number)) / LMR_DIVISOR);
+        reductions[depth][move_number] =
+            static_cast<std::uint8_t>(std::max(0.0, std::floor(reduction)));
+      }
+    }
+  }
+};
+
+const LmrTable LMR_TABLE;
 
 } // namespace
 
@@ -780,6 +861,21 @@ void detail::order_moves(MoveList& moves, const SearchContext& ctx, std::uint8_t
   }
 }
 
+std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, bool is_pv_node) {
+  const auto depth_index = std::min<std::size_t>(depth, LMR_TABLE_DEPTHS - 1);
+  const auto move_index = std::min<std::size_t>(move_number, LMR_TABLE_MOVES - 1);
+
+  const std::uint8_t reduction = LMR_TABLE.reductions[depth_index][move_index];
+
+  // A PV node is the one whose mistakes change the move we play, so it gives up
+  // one ply less than the zero-window nodes around it.
+  if (is_pv_node && reduction > 0) {
+    return static_cast<std::uint8_t>(reduction - 1);
+  }
+
+  return reduction;
+}
+
 void detail::order_quiescence_moves(MoveList& moves) {
   OrderedMoves ordering(moves);
   for (std::size_t i = 0; i < moves.size(); ++i) {
@@ -1034,7 +1130,11 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
   OrderedMoves ordering(moves, ctx, report.ply, hash_move, previous_move);
 
-  bool has_searched_one = false;
+  // How many legal moves this node has actually searched, so the move about to
+  // be searched is number `moves_searched + 1`. Late move reductions are a
+  // statement about that number, and futility pruning has always needed to know
+  // whether anything had been searched at all.
+  std::size_t moves_searched = 0;
   Bound tt_bound = Bound::Upper;
 
   // The best move THIS search finds, kept apart from `hash_move` above.
@@ -1063,39 +1163,62 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // At shallow depths, skip quiet moves that can't possibly raise alpha.
     // Don't prune captures, promotions, or when in check.
     // Only prune after first move to avoid falsely returning stalemate.
-    if (has_searched_one && depth <= FUTILITY_DEPTH && !in_check && is_quiet(mv) &&
-        static_eval + FUTILITY_MARGIN[depth] <= alpha) {
+    if (moves_searched > 0 && depth <= FUTILITY_DEPTH && !in_check && is_quiet(mv) &&
+        static_eval + FUTILITY_MARGIN[static_cast<std::size_t>(depth)] <= alpha) {
       pos.unmake_move(mv);
       continue;
     }
 
+    ++moves_searched;
     report.ply += 1;
 
     MoveList child_pv;
     int eval;
 
-    // PRINCIPAL VARIATION SEARCH (PVS)
-    // After searching the first move (assumed best due to move ordering),
-    // search remaining moves with a "zero window" (alpha, alpha+1). This is
-    // faster but only proves "this move is worse than alpha" or "better".
-    //
-    // If a move beats alpha in the zero-window search, it might be a new best
-    // move—re-search with the full window to get the true score.
-    if (has_searched_one) {
+    if (moves_searched == 1) {
+      // First move: search with full window. Ordering says this is the likely
+      // best move, and the score the rest are measured against has to come
+      // from somewhere.
+      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt, ctx,
+                        report, stopper, mv);
+    } else {
+      // LATE MOVE REDUCTIONS
+      // A quiet move ordering ranked near the back is searched shallower. The
+      // check for whether the move GIVES check is last because it costs a scan
+      // of the board and the cheap conditions usually decide the question.
+      std::uint8_t reduction = 0;
+      if (depth >= LMR_MIN_DEPTH && moves_searched > LMR_MIN_MOVE_NUMBER && is_quiet(mv) &&
+          !in_check && !ordering.is_refutation(mv) && !is_in_check(pos.colour_to_move, pos.board)) {
+        reduction = lmr_reduction(depth, moves_searched, is_pv_node);
+
+        // Never reduce into quiescence: a move searched at depth 0 is a move
+        // nobody looked at, which is pruning, not reducing. depth is at least
+        // LMR_MIN_DEPTH here, so there is always at least one ply to keep.
+        reduction = std::min(reduction, static_cast<std::uint8_t>(depth - 2));
+      }
+
+      // PRINCIPAL VARIATION SEARCH (PVS)
+      // After the first move, search the rest with a "zero window"
+      // (alpha, alpha+1). That only proves "worse than alpha" or "better", but
+      // it proves it far more cheaply than a real search.
       MoveList zero_window_pv;
-      // Zero-window: just checking if move can beat alpha
-      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
+      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1 - reduction), -alpha - 1, -alpha,
                         zero_window_pv, tt, ctx, report, stopper, mv);
 
-      // Re-search with full window if zero-window found a potential improvement
+      // The reduced search says the move is better than alpha, and a reduced
+      // search is not entitled to that opinion: verify it at full depth, still
+      // with the zero window.
+      if (reduction > 0 && eval > alpha) {
+        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
+                          zero_window_pv, tt, ctx, report, stopper, mv);
+      }
+
+      // Still looking like a new best move, so pay for the real thing: the full
+      // window is what produces a true score and the line behind it.
       if (eval > alpha && eval < beta) {
         eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
                           ctx, report, stopper, mv);
       }
-    } else {
-      // First move: search with full window
-      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt, ctx,
-                        report, stopper, mv);
     }
 
     report.ply -= 1;
@@ -1146,12 +1269,10 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       searched_quiets[searched_quiet_count] = mv;
       ++searched_quiet_count;
     }
-
-    has_searched_one = true;
   }
 
   // No legal moves: either checkmate or stalemate
-  if (!has_searched_one) {
+  if (moves_searched == 0) {
     // Checkmate: return negative mate score (we're getting mated)
     // Stalemate: draw
     return in_check ? -CENTIPAWN_MATE + report.ply : CENTIPAWN_DRAW;

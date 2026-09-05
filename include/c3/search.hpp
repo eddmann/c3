@@ -61,6 +61,12 @@
 //      At shallow depths, skip quiet moves that can't possibly improve alpha.
 //      If static_eval + margin < alpha, the move won't help—prune it.
 //
+//   9. LATE MOVE REDUCTIONS
+//      Quiet moves that ordering ranked near the back are searched shallower
+//      than the rest. If such a move turns out to beat alpha anyway, it is
+//      searched again at full depth, so the saving costs nothing when the
+//      guess was right and a re-search when it was wrong.
+//
 // =============================================================================
 
 #include <array>
@@ -634,6 +640,13 @@ void order_moves(MoveList& moves, const SearchContext& ctx, std::uint8_t ply,
                  const std::optional<Move>& hash_move = std::nullopt,
                  const std::optional<Move>& previous_move = std::nullopt);
 void order_quiescence_moves(MoveList& moves);
+
+// How many plies to shave off the search of the `move_number`-th move at this
+// depth (1 for the first move searched). Zero means "search it in full". PV
+// nodes get one ply less reduction than the rest; see the LATE MOVE REDUCTIONS
+// block in search.cpp for why.
+[[nodiscard]] std::uint8_t lmr_reduction(std::uint8_t depth, std::size_t move_number,
+                                         bool is_pv_node);
 
 // `previous_move` is the move that led to this position; it is what the
 // counter-move table is keyed by, and it is empty at the root and immediately
