@@ -284,6 +284,35 @@ TEST(Movegen, BlackPawnOnPromotionRankHasNoAdvance) {
   EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::F1), 0);
 }
 
+TEST(Movegen, NoCastlingWhenKingHasLeftItsHomeSquare) {
+  // Castling rights in a FEN can disagree with the pieces on the board; the
+  // king must actually stand on e1/e8 for a castling move to make sense.
+  const Position pos = parse_fen("4k3/8/8/8/8/8/8/R2K3R w KQ - 0 1");
+  EXPECT_EQ(castling_move_count(pseudo_legal_moves(pos)), 0);
+}
+
+TEST(Movegen, NoCastlingWhenWhiteRookIsMissingFromCorner) {
+  const Position pos = parse_fen("4k3/8/8/8/8/8/8/4K2R w KQ - 0 1");
+  const auto moves = pseudo_legal_moves(pos);
+
+  EXPECT_EQ(castling_move_count(moves), 1);
+
+  const auto castling_move =
+      *std::ranges::find_if(moves, [](const Move& mv) { return mv.is_castling(); });
+  EXPECT_EQ(castling_move.to, Square::G1);
+}
+
+TEST(Movegen, NoCastlingWhenBlackRookIsMissingFromCorner) {
+  const Position pos = parse_fen("r3k3/8/8/8/8/8/8/4K3 b kq - 0 1");
+  const auto moves = pseudo_legal_moves(pos);
+
+  EXPECT_EQ(castling_move_count(moves), 1);
+
+  const auto castling_move =
+      *std::ranges::find_if(moves, [](const Move& mv) { return mv.is_castling(); });
+  EXPECT_EQ(castling_move.to, Square::C8);
+}
+
 TEST(Movegen, CastleKingSideOnly) {
   const Position pos = parse_fen("8/8/8/8/8/8/8/R3K2R w K - 0 1");
   const auto moves = pseudo_legal_moves(pos);

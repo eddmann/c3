@@ -239,15 +239,30 @@ Bitboard pawn_advances(Square square, Colour colour, const Board& board) {
 // We only check the squares the KING passes through (F1/D1 for white).
 // =============================================================================
 
+// A castling right in a FEN is only a claim about the past, and in an edited or
+// hand-written position the pieces it talks about may not be there at all.
+// Confirm both are home before offering the move: otherwise a king sitting on
+// d1 would happily "castle" to g1, landing two files from where a rook never
+// stood.
+bool castling_pieces_at_home(Colour colour, Square king_home, Square rook_home,
+                             const Board& board) {
+  return (board.pieces(king(colour)) & king_home) != 0 &&
+         (board.pieces(rook(colour)) & rook_home) != 0;
+}
+
 Bitboard white_castling(CastlingRights rights, const Board& board) {
   Bitboard moves = 0;
 
-  if ((rights & CastlingRight::WhiteKing) && !board.has_occupancy_at(WHITE_KING_CASTLING_PATH) &&
+  if ((rights & CastlingRight::WhiteKing) &&
+      castling_pieces_at_home(Colour::White, Square::E1, Square::H1, board) &&
+      !board.has_occupancy_at(WHITE_KING_CASTLING_PATH) &&
       !is_attacked(Square::F1, Colour::Black, board)) {
     moves |= Square::G1;
   }
 
-  if ((rights & CastlingRight::WhiteQueen) && !board.has_occupancy_at(WHITE_QUEEN_CASTLING_PATH) &&
+  if ((rights & CastlingRight::WhiteQueen) &&
+      castling_pieces_at_home(Colour::White, Square::E1, Square::A1, board) &&
+      !board.has_occupancy_at(WHITE_QUEEN_CASTLING_PATH) &&
       !is_attacked(Square::D1, Colour::Black, board)) {
     moves |= Square::C1;
   }
@@ -258,12 +273,16 @@ Bitboard white_castling(CastlingRights rights, const Board& board) {
 Bitboard black_castling(CastlingRights rights, const Board& board) {
   Bitboard moves = 0;
 
-  if ((rights & CastlingRight::BlackKing) && !board.has_occupancy_at(BLACK_KING_CASTLING_PATH) &&
+  if ((rights & CastlingRight::BlackKing) &&
+      castling_pieces_at_home(Colour::Black, Square::E8, Square::H8, board) &&
+      !board.has_occupancy_at(BLACK_KING_CASTLING_PATH) &&
       !is_attacked(Square::F8, Colour::White, board)) {
     moves |= Square::G8;
   }
 
-  if ((rights & CastlingRight::BlackQueen) && !board.has_occupancy_at(BLACK_QUEEN_CASTLING_PATH) &&
+  if ((rights & CastlingRight::BlackQueen) &&
+      castling_pieces_at_home(Colour::Black, Square::E8, Square::A8, board) &&
+      !board.has_occupancy_at(BLACK_QUEEN_CASTLING_PATH) &&
       !is_attacked(Square::D8, Colour::White, board)) {
     moves |= Square::C8;
   }
