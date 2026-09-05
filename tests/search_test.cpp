@@ -222,18 +222,31 @@ TEST(SearchOrdering, RanksQuietMovesByHistory) {
 
 // History heuristic and counter-moves -------------------------------------------
 
-TEST(SearchHistory, GravityMakesScoresSaturateInsteadOfRunningAway) {
-  search::HistoryTable history;
-  const auto mv = make_move(Piece::WN, "g1", "f3");
+namespace {
 
+// Applies the same bonus `repetitions` times, checking after each one that the
+// score only ever climbs and never escapes the ceiling, and returns where it
+// settled. A loop of assertions belongs in a named function: the test that
+// calls it then reads as the claim it is making rather than as bookkeeping.
+int saturate_history(search::HistoryTable& history, const Move& mv, int bonus, int repetitions) {
   int previous = 0;
-  for (int i = 0; i < 1'000; ++i) {
-    history.update(mv, 1'200);
+  for (int i = 0; i < repetitions; ++i) {
+    history.update(mv, bonus);
     const int score = history.probe(mv);
     EXPECT_GE(score, previous) << "a bonus must never lower a score";
     EXPECT_LE(score, search::HISTORY_MAX) << "gravity must cap the score";
     previous = score;
   }
+  return previous;
+}
+
+} // namespace
+
+TEST(SearchHistory, GravityMakesScoresSaturateInsteadOfRunningAway) {
+  search::HistoryTable history;
+  const auto mv = make_move(Piece::WN, "g1", "f3");
+
+  const int previous = saturate_history(history, mv, 1'200, 1'000);
 
   EXPECT_GT(previous, search::HISTORY_MAX / 2) << "repeated cutoffs should still add up";
 
@@ -318,39 +331,61 @@ TEST(SearchHistory, PenalisesQuietMovesTriedBeforeTheCutoff) {
 
 // Late move reductions ---------------------------------------------------------
 
-TEST(SearchReductions, GrowWithDepthAndMoveNumber) {
-  const auto reduction = [](std::uint8_t depth, std::size_t move_number, bool is_pv_node) {
-    return static_cast<int>(search::detail::lmr_reduction(depth, move_number, is_pv_node));
-  };
+namespace {
 
+int lmr(std::uint8_t depth, std::size_t move_number, bool is_pv_node = false) {
+  return static_cast<int>(search::detail::lmr_reduction(depth, move_number, is_pv_node));
+}
+
+struct ReductionCase {
+  const char* what;
+  std::uint8_t depth;
+  std::size_t move_number;
+  bool is_pv_node;
+  int expected;
+};
+
+void expect_reductions(const std::vector<ReductionCase>& cases) {
+  for (const auto& c : cases) {
+    EXPECT_EQ(lmr(c.depth, c.move_number, c.is_pv_node), c.expected) << c.what;
+  }
+}
+
+void expect_reductions_are_monotone() {
+  for (std::uint8_t depth = 3; depth < 32; ++depth) {
+    for (std::size_t move_number = 4; move_number < 32; ++move_number) {
+      EXPECT_GE(lmr(depth, move_number), lmr(static_cast<std::uint8_t>(depth - 1), move_number));
+      EXPECT_GE(lmr(depth, move_number), lmr(depth, move_number - 1));
+    }
+  }
+}
+
+} // namespace
+
+TEST(SearchReductions, GrowWithDepthAndMoveNumber) {
   // floor(0.75 + ln(depth) * ln(move number) / 2.25), the shape the table is
   // built from. Spot values rather than a reimplementation of the formula:
   // a test that recomputes what it is testing proves nothing.
-  EXPECT_EQ(reduction(3, 4, false), 1);
-  EXPECT_EQ(reduction(8, 8, false), 2);
-  EXPECT_EQ(reduction(16, 16, false), 4);
-
-  // A PV node gives up one ply less than the zero-window nodes around it.
-  EXPECT_EQ(reduction(16, 16, true), 3);
-  EXPECT_EQ(reduction(8, 8, true), 1);
-
-  // ln(1) = 0, so depth 1 reduces nothing however late the move; and a
-  // reduction is never negative.
-  EXPECT_EQ(reduction(1, 60, false), 0);
-  EXPECT_EQ(reduction(3, 4, true), 0);
+  expect_reductions({
+      {"depth 3, move 4", 3, 4, false, 1},
+      {"depth 8, move 8", 8, 8, false, 2},
+      {"depth 16, move 16", 16, 16, false, 4},
+      // A PV node gives up one ply less than the zero-window nodes around it.
+      {"PV node, depth 16, move 16", 16, 16, true, 3},
+      {"PV node, depth 8, move 8", 8, 8, true, 1},
+      // ln(1) = 0, so depth 1 reduces nothing however late the move; and a
+      // reduction is never negative.
+      {"depth 1 reduces nothing", 1, 60, false, 0},
+      {"a PV reduction never goes negative", 3, 4, true, 0},
+  });
 
   // Monotone in both arguments: deeper searches can spare more, and the further
   // down the list ordering put a move the less it is believed.
-  for (std::uint8_t depth = 3; depth < 32; ++depth) {
-    for (std::size_t move_number = 4; move_number < 32; ++move_number) {
-      EXPECT_GE(reduction(depth, move_number, false), reduction(depth - 1, move_number, false));
-      EXPECT_GE(reduction(depth, move_number, false), reduction(depth, move_number - 1, false));
-    }
-  }
+  expect_reductions_are_monotone();
 
   // Out-of-range arguments are clamped, not wrapped: the reduction stops
   // growing rather than folding back to zero.
-  EXPECT_EQ(reduction(255, 250, false), reduction(63, 63, false));
+  EXPECT_EQ(lmr(255, 250), lmr(63, 63));
 }
 
 TEST(SearchReductions, SearchLateQuietMovesShallower) {
@@ -851,6 +886,16 @@ TEST(TranspositionTable, PrefersReplacingEntriesFromAnEarlierSearch) {
   EXPECT_EQ(tt.probe(key), nullptr);
 }
 
+namespace {
+
+void advance_generations(search::TranspositionTable& tt, int searches) {
+  for (int i = 0; i < searches; ++i) {
+    tt.new_search();
+  }
+}
+
+} // namespace
+
 TEST(TranspositionTable, GenerationWrapsAfterSixtyFourSearches) {
   // Six bits hold the generation, so after TT_GENERATION_COUNT searches the
   // counter comes back round and a very old entry looks current again. That is
@@ -862,9 +907,7 @@ TEST(TranspositionTable, GenerationWrapsAfterSixtyFourSearches) {
 
   tt.store(key, 9, 100, search::Bound::Exact, search::TT_NO_MOVE);
 
-  for (int i = 0; i < search::TT_GENERATION_COUNT; ++i) {
-    tt.new_search();
-  }
+  advance_generations(tt, search::TT_GENERATION_COUNT);
   EXPECT_EQ(tt.generation(), 0) << "the counter should have wrapped exactly once";
 
   // The entry now claims the current generation, so it is no longer "stale"
@@ -1019,16 +1062,18 @@ TEST(TranspositionTable, NonPvNodesTakeCutoffsFromEveryBoundType) {
   // keep, so all three bound types must still cut off without searching.
   Position pos = Position::startpos();
 
-  const struct {
+  struct BoundCase {
     const char* name;
     int score;
     search::Bound bound;
     int expected;
-  } cases[] = {
+  };
+
+  const std::array<BoundCase, 3> cases = {{
       {"exact", 123, search::Bound::Exact, 123},
       {"lower", 500, search::Bound::Lower, 1},  // >= beta: return beta
       {"upper", -500, search::Bound::Upper, 0}, // <= alpha: return alpha
-  };
+  }};
 
   for (const auto& scenario : cases) {
     search::TranspositionTable tt;
@@ -1308,26 +1353,56 @@ TEST(SearchMate, ReportsMoveCountUntilMate) {
 // mating—because a reduction bug shows up in some shapes and not others.
 // -----------------------------------------------------------------------------
 
-TEST(SearchTactics, FindsTheOnlyMoveInKnownPositions) {
-  struct Tactic {
-    std::string_view name;
-    std::string_view fen;
-    std::uint8_t depth;
-    std::string_view best;
-    bool is_mate;
-    // A second key move that is exactly as good, when the position has one.
-    // Which of two equal moves wins is decided by ordering ties, not strength.
-    std::string_view equally_good = {};
-  };
+namespace {
 
+struct Tactic {
+  std::string_view name;
+  std::string_view fen;
+  std::uint8_t depth;
+  std::string_view best;
+  bool is_mate;
+  // A second key move that is exactly as good, when the position has one.
+  // Which of two equal moves wins is decided by ordering ties, not strength.
+  std::string_view equally_good;
+};
+
+void expect_tactic_found(const Tactic& tactic) {
+  SCOPED_TRACE(std::string(tactic.name) + " — " + std::string(tactic.fen));
+
+  Position pos = parse(tactic.fen);
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = tactic.depth;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  ASSERT_FALSE(result.pv.empty());
+  const auto played = to_uci(result.pv[0]);
+  EXPECT_TRUE(played == tactic.best ||
+              (!tactic.equally_good.empty() && played == tactic.equally_good))
+      << "played " << played << ", expected " << tactic.best;
+
+  if (tactic.is_mate) {
+    EXPECT_GT(result.eval, CENTIPAWN_MATE_THRESHOLD) << "should be scored as a forced mate";
+    return;
+  }
+
+  // A queen for a knight, with the knight getting out afterwards. The exact
+  // number belongs to the evaluation; that it is a large advantage does not.
+  EXPECT_GT(result.eval, 200);
+}
+
+} // namespace
+
+TEST(SearchTactics, FindsTheOnlyMoveInKnownPositions) {
   const std::vector<Tactic> tactics = {
-      {"back-rank mate", "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1", 4, "a1a8", true},
+      {"back-rank mate", "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1", 4, "a1a8", true, ""},
       {"Scholar's mate", "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1", 4,
-       "f3f7", true},
+       "f3f7", true, ""},
       {"smothered mate: the rook and pawns are the cage", "6rk/6pp/8/6N1/8/8/8/6K1 w - - 0 1", 4,
-       "g5f7", true},
+       "g5f7", true, ""},
       {"the pawn takes the last flight square away", "1k6/1P6/1K6/8/8/8/8/7R w - - 0 1", 4, "h1h8",
-       true},
+       true, ""},
       // The key move is a quiet king move, which is exactly the kind of move a
       // reduction is happiest to throw away.
       // Kg6 and Kf7 both mate in two (1.Kf7 Kh7 2.Rh1#), so either is accepted.
@@ -1336,32 +1411,11 @@ TEST(SearchTactics, FindsTheOnlyMoveInKnownPositions) {
       // No mate anywhere: the reward is material, several plies away, and the
       // move that wins it is quiet in the sense that matters here—it captures
       // nothing.
-      {"knight fork wins the queen", "4k3/8/q7/3N4/8/8/4P3/7K w - - 0 1", 6, "d5c7", false},
+      {"knight fork wins the queen", "4k3/8/q7/3N4/8/8/4P3/7K w - - 0 1", 6, "d5c7", false, ""},
   };
 
   for (const auto& tactic : tactics) {
-    SCOPED_TRACE(std::string(tactic.name) + " — " + std::string(tactic.fen));
-
-    Position pos = parse(tactic.fen);
-    search::NullReporter reporter;
-    search::Limits limits;
-    limits.depth = tactic.depth;
-
-    const auto result = search::search(pos, limits, reporter);
-
-    ASSERT_FALSE(result.pv.empty());
-    const auto played = to_uci(result.pv[0]);
-    EXPECT_TRUE(played == tactic.best ||
-                (!tactic.equally_good.empty() && played == tactic.equally_good))
-        << "played " << played << ", expected " << tactic.best;
-
-    if (tactic.is_mate) {
-      EXPECT_GT(result.eval, CENTIPAWN_MATE_THRESHOLD) << "should be scored as a forced mate";
-    } else {
-      // A queen for a knight, with the knight getting out afterwards. The exact
-      // number belongs to the evaluation; that it is a large advantage does not.
-      EXPECT_GT(result.eval, 200);
-    }
+    expect_tactic_found(tactic);
   }
 }
 
@@ -1803,7 +1857,7 @@ TEST(SearchPV, KeepsFullLengthPvOnAWarmTable) {
   // scores for its own principal variation. If PV nodes were allowed to take
   // those cutoffs they would return a score with no line behind it, and the
   // reported PV would collapse to a move or two.
-  const auto fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+  const auto* const fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
 
   search::TranspositionTable tt;
   search::NullReporter reporter;

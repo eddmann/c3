@@ -47,7 +47,11 @@
 //   5. QUIESCENCE SEARCH
 //      At leaf nodes, don't just evaluate—keep searching captures until the
 //      position is "quiet". This avoids the "horizon effect" where we stop
-//      searching just before a piece gets captured.
+//      searching just before a piece gets captured. A leaf that is IN CHECK is
+//      not quiet and does not get to pretend otherwise: it searches every legal
+//      reply and reports mate when there is none. The captures it does search
+//      are filtered—by delta pruning, by static exchange evaluation, and to
+//      queen promotions only—because most of them cannot change the answer.
 //
 //   6. NULL-MOVE PRUNING
 //      If doing nothing (passing) still gives a good score, the position is
@@ -66,6 +70,20 @@
 //      than the rest. If such a move turns out to beat alpha anyway, it is
 //      searched again at full depth, so the saving costs nothing when the
 //      guess was right and a re-search when it was wrong.
+//
+//  10. STATIC EXCHANGE EVALUATION
+//      Price the whole exchange on a square—I take, you take back, and so on
+//      with the cheapest piece each time—without searching a node. Quiescence
+//      uses it to refuse captures that lose material outright, which is the
+//      one thing MVV-LVA cannot see.
+//
+// WHERE THE SEARCH'S WORKING STORAGE LIVES
+// Not on the stack. The recursion is up to 255 frames deep and each frame
+// would otherwise hold several two-kilobyte move lists, which overflows the
+// 512 KiB stack the search thread gets on macOS. Move lists, ordering scores
+// and principal variations live in per-ply rows owned by the SearchContext
+// below; see WHY THE SCRATCH SPACE LIVES HERE for the full argument, and THE
+// PLY CEILING for what keeps the ply from running past the end of those rows.
 //
 // =============================================================================
 

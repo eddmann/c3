@@ -453,7 +453,7 @@ std::vector<std::string> split_lines(const std::string& text) {
 std::vector<std::string> lines_starting_with(const std::string& text, const std::string& prefix) {
   std::vector<std::string> matches;
   for (const auto& line : split_lines(text)) {
-    if (line.rfind(prefix, 0) == 0) {
+    if (line.starts_with(prefix)) {
       matches.push_back(line);
     }
   }
@@ -565,7 +565,7 @@ TEST(UciLoop, StopEndsAnInfiniteSearch) {
   std::string last_pv_move;
   std::size_t info_depth_lines = 0;
   for (const auto& line : lines) {
-    if (line.rfind("info depth ", 0) != 0) {
+    if (!line.starts_with("info depth ")) {
       continue;
     }
     ++info_depth_lines;
@@ -788,9 +788,9 @@ TEST(UciLoop, EveryLineIsAValidUciCommand) {
     if (line.empty()) {
       continue;
     }
-    const bool valid = line.rfind("info ", 0) == 0 || line.rfind("bestmove ", 0) == 0 ||
-                       line.rfind("id ", 0) == 0 || line.rfind("option ", 0) == 0 ||
-                       line == "uciok" || line == "readyok";
+    const bool valid = line.starts_with("info ") || line.starts_with("bestmove ") ||
+                       line.starts_with("id ") || line.starts_with("option ") || line == "uciok" ||
+                       line == "readyok";
     EXPECT_TRUE(valid) << "not a UCI line: " << line << '\n' << output;
   }
 }
@@ -886,7 +886,7 @@ protected:
     }
 
     line_ = commands_[next_] + "\n";
-    if (commands_[next_].rfind("go", 0) == 0) {
+    if (commands_[next_].starts_with("go")) {
       ++searches_started_;
     }
     ++next_;
@@ -921,7 +921,7 @@ std::vector<std::uint64_t> node_counts_per_search(const std::string& output) {
   std::uint64_t latest = 0;
 
   for (const auto& line : split_lines(output)) {
-    if (line.rfind("info depth ", 0) == 0) {
+    if (line.starts_with("info depth ")) {
       const auto nodes = line.find(" nodes ");
       if (nodes != std::string::npos) {
         std::istringstream value(line.substr(nodes + std::string(" nodes ").size()));
@@ -930,7 +930,7 @@ std::vector<std::uint64_t> node_counts_per_search(const std::string& output) {
       continue;
     }
 
-    if (line.rfind("bestmove ", 0) == 0) {
+    if (line.starts_with("bestmove ")) {
       counts.push_back(latest);
       latest = 0;
     }
@@ -1100,7 +1100,7 @@ TEST(UciBench, EveryLineIsAValidUciLine) {
     if (line.empty()) {
       continue;
     }
-    EXPECT_EQ(line.rfind("info ", 0), 0U) << "not a UCI line: " << line;
+    EXPECT_TRUE(line.starts_with("info ")) << "not a UCI line: " << line;
   }
 }
 

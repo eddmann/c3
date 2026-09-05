@@ -396,12 +396,15 @@ std::optional<std::uint8_t> parse_bench(const std::vector<std::string>& args,
   return depth;
 }
 
-SetOptionCommand parse_setoption(
-    const std::vector<std::string>& args) { // NOLINT(readability-function-cognitive-complexity)
-  if (args.empty() || args[0] != "name") {
-    throw std::runtime_error("missing option name");
-  }
+// `setoption name Some Long Name value some long value`: both halves may run to
+// several words, and the first bare `value` token is the divider. Everything is
+// lowered, because a GUI is free to send whichever case it likes.
+struct OptionNameAndValue {
+  std::string name;
+  std::string value;
+};
 
+OptionNameAndValue split_option_name_and_value(const std::vector<std::string>& args) {
   std::vector<std::string> name_parts;
   std::vector<std::string> value_parts;
   bool in_value = false;
@@ -412,27 +415,56 @@ SetOptionCommand parse_setoption(
       continue;
     }
 
-    if (in_value) {
-      value_parts.push_back(args[i]);
-    } else {
-      name_parts.push_back(args[i]);
+    (in_value ? value_parts : name_parts).push_back(args[i]);
+  }
+
+  const auto join = [](const std::vector<std::string>& parts) {
+    std::string joined;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      joined += (i == 0 ? "" : " ") + parts[i];
     }
+    return to_lower(joined);
+  };
+
+  return {.name = join(name_parts), .value = join(value_parts)};
+}
+
+// Throws with the reason if this is not a hash size the engine can be given.
+void validate_hash_value(const std::optional<std::string>& value) {
+  if (!value.has_value()) {
+    throw std::runtime_error("missing value for 'hash' option");
   }
 
-  std::string name;
-  for (std::size_t i = 0; i < name_parts.size(); ++i) {
-    name += (i == 0 ? "" : " ") + name_parts[i];
+  std::size_t size_mb = 0;
+  try {
+    size_mb = std::stoull(*value);
+  } catch (...) {
+    throw std::runtime_error("could not parse value for 'hash' option");
   }
-  name = to_lower(name);
 
-  std::string value;
-  for (std::size_t i = 0; i < value_parts.size(); ++i) {
-    value += (i == 0 ? "" : " ") + value_parts[i];
+  // The range check lives outside the try: raising it inside would be caught
+  // by the catch-all above and misreported as a parse failure, hiding the
+  // real reason from whoever typed the command.
+  if (size_mb < search::TT_MIN_SIZE_MB || size_mb > search::TT_MAX_SIZE_MB) {
+    throw std::runtime_error("value for 'hash' option must be between " +
+                             std::to_string(search::TT_MIN_SIZE_MB) + " and " +
+                             std::to_string(search::TT_MAX_SIZE_MB) + " MB");
   }
-  value = to_lower(value);
+}
+
+SetOptionCommand parse_setoption(const std::vector<std::string>& args) {
+  if (args.empty() || args[0] != "name") {
+    throw std::runtime_error("missing option name");
+  }
+
+  const auto [name, value] = split_option_name_and_value(args);
 
   if (name.empty()) {
     throw std::runtime_error("missing option name");
+  }
+
+  if (name != "hash") {
+    throw std::runtime_error("unknown option '" + name + "'");
   }
 
   SetOptionCommand option{
@@ -440,29 +472,7 @@ SetOptionCommand parse_setoption(
       .value = value.empty() ? std::nullopt : std::make_optional(value),
   };
 
-  if (name == "hash") {
-    if (!option.value.has_value()) {
-      throw std::runtime_error("missing value for 'hash' option");
-    }
-
-    std::size_t size_mb = 0;
-    try {
-      size_mb = std::stoull(*option.value);
-    } catch (...) {
-      throw std::runtime_error("could not parse value for 'hash' option");
-    }
-
-    // The range check lives outside the try: raising it inside would be caught
-    // by the catch-all above and misreported as a parse failure, hiding the
-    // real reason from whoever typed the command.
-    if (size_mb < search::TT_MIN_SIZE_MB || size_mb > search::TT_MAX_SIZE_MB) {
-      throw std::runtime_error("value for 'hash' option must be between " +
-                               std::to_string(search::TT_MIN_SIZE_MB) + " and " +
-                               std::to_string(search::TT_MAX_SIZE_MB) + " MB");
-    }
-  } else {
-    throw std::runtime_error("unknown option '" + name + "'");
-  }
+  validate_hash_value(option.value);
 
   return option;
 }
@@ -1094,8 +1104,150 @@ void run_bench(Engine& engine, std::uint8_t depth,
 } // namespace
 
 namespace {
-void run_loop_impl(std::istream& in,
-                   std::ostream& out) { // NOLINT(readability-function-cognitive-complexity)
+
+using WriteLine = std::function<void(const std::string&)>;
+
+// The debugging aids: not part of UCI, and grouped here so the protocol proper
+// stays readable in the dispatch below. Their output still goes out as `info
+// string`, so that every line this loop writes is something a GUI can parse
+// and skip. Returns false when `cmd` was not one of them.
+bool dispatch_debug_command(const UciCommand& cmd, Engine& engine, const WriteLine& write_line) {
+  switch (cmd.type) {
+  case CommandType::PrintBoard:
+  case CommandType::PrintFen:
+    write_line("info string " + engine.position().to_fen());
+    return true;
+
+  case CommandType::Eval:
+    write_line("info string eval: " + std::to_string(eval(engine.position())));
+    return true;
+
+  case CommandType::Zobrist: {
+    std::ostringstream ss;
+    ss << "info string zobrist: " << std::showbase << std::hex << std::setw(18) << std::setfill('0')
+       << engine.position().key;
+    write_line(ss.str());
+    return true;
+  }
+
+  case CommandType::Perft: {
+    if (!cmd.perft_depth.has_value()) {
+      throw std::runtime_error("missing depth");
+    }
+
+    Position copy = engine.position();
+    const auto started = std::chrono::steady_clock::now();
+    const auto nodes = perft(copy, *cmd.perft_depth);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    const auto ms = std::max<std::int64_t>(elapsed_ms.count(), 1);
+    const auto nps = nodes * 1000 / static_cast<std::uint64_t>(ms);
+
+    write_line("info string nodes: " + std::to_string(nodes));
+    write_line("info string time: " + std::to_string(ms) + " ms");
+    write_line("info string nps: " + std::to_string(nps));
+    return true;
+  }
+
+  default:
+    return false;
+  }
+}
+
+// Acts on one parsed command. Returns false when the loop should end, which is
+// `quit` and nothing else.
+bool dispatch_command(const UciCommand& cmd, Engine& engine, SearchHandle& search_handle,
+                      std::ostream& out, std::mutex& out_mutex, const WriteLine& write_line) {
+  if (dispatch_debug_command(cmd, engine, write_line)) {
+    return true;
+  }
+
+  switch (cmd.type) {
+  case CommandType::Init:
+    write_line("id name " + engine_name());
+    write_line("id author " + engine_author());
+    write_line("option name Hash type spin default " + std::to_string(search::TT_DEFAULT_SIZE_MB) +
+               " min " + std::to_string(search::TT_MIN_SIZE_MB) + " max " +
+               std::to_string(search::TT_MAX_SIZE_MB));
+    write_line("uciok");
+    break;
+
+  case CommandType::IsReady:
+    write_line("readyok");
+    break;
+
+  case CommandType::NewGame:
+    search_handle.stop();
+    engine.new_game();
+    break;
+
+  case CommandType::DoMove:
+    if (!cmd.move.has_value()) {
+      throw std::runtime_error("missing move");
+    }
+    engine.apply_move(to_engine_move(*cmd.move, engine.position()));
+    break;
+
+  case CommandType::Position:
+    if (!cmd.position.has_value()) {
+      throw std::runtime_error("missing position payload");
+    }
+    search_handle.stop();
+    apply_position_command(*cmd.position, engine.position());
+    break;
+
+  case CommandType::Go:
+    if (!cmd.go_params.has_value()) {
+      throw std::runtime_error("missing go parameters");
+    }
+    search_handle.stop();
+    start_search(search_handle, *cmd.go_params, engine.position(), engine.transposition_table(),
+                 out, out_mutex);
+    break;
+
+  case CommandType::Bench:
+    // Runs on this thread and clears the table as it goes, so any search
+    // in flight has to be gone first.
+    search_handle.stop();
+    run_bench(engine, cmd.bench_depth.value_or(BENCH_DEFAULT_DEPTH), write_line);
+    break;
+
+  case CommandType::SetOption:
+    if (!cmd.option.has_value()) {
+      throw std::runtime_error("missing option payload");
+    }
+    if (cmd.option->name == "hash") {
+      // Resizing frees the storage the running search is reading and
+      // writing, so the search has to be gone first—and it has to be gone
+      // before we touch the table, not merely asked to stop. stop() joins,
+      // so once it returns this thread is the table's only user.
+      search_handle.stop();
+      engine.set_hash_size_mb(std::stoull(cmd.option->value.value()));
+    }
+    break;
+
+  case CommandType::Stop:
+    search_handle.stop();
+    break;
+
+  case CommandType::Quit:
+    search_handle.stop();
+    return false;
+
+  // Handled above, or nothing to do.
+  case CommandType::PrintBoard:
+  case CommandType::PrintFen:
+  case CommandType::Eval:
+  case CommandType::Zobrist:
+  case CommandType::Perft:
+  case CommandType::NoOp:
+    break;
+  }
+
+  return true;
+}
+
+void run_loop_impl(std::istream& in, std::ostream& out) {
   // DECLARATION ORDER MATTERS: locals are destroyed in reverse, so the search
   // handle (which joins the search thread) must be declared last. The thread
   // writes to `out` while holding `out_mutex`, and it searches through the
@@ -1124,119 +1276,7 @@ void run_loop_impl(std::istream& in,
         write_line("info string " + diagnostic);
       }
 
-      switch (cmd.type) {
-      case CommandType::Init:
-        write_line("id name " + engine_name());
-        write_line("id author " + engine_author());
-        write_line("option name Hash type spin default " +
-                   std::to_string(search::TT_DEFAULT_SIZE_MB) + " min " +
-                   std::to_string(search::TT_MIN_SIZE_MB) + " max " +
-                   std::to_string(search::TT_MAX_SIZE_MB));
-        write_line("uciok");
-        break;
-
-      case CommandType::IsReady:
-        write_line("readyok");
-        break;
-
-      case CommandType::NewGame:
-        search_handle.stop();
-        engine.new_game();
-        break;
-
-      // The commands below are debugging aids, not part of UCI. Their output
-      // still goes out as `info string` so that every line this loop writes is
-      // something a GUI can parse and skip.
-      case CommandType::PrintBoard:
-      case CommandType::PrintFen:
-        write_line("info string " + engine.position().to_fen());
-        break;
-
-      case CommandType::Eval:
-        write_line("info string eval: " + std::to_string(eval(engine.position())));
-        break;
-
-      case CommandType::Zobrist: {
-        std::ostringstream ss;
-        ss << "info string zobrist: " << std::showbase << std::hex << std::setw(18)
-           << std::setfill('0') << engine.position().key;
-        write_line(ss.str());
-        break;
-      }
-
-      case CommandType::Perft: {
-        if (!cmd.perft_depth.has_value()) {
-          throw std::runtime_error("missing depth");
-        }
-
-        Position copy = engine.position();
-        const auto started = std::chrono::steady_clock::now();
-        const auto nodes = perft(copy, *cmd.perft_depth);
-        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started);
-        const auto ms = std::max<std::int64_t>(elapsed_ms.count(), 1);
-        const auto nps = nodes * 1000 / static_cast<std::uint64_t>(ms);
-
-        write_line("info string nodes: " + std::to_string(nodes));
-        write_line("info string time: " + std::to_string(ms) + " ms");
-        write_line("info string nps: " + std::to_string(nps));
-        break;
-      }
-
-      case CommandType::DoMove:
-        if (!cmd.move.has_value()) {
-          throw std::runtime_error("missing move");
-        }
-        engine.apply_move(to_engine_move(*cmd.move, engine.position()));
-        break;
-
-      case CommandType::Position:
-        if (!cmd.position.has_value()) {
-          throw std::runtime_error("missing position payload");
-        }
-        search_handle.stop();
-        apply_position_command(*cmd.position, engine.position());
-        break;
-
-      case CommandType::Go:
-        if (!cmd.go_params.has_value()) {
-          throw std::runtime_error("missing go parameters");
-        }
-        search_handle.stop();
-        start_search(search_handle, *cmd.go_params, engine.position(), engine.transposition_table(),
-                     out, out_mutex);
-        break;
-
-      case CommandType::Bench:
-        // Runs on this thread and clears the table as it goes, so any search
-        // in flight has to be gone first.
-        search_handle.stop();
-        run_bench(engine, cmd.bench_depth.value_or(BENCH_DEFAULT_DEPTH), write_line);
-        break;
-
-      case CommandType::SetOption:
-        if (!cmd.option.has_value()) {
-          throw std::runtime_error("missing option payload");
-        }
-        if (cmd.option->name == "hash") {
-          // Resizing frees the storage the running search is reading and
-          // writing, so the search has to be gone first—and it has to be gone
-          // before we touch the table, not merely asked to stop. stop() joins,
-          // so once it returns this thread is the table's only user.
-          search_handle.stop();
-          engine.set_hash_size_mb(std::stoull(cmd.option->value.value()));
-        }
-        break;
-
-      case CommandType::NoOp:
-        break;
-
-      case CommandType::Stop:
-        search_handle.stop();
-        break;
-
-      case CommandType::Quit:
-        search_handle.stop();
+      if (!dispatch_command(cmd, engine, search_handle, out, out_mutex, write_line)) {
         return;
       }
     } catch (const std::exception& ex) {
