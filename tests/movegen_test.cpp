@@ -52,8 +52,8 @@ void assert_legal_move_count(std::string_view fen, std::size_t count) {
   EXPECT_EQ(legal_moves(parse_fen(fen)).size(), count) << fen;
 }
 
-// is_attacked short-circuits while get_attackers collects every attacker; the
-// two must always agree about whether the square is attacked at all.
+// Whatever is_attacked does internally, it must answer exactly what the full
+// attacker set says: callers pick between the two on cost, never on meaning.
 void assert_attacked_matches_attackers(std::string_view fen) {
   const Position pos = parse_fen(fen);
 
@@ -75,16 +75,18 @@ std::size_t moves_from_square(const MoveList& moves, Square from) {
 
 // The deepest fixtures are marked in the fixture file rather than hidden in a
 // second file, so the whole suite stays in one place and one loader.
+enum class PerftFixtureSet { Everyday, Slow };
+
 bool is_slow_perft_record(const fixtures::PerftRecord& record) {
   return record.name.starts_with("slow-");
 }
 
-void assert_perft_fixtures_match(bool slow) {
+void assert_perft_fixtures_match(PerftFixtureSet set) {
   const auto records = fixtures::load_perft(fixtures::perft_path());
   std::size_t checked = 0;
 
   for (const auto& record : records) {
-    if (is_slow_perft_record(record) != slow) {
+    if (is_slow_perft_record(record) != (set == PerftFixtureSet::Slow)) {
       continue;
     }
 
@@ -369,7 +371,7 @@ TEST(Movegen, NoCastlingWhenKingHasLeftItsHomeSquare) {
   EXPECT_EQ(castling_move_count(pseudo_legal_moves(pos)), 0);
 }
 
-TEST(Movegen, NoCastlingWhenWhiteRookIsMissingFromCorner) {
+TEST(Movegen, OnlyKingSideCastlingWhenQueenRookIsMissing) {
   const Position pos = parse_fen("4k3/8/8/8/8/8/8/4K2R w KQ - 0 1");
   const auto moves = pseudo_legal_moves(pos);
 
@@ -380,7 +382,7 @@ TEST(Movegen, NoCastlingWhenWhiteRookIsMissingFromCorner) {
   EXPECT_EQ(castling_move.to, Square::G1);
 }
 
-TEST(Movegen, NoCastlingWhenBlackRookIsMissingFromCorner) {
+TEST(Movegen, OnlyQueenSideCastlingWhenKingRookIsMissing) {
   const Position pos = parse_fen("r3k3/8/8/8/8/8/8/4K3 b kq - 0 1");
   const auto moves = pseudo_legal_moves(pos);
 
@@ -514,7 +516,7 @@ TEST(Movegen, IgnoreFriendlyPieceCaptures) {
 // Perft -------------------------------------------------------------------
 
 TEST(Perft, FixturesMatch) {
-  assert_perft_fixtures_match(false);
+  assert_perft_fixtures_match(PerftFixtureSet::Everyday);
 }
 
 // The deepest positions count millions of nodes, which takes a minute or more
@@ -525,5 +527,5 @@ TEST(Perft, SlowFixturesMatch) {
     GTEST_SKIP() << "set C3_SLOW_PERFT=1 to run the deep perft fixtures";
   }
 
-  assert_perft_fixtures_match(true);
+  assert_perft_fixtures_match(PerftFixtureSet::Slow);
 }
