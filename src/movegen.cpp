@@ -412,7 +412,7 @@ bool is_in_check(Colour colour, const Board& board) {
 
 MoveList pseudo_legal_moves(const Position& pos) {
   MoveList moves;
-  moves.reserve(MAX_LEGAL_MOVES);
+  moves.reserve(MOVE_LIST_RESERVE);
 
   const Colour colour_to_move = pos.colour_to_move;
 
@@ -481,7 +481,7 @@ MoveList pseudo_legal_moves(const Position& pos) {
 
 MoveList pseudo_legal_noisy_moves(const Position& pos) {
   MoveList moves;
-  moves.reserve(MAX_LEGAL_MOVES);
+  moves.reserve(MOVE_LIST_RESERVE);
 
   const Colour colour_to_move = pos.colour_to_move;
   const Bitboard captures_mask = pos.board.pieces_by_colour(!colour_to_move);

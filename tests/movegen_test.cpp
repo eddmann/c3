@@ -238,6 +238,15 @@ TEST(Movegen, LegalMoveCountInCheckIsLimited) {
   assert_legal_move_count("rnbqkbnr/1pp1p1pp/p2p1p2/1B6/8/4P3/PPPP1PPP/RNBQK1NR b KQq - 0 1", 7);
 }
 
+TEST(Movegen, GeneratesTheMostCrowdedKnownPosition) {
+  // 218 legal moves is the highest count found for a legal chess position, and
+  // the figure MOVE_LIST_RESERVE is sized from.
+  const Position pos = parse_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1");
+
+  EXPECT_EQ(legal_moves(pos).size(), 218);
+  EXPECT_LE(legal_moves(pos).size(), MOVE_LIST_RESERVE);
+}
+
 TEST(Movegen, LegalMovesRejectMovesByAPinnedPiece) {
   // The knight on e2 is the only thing between the king on e1 and the rook on
   // e8, so every knight move is pseudo-legal yet none of them is legal.
