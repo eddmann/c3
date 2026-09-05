@@ -124,3 +124,16 @@ TEST(Piece, CollectionsMatchExpectedOrdering) {
   EXPECT_EQ(black_promos[0], Piece::BN);
   EXPECT_EQ(black_promos[3], Piece::BQ);
 }
+
+// A pawn is never on the rank it would advance off, so stepping past the edge
+// means a caller lost track of the piece it was walking. Debug builds abort at
+// the offending call rather than silently wrapping around to the far rank.
+TEST(SquareDeathTest, AdvanceOffTheBoardIsRejected) {
+  EXPECT_DEBUG_DEATH((void)Square::A1.advance(Colour::Black), "");
+  EXPECT_DEBUG_DEATH((void)Square::H8.advance(Colour::White), "");
+}
+
+TEST(Piece, FitsInASingleByte) {
+  EXPECT_EQ(sizeof(Piece), 1U);
+  EXPECT_LE(sizeof(std::optional<Piece>), 2U);
+}
