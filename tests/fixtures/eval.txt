@@ -1,13 +1,37 @@
 # name|fen|score_cp
 # Scores are in centipawns from the side-to-move's perspective, produced by the
-# tapered evaluation (material + piece-square tables, blended by game phase).
-startpos|rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1|0
-kiwipete|r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1|105
-white-rook-king|8/8/8/8/8/8/8/R3K2R w - - 0 1|1008
-black-to-move-same|8/8/8/8/8/8/8/R3K2R b - - 0 1|-1008
-# Bare kings and a lone bishop cannot mate: dead draws, scored exactly zero.
+# tapered evaluation: material and piece-square tables read off the Board's
+# running totals, plus pawn structure, king safety, rook placement and mobility,
+# blended by game phase, plus a tempo bonus for whoever is to move.
+#
+# These are REGRESSION PINS, not judgements: the numbers are whatever the
+# evaluation currently says, and they exist so that a change to it has to be a
+# deliberate one. Retune a weight and these all move; that is the point. The
+# relational tests in eval_test.cpp are where the chess claims live.
+startpos|rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1|10
+kiwipete|r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1|108
+white-rook-king|8/8/8/8/8/8/8/R3K2R w - - 0 1|1103
+# The same board with Black to move. The board-derived score negates exactly;
+# the tempo bonus does not, so the two add up to twice the bonus rather than zero.
+black-to-move-same|8/8/8/8/8/8/8/R3K2R b - - 0 1|-1083
+# Bare kings and a lone bishop cannot mate: dead draws, scored exactly zero,
+# tempo bonus included.
 endgame-kings|8/8/8/3k4/8/8/3K4/8 w - - 0 1|0
 insufficient-lone-bishop|4k3/8/8/8/8/8/8/4KB2 w - - 0 1|0
 # Rook endgame: with the board nearly empty the taper leans on the endgame king
 # table, which rewards White's centralised king and punishes Black's cornered one.
-endgame-central-king|k7/8/8/8/3K4/8/8/7R w - - 0 1|595
+endgame-central-king|k7/8/8/8/3K4/8/8/7R w - - 0 1|669
+# A pawn nothing can stop from queening, in an endgame where the passed-pawn
+# bonus is at its full (doubled) strength.
+passed-pawn-endgame|4k3/8/8/3P4/8/8/8/4K3 w - - 0 1|215
+# Two pawns on one file: doubled once, both isolated because no friendly pawn
+# stands on the b- or d-file to defend either of them, and only ONE passer
+# between them—the rear pawn can never get past the one in front.
+doubled-isolated-pawns|7k/8/8/8/8/2P5/2P5/7K w - - 0 1|225
+# The same material and the same pawns, two corners for the king: behind f2/g2/h2
+# it collects the pawn shield, on b1 it has abandoned it and the a/b/c files are
+# wide open. The gap between these two entries is the king-safety term.
+king-safety-sheltered|3qk3/8/8/8/3Q4/8/5PPP/6K1 w - - 0 1|448
+king-safety-exposed|3qk3/8/8/8/3Q4/8/5PPP/1K6 w - - 0 1|423
+# A rook with an open file in front of it, and the mobility that comes with it.
+rook-open-file|4k3/8/8/8/8/8/1P6/R6K w - - 0 1|687

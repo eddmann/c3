@@ -16,7 +16,8 @@ This project grew out of a fascination with chess programming and a desire to de
 - Null-move pruning, futility pruning, quiescence search, check extensions
 - Transposition table with Zobrist hashing
 - Move ordering: TT move, MVV-LVA, killer moves
-- Material and piece-square table evaluation
+- Tapered evaluation: material and piece-square tables (kept as an incremental
+  running total), pawn structure, king safety, rook placement, mobility, tempo
 - Full UCI protocol with time management
 - GoogleTest suite with perft validation
 - Fastchess gauntlet and SPRT strength testing
@@ -24,7 +25,9 @@ This project grew out of a fascination with chess programming and a desire to de
 ## Roadmap
 
 - Late-move reductions (LMR)
-- Enhanced evaluation (king safety, pawn structure, endgame patterns)
+- Endgame patterns (king-pawn races, opposition, drawn-endgame scaling)
+- Pawn hash table, and evaluation weights fitted by tuning rather than by hand
+  (`scripts/texel_tune.py` sketches the machinery)
 - Opening book support
 - Tablebase support
 - Multi-threaded search
@@ -160,6 +163,15 @@ Style: 2-space indent, 100-column limit (configured in `.clang-format`).
 
 Both scripts drive [fastchess](https://github.com/Disservin/fastchess) and write
 their PGN, log and summary into `Testing/fastchess/`.
+
+Evaluation changes need this more than search changes do, because they buy
+knowledge with speed. Mobility is the expensive term: it asks the magic bitboard
+tables a question for every sliding piece at every leaf, and the positional terms
+together cost roughly 30–55% more time per node than material and piece squares
+alone (measured here at depth 8: 2.15 → 1.65 Mnps on the start position,
+3.14 → 2.04 Mnps on kiwipete, with about half of that down to mobility). A
+release should therefore confirm with a gauntlet that the extra knowledge is
+worth more than the depth it gives up; nodes per second alone cannot answer that.
 
 ### Gauntlet
 
