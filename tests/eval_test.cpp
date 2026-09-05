@@ -1,14 +1,23 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
+#include "c3/attacks.hpp"
+#include "c3/bitboard.hpp"
 #include "c3/board.hpp"
+#include "c3/colour.hpp"
 #include "c3/eval.hpp"
+#include "c3/move.hpp"
+#include "c3/movegen.hpp"
 #include "c3/piece.hpp"
 #include "c3/position.hpp"
+#include "c3/rng.hpp"
 #include "fixtures.hpp"
 
 using namespace c3;
@@ -470,4 +479,229 @@ TEST(Eval, MinorAgainstMinorScoresDrawn) {
 
 TEST(Eval, TwoKnightsAgainstABareKingScoreDrawn) {
   EXPECT_EQ(eval(parse("4k3/8/8/8/8/8/8/2N1KN2 w - - 0 1")), CENTIPAWN_DRAW);
+}
+
+// -----------------------------------------------------------------------------
+// Incremental accumulator: the running totals must always agree with the slow,
+// obviously-correct computation they replace
+// -----------------------------------------------------------------------------
+
+namespace {
+
+// The bishop-pair bonus is the one material term the accumulator does not
+// carry, so a test comparing the two has to add it back by hand.
+bool test_has_bishop_pair(const Board& board, Colour side) {
+  constexpr Bitboard dark = 0xAA55'AA55'AA55'AA55ULL;
+  const Bitboard bishops = board.pieces(bishop(side));
+  return (bishops & dark) != 0 && (bishops & ~dark) != 0;
+}
+
+// eval() the slow way: walk both piece lists, twice, and taper the result.
+// This is the reference the incremental evaluation has to reproduce exactly.
+int reference_eval(const Position& pos) {
+  if (has_insufficient_material(pos.board)) {
+    return CENTIPAWN_DRAW;
+  }
+
+  const auto white_advantage = [&pos](Phase phase) {
+    return eval_material(Colour::White, pos.board, phase) -
+           eval_material(Colour::Black, pos.board, phase) +
+           eval_psqt(Colour::White, pos.board, phase) - eval_psqt(Colour::Black, pos.board, phase);
+  };
+
+  const int phase = game_phase(pos.board);
+  const int score = (white_advantage(Phase::Middlegame) * phase +
+                     white_advantage(Phase::Endgame) * (PHASE_MAX - phase)) /
+                    PHASE_MAX;
+  const int bounded = std::clamp(score, -CENTIPAWN_EVAL_MAX, CENTIPAWN_EVAL_MAX);
+
+  return pos.colour_to_move == Colour::White ? bounded : -bounded;
+}
+
+// Both halves of the invariant in one place: the accumulator matches a rebuild
+// from the pieces on the board, and the fast eval matches the slow one.
+void expect_accumulator_is_sound(const Position& pos, std::string_view context) {
+  const auto& live = pos.board.accumulator();
+  const auto rebuilt = pos.board.compute_accumulator();
+
+  for (const auto side : {Colour::White, Colour::Black}) {
+    EXPECT_EQ(live.middlegame(side), rebuilt.middlegame(side))
+        << context << " (middlegame, " << (side == Colour::White ? "white" : "black") << ")";
+    EXPECT_EQ(live.endgame(side), rebuilt.endgame(side))
+        << context << " (endgame, " << (side == Colour::White ? "white" : "black") << ")";
+  }
+  EXPECT_EQ(live.phase(), rebuilt.phase()) << context << " (phase)";
+  EXPECT_EQ(eval(pos), reference_eval(pos)) << context << " (eval)";
+}
+
+constexpr std::array<std::string_view, 8> ACCUMULATOR_FENS = {
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    "4k3/8/8/8/8/8/8/4KB2 w - - 0 1",
+    "8/8/8/3k4/8/8/3K4/8 w - - 0 1",
+    "QQQQQQQQ/QQQQQQQK/8/8/8/8/8/7k w - - 0 1",
+    "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+};
+
+} // namespace
+
+TEST(EvalAccumulator, FenLoadInitialisesTheTotals) {
+  // Positions arrive from FEN, not from a sequence of moves, so the very first
+  // thing the accumulator has to get right is a board it never saw built.
+  for (const auto fen : ACCUMULATOR_FENS) {
+    const auto pos = parse(fen);
+    expect_accumulator_is_sound(pos, fen);
+  }
+}
+
+TEST(EvalAccumulator, TotalsAreMaterialPlusPieceSquareBonuses) {
+  // Pins WHAT the accumulator holds, not just that it is self-consistent: one
+  // side's running total is its material (minus the bishop-pair bonus, which
+  // belongs to no single piece) plus its piece-square bonuses.
+  for (const auto fen : ACCUMULATOR_FENS) {
+    const auto pos = parse(fen);
+    const auto& accumulator = pos.board.accumulator();
+
+    for (const auto side : {Colour::White, Colour::Black}) {
+      const bool pair = test_has_bishop_pair(pos.board, side);
+
+      const int expected_middlegame = eval_material(side, pos.board, Phase::Middlegame) -
+                                      (pair ? BISHOP_PAIR_MIDDLEGAME : 0) +
+                                      eval_psqt(side, pos.board, Phase::Middlegame);
+      const int expected_endgame = eval_material(side, pos.board, Phase::Endgame) -
+                                   (pair ? BISHOP_PAIR_ENDGAME : 0) +
+                                   eval_psqt(side, pos.board, Phase::Endgame);
+
+      EXPECT_EQ(accumulator.middlegame(side), expected_middlegame) << fen;
+      EXPECT_EQ(accumulator.endgame(side), expected_endgame) << fen;
+    }
+  }
+}
+
+TEST(EvalAccumulator, PhaseTotalIsUncappedButGamePhaseIsNot) {
+  // The accumulator deliberately stores the raw phase count so that add() and
+  // remove() stay exact inverses; game_phase() applies the 24-point cap. A
+  // board full of promoted queens is where the two readings part company.
+  const auto normal = parse("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  EXPECT_EQ(normal.board.accumulator().phase(), PHASE_MAX);
+  EXPECT_EQ(game_phase(normal.board), PHASE_MAX);
+
+  const auto promoted = parse("QQQQQQQQ/QQQQQQQK/8/8/8/8/8/7k w - - 0 1");
+  EXPECT_GT(promoted.board.accumulator().phase(), PHASE_MAX);
+  EXPECT_EQ(game_phase(promoted.board), PHASE_MAX);
+}
+
+TEST(EvalAccumulator, EveryMoveKindKeepsTheTotalsInSync) {
+  // One case per way a move can change the board, because each one reaches
+  // put_piece/remove_piece by a different route: a promotion swaps a pawn for a
+  // queen, en passant clears a square the move never names, and castling moves
+  // two pieces for one move.
+  struct Case {
+    std::string_view name;
+    std::string_view fen;
+    Move move;
+  };
+
+  const std::array<Case, 6> cases = {{
+      {"quiet", "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
+       Move{Piece::WP, Square::E2, Square::E4, std::nullopt, std::nullopt, false}},
+      {"capture", "n3k3/8/8/8/8/8/8/R3K3 w - - 0 1",
+       Move{Piece::WR, Square::A1, Square::A8, Piece::BN, std::nullopt, false}},
+      {"promotion", "4k3/2P5/8/8/8/8/8/4K3 w - - 0 1",
+       Move{Piece::WP, Square::C7, Square::C8, std::nullopt, Piece::WQ, false}},
+      {"promotion-capture", "1n2k3/2P5/8/8/8/8/8/4K3 w - - 0 1",
+       Move{Piece::WP, Square::C7, Square::B8, Piece::BN, Piece::WQ, false}},
+      {"en-passant", "4k3/8/8/3Pp3/8/8/8/4K3 w - e6 0 1",
+       Move{Piece::WP, Square::D5, Square::E6, Piece::BP, std::nullopt, true}},
+      {"castling", "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+       Move{Piece::WK, Square::E1, Square::G1, std::nullopt, std::nullopt, false}},
+  }};
+
+  for (const auto& test_case : cases) {
+    Position pos = parse(test_case.fen);
+    const auto before = pos.board.accumulator();
+
+    expect_accumulator_is_sound(pos, test_case.name);
+    pos.make_move(test_case.move);
+    expect_accumulator_is_sound(pos, test_case.name);
+    pos.unmake_move(test_case.move);
+    expect_accumulator_is_sound(pos, test_case.name);
+
+    EXPECT_EQ(pos.board.accumulator(), before) << test_case.name << " (unmake did not restore)";
+  }
+}
+
+TEST(EvalAccumulator, QueenSideCastlingKeepsTheTotalsInSync) {
+  // The two castles move the rook different distances, so they are separate
+  // paths through make_move and each needs its own case.
+  Position pos = parse("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+  const Move mv{Piece::WK, Square::E1, Square::C1, std::nullopt, std::nullopt, false};
+  const auto before = pos.board.accumulator();
+
+  pos.make_move(mv);
+  expect_accumulator_is_sound(pos, "queenside castling");
+  pos.unmake_move(mv);
+  expect_accumulator_is_sound(pos, "queenside castling undone");
+
+  EXPECT_EQ(pos.board.accumulator(), before);
+}
+
+TEST(EvalAccumulator, SurvivesRandomPlayouts) {
+  // The per-move-kind cases above are hand-picked; this one is not. Several
+  // seeded games of random legal moves, checking the totals after EVERY make
+  // and EVERY unmake, is what catches the combination nobody thought to write
+  // down—an under-promotion that also captures a rook and removes a castling
+  // right, say. Seeded, so a failure is reproducible.
+  constexpr std::array<std::string_view, 3> openings = {
+      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+      "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+  };
+  constexpr int MAX_PLIES = 120;
+
+  HashRng rng(0x5EED'5EED'5EED'5EEDULL);
+  int plies_played = 0;
+
+  for (const auto opening : openings) {
+    Position pos = parse(opening);
+    expect_accumulator_is_sound(pos, opening);
+
+    for (int ply = 0; ply < MAX_PLIES; ++ply) {
+      // Filter the pseudo-legal list down to moves that do not leave our own
+      // king in check—make it, look, and take it back if it was illegal. Every
+      // one of those trial unmakes is itself a check of the invariant.
+      const Colour mover = pos.colour_to_move;
+      MoveList legal;
+      for (const auto& candidate : pseudo_legal_moves(pos)) {
+        pos.make_move(candidate);
+        const bool leaves_king_in_check = is_in_check(mover, pos.board);
+        pos.unmake_move(candidate);
+        if (!leaves_king_in_check) {
+          legal.push_back(candidate);
+        }
+      }
+
+      if (legal.empty()) {
+        break; // Checkmate or stalemate: this game is over.
+      }
+
+      const auto& chosen = legal[static_cast<std::size_t>(rng.next() % legal.size())];
+
+      pos.make_move(chosen);
+      expect_accumulator_is_sound(pos, "after make");
+      ++plies_played;
+
+      pos.unmake_move(chosen);
+      expect_accumulator_is_sound(pos, "after unmake");
+
+      pos.make_move(chosen); // Play it for real and carry on.
+      expect_accumulator_is_sound(pos, "after replay");
+    }
+  }
+
+  // Guard against the loop silently doing nothing (an empty move list on the
+  // very first ply would otherwise leave this test vacuously green).
+  EXPECT_GT(plies_played, 200);
 }

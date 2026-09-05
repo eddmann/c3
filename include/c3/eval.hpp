@@ -35,12 +35,9 @@
 //
 // =============================================================================
 
-#include <array>
-#include <cstddef>
-#include <cstdint>
-
 #include "c3/board.hpp"
 #include "c3/colour.hpp"
+#include "c3/eval_terms.hpp"
 #include "c3/position.hpp"
 
 namespace c3 {
@@ -86,66 +83,12 @@ inline constexpr int CENTIPAWN_MATE = CENTIPAWN_MAX;
 inline constexpr int CENTIPAWN_MATE_THRESHOLD = CENTIPAWN_MATE - 255;
 inline constexpr int CENTIPAWN_EVAL_MAX = CENTIPAWN_MATE_THRESHOLD - 1;
 
-// =============================================================================
-// GAME PHASE
-// =============================================================================
-// "Phase" answers the question: is this still a middlegame, or an endgame?
-//
-// We answer it by counting the non-pawn material left on the board, using the
-// classic 24-point scale (knight 1, bishop 1, rook 2, queen 4, both colours
-// summed). A full opening army is 4 minors + 4 rooks + 2 queens = 24 points; a
-// bare-kings endgame is 0. Pawns are deliberately ignored: trading every piece
-// but keeping all the pawns still gives you a king-and-pawn ENDGAME.
-//
-// The count is capped at PHASE_MAX because promotions can create more material
-// than the game started with.
-// =============================================================================
-
-inline constexpr int PHASE_MAX = 24;
-inline constexpr std::array<int, 6> PHASE_WEIGHTS = {
-    0, // Pawn: pawns do not decide whether we are in an endgame
-    1, // Knight
-    1, // Bishop
-    2, // Rook
-    4, // Queen
-    0, // King: always present, so it carries no information
-};
-
-// The two sets of numbers a tapered evaluation blends between.
-enum class Phase : std::size_t { Middlegame, Endgame };
-
-// =============================================================================
-// MATERIAL VALUES
-// =============================================================================
-// Traditional piece values, in the "simplified evaluation function" flavour
-// (Tomasz Michniewski, Chess Programming Wiki):
-//   Pawn   = 100 (the unit of measurement)
-//   Knight = 320 (≈3 pawns, good in closed positions)
-//   Bishop = 330 (a shade above the knight, so the engine keeps the pair)
-//   Rook   = 500 (≈5 pawns, dominates open files)
-//   Queen  = 900 (≈9 pawns, strongest piece)
-//   King   = 0   (priceless, but doesn't contribute to material count)
-//
-// PIECE_VALUES holds the middlegame numbers. The search also uses this array
-// for MVV-LVA capture ordering ("most valuable victim, least valuable
-// attacker"), which is why it keeps its 12-entry shape.
-//
-// PIECE_VALUES_ENDGAME is our own addition—the published set has a single list
-// of values—and nudges the numbers for a bare board: a pawn is worth more once
-// it has a realistic chance of queening, and the long-range pieces gain a little
-// as the board opens up. Minor pieces stay put; they are the yardstick
-// everything else is measured against.
-// =============================================================================
-
-inline constexpr std::array<int, 12> PIECE_VALUES = {
-    100, 320, 330, 500, 900, 0, // White: P, N, B, R, Q, K
-    100, 320, 330, 500, 900, 0  // Black: P, N, B, R, Q, K
-};
-
-inline constexpr std::array<int, 12> PIECE_VALUES_ENDGAME = {
-    120, 320, 330, 520, 940, 0, // White: P, N, B, R, Q, K
-    120, 320, 330, 520, 940, 0  // Black: P, N, B, R, Q, K
-};
+// The game phase scale (PHASE_MAX, PHASE_WEIGHTS), the Phase enum and the two
+// tables of piece values (PIECE_VALUES, PIECE_VALUES_ENDGAME) live in
+// eval_terms.hpp, included above, alongside the piece-square tables built from
+// them. They moved there so that Board can keep a running total of them; see
+// that header for the numbers themselves and for why the total is maintained
+// rather than recomputed.
 
 // =============================================================================
 // BISHOP PAIR
@@ -171,6 +114,14 @@ inline constexpr int BISHOP_PAIR_ENDGAME = 50;
 // Component scores for one colour, always positive-is-good-for-that-colour.
 // Both take the phase explicitly so tests (and curious readers) can inspect
 // either end of the taper.
+//
+// eval() no longer calls either of these: it reads the running totals the Board
+// keeps instead. They remain as the from-scratch REFERENCE implementation—the
+// slow, obviously-correct version that the tests and the Debug assertions in
+// position.cpp measure the running totals against. Keeping a readable reference
+// beside an optimised implementation is what makes the optimisation safe to
+// trust; delete it and the only check left on the accumulator is that it agrees
+// with itself.
 [[nodiscard]] int eval_material(Colour colour, const Board& board, Phase phase) noexcept;
 [[nodiscard]] int eval_psqt(Colour colour, const Board& board, Phase phase) noexcept;
 

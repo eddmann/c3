@@ -30,11 +30,20 @@
 //   - Bitboards alone: Finding what's on E4 requires checking 12 bitboards
 //   - Hybrid: Both operations are O(1), for one extra copy of the position
 //
-// A Board is 248 bytes: 128 for the mailbox (std::optional<Piece> is 2 bytes
+// The Board also carries an EvalAccumulator: the running material, piece-square
+// and game-phase totals that the evaluation reads instead of walking the piece
+// lists at every node. It lives here rather than in Position because
+// put_piece/remove_piece below are the ONLY way a piece ever appears on or
+// leaves a square—FEN parsing, make_move, unmake_move and tests all funnel
+// through them—so keeping the totals current there makes it impossible for them
+// to drift out of sync. See eval_terms.hpp for what the totals contain and why.
+//
+// A Board is 272 bytes: 128 for the mailbox (std::optional<Piece> is 2 bytes
 // now that Piece is a single byte—it used to be 8, which alone made a Board
-// 624 bytes), 96 for the per-piece bitboards, 16 for the colour bitboards and 8
-// for the occupancy. Small enough that copying one is cheap and several fit in
-// L1 alongside everything else the search is touching.
+// 624 bytes), 96 for the per-piece bitboards, 16 for the colour bitboards, 8
+// for the occupancy and 20 for the accumulator, rounded up to a multiple of 8.
+// Small enough that copying one is cheap and several fit in L1 alongside
+// everything else the search is touching.
 //
 // =============================================================================
 
@@ -46,6 +55,7 @@
 
 #include "c3/bitboard.hpp"
 #include "c3/colour.hpp"
+#include "c3/eval_terms.hpp"
 #include "c3/piece.hpp"
 #include "c3/square.hpp"
 
@@ -83,6 +93,7 @@ public:
     pieces_[idx] |= square;
     colours_[colour_idx] |= square;
     occupancy_ |= square;
+    accumulator_.add(piece, square);
   }
 
   [[nodiscard]] std::optional<Piece> piece_at(Square square) const noexcept {
@@ -110,11 +121,32 @@ public:
     pieces_[idx] &= ~Bitboard(square);
     colours_[colour_idx] &= ~Bitboard(square);
     occupancy_ &= ~Bitboard(square);
+    accumulator_.remove(*maybe_piece, square);
   }
 
   [[nodiscard]] Bitboard occupancy() const noexcept { return occupancy_; }
   [[nodiscard]] bool has_occupancy_at(Bitboard squares) const noexcept {
     return (occupancy() & squares) != 0;
+  }
+
+  // The running evaluation totals, maintained by put_piece/remove_piece.
+  [[nodiscard]] const EvalAccumulator& accumulator() const noexcept { return accumulator_; }
+
+  // The same totals, rebuilt from the pieces actually on the board. This is the
+  // slow, obviously-correct version: Debug builds compare the two after every
+  // make_move and unmake_move, exactly as they compare the incremental Zobrist
+  // key against compute_key(). An accumulator that silently drifts would poison
+  // every evaluation from that node onwards, and the resulting bad move is
+  // impossible to trace back to its cause—so we catch the drift instead.
+  [[nodiscard]] EvalAccumulator compute_accumulator() const noexcept {
+    EvalAccumulator rebuilt;
+    for (std::uint8_t index = 0; index < 64; ++index) {
+      const Square square = Square::from_index(index);
+      if (const auto piece = piece_at(square)) {
+        rebuilt.add(*piece, square);
+      }
+    }
+    return rebuilt;
   }
 
 private:
@@ -126,14 +158,16 @@ private:
     return static_cast<std::size_t>(colour);
   }
 
-  // The four representations below are kept in sync by put_piece/remove_piece.
-  // This redundancy is intentional: different queries are fast with different
-  // representations, and the synchronization cost is minimal.
+  // The four representations below are kept in sync by put_piece/remove_piece,
+  // and so is the accumulator that rides along with them. This redundancy is
+  // intentional: different queries are fast with different representations, and
+  // the synchronization cost is minimal.
 
   std::array<std::optional<Piece>, 64> squares_{}; // Mailbox: square → piece
   std::array<Bitboard, 12> pieces_{};              // Bitboard per piece type
   std::array<Bitboard, 2> colours_{};              // Bitboard per colour
   Bitboard occupancy_{};                           // Union of both colour bitboards
+  EvalAccumulator accumulator_{};                  // Running material/PSQT/phase totals
 };
 
 } // namespace c3
