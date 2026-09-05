@@ -190,7 +190,9 @@ TEST(Engine, SearchFindsObviousMaterialGain) {
   Engine engine;
   // Position where knight on f3 can capture free queen on d4
   // Knight from f3 can reach d4 (L-shape: 2 left, 1 up)
-  engine.set_position_from_fen("4k3/8/8/8/3q4/5N2/8/4K3 w - - 0 1");
+  // The a2 pawn matters: without it, winning the queen would leave K+N vs K,
+  // which is an insufficient-material draw and scores 0 rather than winning.
+  engine.set_position_from_fen("4k3/8/8/8/3q4/5N2/P7/4K3 w - - 0 1");
 
   search::NullReporter reporter;
   search::Limits limits;
