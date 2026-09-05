@@ -93,4 +93,12 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME Scripts.CommonUnitTests
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${PROJECT_SOURCE_DIR}/tests/scripts -t ${PROJECT_SOURCE_DIR}/tests/scripts -v)
+
+  # The Texel tuning skeleton's pure functions (sigmoid, objective, K search,
+  # EPD parsing, coordinate descent). Named separately from the sweep above so a
+  # failure points straight at the tuner.
+  add_test(NAME Scripts.TexelTuneUnitTests
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${PROJECT_SOURCE_DIR}/tests/scripts -t ${PROJECT_SOURCE_DIR}/tests/scripts
+            -p test_texel_tune.py -v)
 endif()
