@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -222,11 +224,6 @@ TEST(UciParse, SetOptionUnknownThrows) {
 TEST(UciParse, SetOptionMissingNameThrows) {
   EXPECT_THROW(uci::parse_command("setoption"), std::runtime_error);
   EXPECT_THROW(uci::parse_command("setoption name"), std::runtime_error);
-}
-
-TEST(UciParse, GoDepthOutOfRangeThrows) {
-  // Depth must fit in uint8_t (0-255), values > 255 throw
-  EXPECT_THROW(uci::parse_command("go depth 256"), std::runtime_error);
 }
 
 TEST(UciParse, InvalidMoveThrows) {
@@ -504,6 +501,27 @@ TEST(UciLoop, StopEndsAnInfiniteSearch) {
   const auto bestmoves = lines_starting_with(output, "bestmove ");
   ASSERT_EQ(bestmoves.size(), 1U) << output;
   EXPECT_EQ(bestmoves[0].find("(none)"), std::string::npos) << output;
+
+  // The reported move must be the one we actually searched, not the fallback:
+  // at least one iteration reported, and its PV starts with that move.
+  const auto lines = split_lines(output);
+  std::string last_pv_move;
+  std::size_t info_depth_lines = 0;
+  for (const auto& line : lines) {
+    if (line.rfind("info depth ", 0) != 0) {
+      continue;
+    }
+    ++info_depth_lines;
+    const auto pv = line.find(" pv ");
+    if (pv != std::string::npos) {
+      std::istringstream moves(line.substr(pv + 4));
+      moves >> last_pv_move;
+    }
+  }
+
+  EXPECT_GE(info_depth_lines, 1U) << output;
+  ASSERT_FALSE(last_pv_move.empty()) << output;
+  EXPECT_EQ(bestmoves[0], "bestmove " + last_pv_move) << output;
 }
 
 TEST(UciLoop, EofStopsTheSearchAndStillReportsOneBestMove) {
@@ -605,4 +623,106 @@ TEST(UciTime, NeverAllocatesZeroWhileTimeRemains) {
 
   const auto scramble = uci::calculate_allocated_time(60ms, std::nullopt);
   EXPECT_EQ(scramble, std::make_optional(10ms));
+}
+
+// -----------------------------------------------------------------------------
+// Malformed input must never cost us a `bestmove`
+// -----------------------------------------------------------------------------
+
+TEST(UciParse, GoWithUnparsableValuesDoesNotThrow) {
+  // A value we cannot read is dropped like an unknown token: `go` still has to
+  // produce a search, and therefore a bestmove.
+  EXPECT_NO_THROW((void)uci::parse_command("go depth abc"));
+  EXPECT_NO_THROW((void)uci::parse_command("go wtime nine btime 1000"));
+  EXPECT_NO_THROW((void)uci::parse_command("go mate 300"));
+  EXPECT_NO_THROW((void)uci::parse_command("go movestogo 5000000000"));
+
+  // The readable half of the line still applies.
+  const auto mixed = uci::parse_command("go wtime nine btime 1000");
+  ASSERT_TRUE(mixed.go_params.has_value());
+  EXPECT_FALSE(mixed.go_params->wtime.has_value());
+  EXPECT_EQ(mixed.go_params->btime, 1000ms);
+  EXPECT_FALSE(mixed.diagnostics.empty());
+}
+
+TEST(UciParse, GoDepthOutOfRangeIsClampedNotDropped) {
+  // Clamping keeps a bounded request bounded; dropping it would silently turn
+  // `go depth 256` into a search that only `stop` can end.
+  const auto cmd = uci::parse_command("go depth 256");
+  ASSERT_TRUE(cmd.go_params.has_value());
+  EXPECT_EQ(cmd.go_params->depth, 255);
+
+  const auto zero = uci::parse_command("go depth 0");
+  ASSERT_TRUE(zero.go_params.has_value());
+  EXPECT_EQ(zero.go_params->depth, 1);
+}
+
+TEST(UciParse, GoMateAndDepthTakeTheTighterBound) {
+  const auto mate_first = uci::parse_command("go mate 2 depth 8");
+  const auto depth_first = uci::parse_command("go depth 8 mate 2");
+
+  ASSERT_TRUE(mate_first.go_params.has_value());
+  ASSERT_TRUE(depth_first.go_params.has_value());
+  EXPECT_EQ(mate_first.go_params->depth, 3);
+  EXPECT_EQ(depth_first.go_params->depth, 3);
+}
+
+TEST(UciParse, GoNodesAcceptsTheFullUnsignedRange) {
+  const auto cmd = uci::parse_command("go nodes 18446744073709551615");
+
+  ASSERT_TRUE(cmd.go_params.has_value());
+  EXPECT_EQ(cmd.go_params->nodes, std::numeric_limits<std::uint64_t>::max());
+}
+
+TEST(UciParse, GoNodesRejectsNegativeValues) {
+  // std::stoull would happily wrap "-1" into 2^64-1.
+  const auto cmd = uci::parse_command("go nodes -1");
+
+  ASSERT_TRUE(cmd.go_params.has_value());
+  EXPECT_FALSE(cmd.go_params->nodes.has_value());
+  EXPECT_FALSE(cmd.diagnostics.empty());
+}
+
+TEST(UciLoop, UnparsableGoValueStillYieldsOneBestMove) {
+  const auto output = run_uci("position startpos\ngo depth abc\nquit\n");
+
+  const auto bestmoves = lines_starting_with(output, "bestmove ");
+  ASSERT_EQ(bestmoves.size(), 1U) << output;
+  EXPECT_EQ(bestmoves[0].find("(none)"), std::string::npos) << output;
+  EXPECT_FALSE(lines_starting_with(output, "info string ").empty()) << output;
+}
+
+TEST(UciLoop, EverySearchGetsExactlyOneBestMove) {
+  const auto output = run_uci("position startpos\ngo infinite\ngo depth 1\nquit\n");
+
+  EXPECT_EQ(lines_starting_with(output, "bestmove ").size(), 2U) << output;
+}
+
+TEST(UciLoop, IsReadyIsAnsweredWhileSearching) {
+  const auto output = run_uci("position startpos\ngo infinite\nisready\nstop\nquit\n");
+
+  const auto readyok = output.find("readyok");
+  const auto bestmove = output.find("bestmove ");
+  ASSERT_NE(readyok, std::string::npos) << output;
+  ASSERT_NE(bestmove, std::string::npos) << output;
+  EXPECT_LT(readyok, bestmove) << output;
+}
+
+TEST(UciLoop, StopWithoutASearchSaysNothing) {
+  EXPECT_EQ(run_uci("stop\nquit\n"), "");
+}
+
+TEST(UciLoop, EveryLineIsAValidUciCommand) {
+  // Debug helpers must not leak bare text: a GUI parses every line we write.
+  const auto output = run_uci("position startpos\nprintfen\neval\nzobrist\nperft 2\nquit\n");
+
+  for (const auto& line : split_lines(output)) {
+    if (line.empty()) {
+      continue;
+    }
+    const bool valid = line.rfind("info ", 0) == 0 || line.rfind("bestmove ", 0) == 0 ||
+                       line.rfind("id ", 0) == 0 || line.rfind("option ", 0) == 0 ||
+                       line == "uciok" || line == "readyok";
+    EXPECT_TRUE(valid) << "not a UCI line: " << line << '\n' << output;
+  }
 }

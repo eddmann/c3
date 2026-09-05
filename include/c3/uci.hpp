@@ -23,14 +23,17 @@
 // Time allocation divides the remaining clock among the moves we still expect
 // to play. Integer division and safety reserves can drive that share to zero
 // in a time scramble, and a zero-millisecond budget means the search aborts
-// before it evaluates anything. A small floor (never more than what is
-// actually left on the clock) guarantees at least a depth-1 answer.
+// before it evaluates anything. Two reserves stack here—the 50ms this layer
+// holds back and the 5ms the stopper subtracts—so a small floor (never more
+// than what is actually left on the clock) is what makes a depth-1 answer
+// LIKELY. It does not make it certain: only the fallback move above
+// guarantees that the GUI gets a reply at all.
 //
 // Anything else we want to say—diagnostics, warnings about input we did not
 // understand—travels as `info string ...`, the protocol's free-text line. The
-// UCI spec also requires unknown commands and unknown tokens to be ignored
-// rather than rejected, so a newer GUI never deadlocks against an older
-// engine.
+// UCI spec requires unknown commands and unknown tokens to be tolerated rather
+// than rejected, so this layer reports them as `info string` and otherwise
+// ignores them; a newer GUI never deadlocks against an older engine.
 // =============================================================================
 
 #include <chrono>
@@ -106,8 +109,11 @@ struct GoParams {
   // have sent on the same line.
   bool infinite{false};
 
-  // "This search is a guess at the opponent's reply." We do not ponder, so
-  // the flag is recorded and the search runs normally.
+  // "This search is a guess at the opponent's reply." Recorded, then treated
+  // as an ordinary search. That is only safe because we never advertise
+  // `option name Ponder` in the `uci` reply: a GUI that has not been told the
+  // engine ponders will not send `go ponder` (and so will never expect the
+  // `ponderhit` handshake this engine cannot honour).
   bool ponder{false};
 };
 
@@ -128,6 +134,11 @@ struct UciCommand {
   std::optional<PositionCommand> position{};
   std::optional<GoParams> go_params{};
   std::optional<SetOptionCommand> option{};
+
+  // Parts of the command we understood well enough to skip but not to obey
+  // (an unreadable value, say). The loop echoes these as `info string` lines;
+  // they are never a reason to reject the command itself.
+  std::vector<std::string> diagnostics{};
 };
 
 UciCommand parse_command(const std::string& command);
