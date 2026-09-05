@@ -47,9 +47,13 @@
 // from the previous one would make the total depend on the order and on
 // whatever the engine happened to be doing beforehand.
 //
-// It runs on the main thread, so nothing else is answered until it finishes,
-// and it leaves the transposition table empty. Neither matters: bench is a
-// tool for whoever is developing the engine, not something a GUI sends.
+// It runs on the main thread, so nothing else is answered until it finishes—
+// which is also why the depth it accepts is capped (see BENCH_MAX_DEPTH):
+// there is no way to interrupt it once it starts. It clears the transposition
+// table before each position AND once more at the end, so a bench leaves the
+// session exactly as it found it. Neither restriction matters in practice:
+// bench is a tool for whoever is developing the engine, not something a GUI
+// sends.
 //
 // Output is `info string` lines, including the final
 //
@@ -158,6 +162,14 @@ struct SetOptionCommand {
   std::string name;
   std::optional<std::string> value;
 };
+
+// Deepest bench this command will accept. bench runs on the reader's own
+// thread, so nothing can interrupt it once started—a depth that takes an hour
+// wedges the session with no way out. Twelve is around two minutes for the
+// whole list in a Release build (depth 8, the default, is under three
+// seconds), which is a long wait but a bounded one. A deeper search of a
+// single position is what `go depth` is for.
+inline constexpr std::uint8_t BENCH_MAX_DEPTH = 12;
 
 struct UciCommand {
   CommandType type{CommandType::Init};

@@ -10,9 +10,11 @@
 #include <sstream>
 #include <streambuf>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
+#include "c3/search.hpp"
 #include "c3/uci.hpp"
 
 using namespace c3;
@@ -133,6 +135,19 @@ TEST(UciTime, BudgetNeverPromisesMoreThanTheClockHolds) {
   // clock can afford, so there is no headroom to give and the two coincide.
   const auto desperate = uci::calculate_time_budget(20ms, std::nullopt);
   EXPECT_EQ(desperate.hard, desperate.soft);
+}
+
+TEST(UciTime, BudgetSurvivesAnAbsurdClock) {
+  // UCI puts no bound on `wtime`, so a buggy GUI can send a clock whose triple
+  // does not fit in a signed 64-bit millisecond count. Multiplying it anyway is
+  // undefined behaviour, and the wrapped value comes out negative—which would
+  // read as "no time at all".
+  const auto absurd = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+  const auto budget = uci::calculate_time_budget(absurd, std::make_optional(absurd));
+
+  EXPECT_GT(budget.soft.count(), 0);
+  EXPECT_GE(budget.hard, budget.soft);
+  EXPECT_LE(budget.hard, search::MAX_TIME_LIMIT);
 }
 
 TEST(UciTime, BudgetHardLimitIsNeverBelowTheSoftOne) {
@@ -571,6 +586,17 @@ TEST(UciLoop, EofStopsTheSearchAndStillReportsOneBestMove) {
   EXPECT_EQ(bestmoves[0].find("(none)"), std::string::npos) << output;
 }
 
+TEST(UciLoop, AnAbsurdClockStillProducesALegalBestMove) {
+  // UCI does not bound the clock a GUI may send. Whatever arrives, the search
+  // has to end in a legal move rather than in wrapped arithmetic.
+  const auto output = run_uci("position startpos\ngo wtime 9000000000000000000 "
+                              "winc 9000000000000000000 depth 3\nquit\n");
+
+  const auto bestmoves = lines_starting_with(output, "bestmove ");
+  ASSERT_EQ(bestmoves.size(), 1U) << output;
+  EXPECT_EQ(bestmoves[0].find("(none)"), std::string::npos) << output;
+}
+
 TEST(UciLoop, ZeroClockStillProducesALegalBestMove) {
   const auto output = run_uci("position startpos\ngo wtime 0 btime 0\nquit\n");
 
@@ -788,12 +814,24 @@ public:
     return text_;
   }
 
+  // Anchored to the start of a line: `bestmove` also appears mid-line in
+  // bench's `info string ... bestmove e2e4` reports, and counting those would
+  // release the next command before the search that owes us a reply has sent
+  // one.
   [[nodiscard]] std::size_t bestmove_count() const {
     const std::scoped_lock lock(mutex_);
+    static constexpr std::string_view REPLY = "bestmove ";
+
     std::size_t count = 0;
-    for (std::size_t at = text_.find("bestmove "); at != std::string::npos;
-         at = text_.find("bestmove ", at + 1)) {
-      count += 1;
+    for (std::size_t at = 0; at < text_.size();) {
+      const auto line_end = text_.find('\n', at);
+      if (text_.compare(at, REPLY.size(), REPLY) == 0) {
+        count += 1;
+      }
+      if (line_end == std::string::npos) {
+        break;
+      }
+      at = line_end + 1;
     }
     return count;
   }
@@ -980,6 +1018,73 @@ TEST(UciBench, DeeperRunsSearchMore) {
   ASSERT_TRUE(shallow.has_value());
   ASSERT_TRUE(deeper.has_value());
   EXPECT_GT(*deeper, *shallow);
+}
+
+TEST(UciBench, LeavesNoStateBehindInTheTable) {
+  // bench clears the table before each position; it must also clear after the
+  // last one, or the session it was run in carries the final position's
+  // results into whatever the user does next. A 1 MB table makes the leftovers
+  // visible in `hashfull`.
+  const auto output =
+      run_uci("setoption name Hash value 1\nbench 4\nposition startpos\ngo depth 1\nquit\n");
+
+  const auto info = lines_starting_with(output, "info depth ");
+  ASSERT_FALSE(info.empty()) << output;
+
+  const auto at = info.back().find(" hashfull ");
+  ASSERT_NE(at, std::string::npos) << output;
+  std::istringstream value(info.back().substr(at + std::string(" hashfull ").size()));
+  std::uint32_t hashfull = 0;
+  ASSERT_TRUE(static_cast<bool>(value >> hashfull)) << output;
+
+  EXPECT_EQ(hashfull, 0U) << "bench left its last position in the table\n" << output;
+}
+
+TEST(UciBench, RejectsADepthItCannotHonour) {
+  // `bench 0` searched nothing and printed zeros; `bench 200` ran on the
+  // reader's own thread with no way to interrupt it. Both are clamped into a
+  // range bench can actually deliver, and the user is told when that happens—
+  // the same treatment `go depth` gives an out-of-range depth.
+  const auto zero = uci::parse_command("bench 0");
+  ASSERT_EQ(zero.type, uci::CommandType::Bench);
+  EXPECT_EQ(zero.bench_depth, 1);
+  EXPECT_FALSE(zero.diagnostics.empty()) << "clamping must be reported";
+
+  const auto huge = uci::parse_command("bench 200");
+  EXPECT_EQ(huge.bench_depth, uci::BENCH_MAX_DEPTH);
+  EXPECT_FALSE(huge.diagnostics.empty()) << "clamping must be reported";
+
+  const auto fine = uci::parse_command("bench 4");
+  EXPECT_EQ(fine.bench_depth, 4);
+  EXPECT_TRUE(fine.diagnostics.empty());
+
+  const auto bare = uci::parse_command("bench");
+  EXPECT_FALSE(bare.bench_depth.has_value());
+  EXPECT_TRUE(bare.diagnostics.empty());
+}
+
+TEST(UciBench, ReportsTokensItDoesNotUnderstand) {
+  // `go` reports what it skipped rather than silently obeying half a command;
+  // bench does the same for an unreadable depth and for trailing junk.
+  const auto junk = uci::parse_command("bench 5 junk");
+  ASSERT_EQ(junk.type, uci::CommandType::Bench);
+  EXPECT_EQ(junk.bench_depth, 5);
+  EXPECT_FALSE(junk.diagnostics.empty()) << "trailing tokens must be reported";
+
+  const auto unreadable = uci::parse_command("bench banana");
+  EXPECT_FALSE(unreadable.bench_depth.has_value()) << "an unreadable depth falls back to default";
+  EXPECT_FALSE(unreadable.diagnostics.empty());
+}
+
+TEST(UciBench, ADepthItCannotHonourIsStillAnsweredAsUci) {
+  // The clamp has to reach the loop, not just the parser: `bench 0` must still
+  // produce a real total rather than twelve zeros.
+  const auto output = run_uci("bench 0\nquit\n");
+
+  const auto total = bench_total(output);
+  ASSERT_TRUE(total.has_value()) << output;
+  EXPECT_GT(*total, 0U) << output;
+  EXPECT_FALSE(lines_starting_with(output, "info string ").empty()) << output;
 }
 
 TEST(UciBench, EveryLineIsAValidUciLine) {

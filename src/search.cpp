@@ -53,12 +53,6 @@ constexpr std::uint8_t ASPIRATION_WINDOW_MAX_RETRIES = 3; // Then fall back to f
 // Checking involves atomic loads and time queries—amortizing the cost matters.
 constexpr std::uint64_t STOPPER_NODES_MASK = 0xFF;
 
-// Safety margin for time management to prevent overshooting the time limit.
-// The engine checks time only every STOPPER_NODES_MASK nodes, and there's
-// additional overhead for UCI output after search completes. This margin
-// ensures we stop early enough to report the move within the allotted time.
-constexpr auto TIME_SAFETY_MARGIN = std::chrono::milliseconds(5);
-
 // Sanitise the PV by checking if it leads to a draw. If the PV results in a
 // fifty-move draw or repetition, truncate it and return CENTIPAWN_DRAW. This
 // prevents the engine from reporting a winning eval when the best line
@@ -172,12 +166,26 @@ std::optional<std::uint8_t> Report::moves_until_mate() const {
 // Limits
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Every limit passes through here on its way into the search, so a budget too
+// large to be a steady_clock::duration cannot reach the arithmetic that would
+// wrap it. See MAX_TIME_LIMIT for why the ceiling exists at all.
+std::optional<std::chrono::milliseconds> capped(std::optional<std::chrono::milliseconds> limit) {
+  if (!limit.has_value()) {
+    return std::nullopt;
+  }
+  return std::min(*limit, MAX_TIME_LIMIT);
+}
+
+} // namespace
+
 std::optional<std::chrono::milliseconds> Limits::hard_limit() const {
-  return hard_time.has_value() ? hard_time : time;
+  return capped(hard_time.has_value() ? hard_time : time);
 }
 
 std::optional<std::chrono::milliseconds> Limits::soft_limit() const {
-  const auto soft = soft_time.has_value() ? soft_time : time;
+  const auto soft = capped(soft_time.has_value() ? soft_time : time);
   const auto hard = hard_limit();
 
   if (!soft.has_value()) {
@@ -189,14 +197,33 @@ std::optional<std::chrono::milliseconds> Limits::soft_limit() const {
   return hard.has_value() ? std::make_optional(std::min(*soft, *hard)) : soft;
 }
 
-bool detail::can_finish_next_iteration(std::chrono::steady_clock::duration elapsed,
+bool detail::should_continue_deepening(std::chrono::steady_clock::duration elapsed,
                                        std::chrono::steady_clock::duration last_iteration,
+                                       std::optional<std::chrono::milliseconds> soft_time,
                                        std::optional<std::chrono::milliseconds> hard_time) {
+  // The budget for this move is spent, and an iteration has just finished, so
+  // there is a complete answer to hand over. Nothing is lost by stopping.
+  if (soft_time.has_value() && elapsed > *soft_time) {
+    return false;
+  }
+
   if (!hard_time.has_value()) {
     return true;
   }
 
-  return elapsed + (last_iteration * ITERATION_GROWTH_FACTOR) <= *hard_time;
+  // No headroom (soft == hard, as `go movetime` produces) means an iteration
+  // that overruns is killed outright rather than absorbed, so the prediction
+  // has to clear a higher bar. See NO_HEADROOM_GROWTH_FACTOR.
+  // A soft limit ABOVE the hard one counts as no headroom too—Limits clamps
+  // that away before the search sees it, and the cautious reading is right
+  // either way, since the hard limit is the real constraint.
+  const bool has_headroom = !soft_time.has_value() || *soft_time < *hard_time;
+  const int factor = has_headroom ? ITERATION_GROWTH_FACTOR : NO_HEADROOM_GROWTH_FACTOR;
+
+  // Measured against where the stopper really fires, not the raw limit.
+  const auto deadline = *hard_time - TIME_SAFETY_MARGIN;
+
+  return elapsed + (last_iteration * factor) <= deadline;
 }
 
 // ---------------------------------------------------------------------------
@@ -347,9 +374,14 @@ void TranspositionTable::allocate(std::size_t size_mb) {
     pow2 <<= 1;
   }
 
+  // Storage first, then the fields that describe it. assign() can throw
+  // (bad_alloc on a large table), and publishing capacity_ before the memory
+  // exists would leave the table claiming millions of entries it does not
+  // have—every probe would then index into whatever the old, smaller vector
+  // still held, or past its end.
+  entries_.assign(pow2, TTEntry{});
   capacity_ = pow2;
   usage_ = 0;
-  entries_.assign(capacity_, TTEntry{});
 }
 
 void TranspositionTable::clear() {
@@ -581,7 +613,10 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
     return 0;
   }
 
-  report.nodes += 1;
+  // THIS position has already been counted—by the alphabeta leaf that handed
+  // it over, or by the recursive call below. Quiescence counts each child it
+  // decides to visit instead, which keeps every position worth exactly one
+  // node whichever of the two searches resolves it.
 
   // Stand-pat: static evaluation as the fallback
   const int stand_pat = eval(pos);
@@ -608,6 +643,10 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
       pos.unmake_move(mv);
       continue;
     }
+
+    // The child is a position we are about to enter and decide, so it is
+    // counted here—the callee will not count itself.
+    report.nodes += 1;
 
     // Negamax: negate score and swap alpha/beta
     const int score = -quiescence(pos, -beta, -alpha, report, stopper);
@@ -650,21 +689,22 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   }
 
   // NODE ACCOUNTING
-  // A "node" is a position the search entered and decided, so it is counted
-  // here—above the draw tests and the transposition probe—rather than after
-  // them. Counting further down made the two cheapest outcomes free: a drawn
-  // terminal and a transposition cutoff each returned an answer without ever
-  // reaching the increment. That understated nps by exactly what the table
-  // was saving us, and it let `go nodes N` run well past N, because the nodes
-  // the limit is meant to count were the ones it could not see.
+  // A "node" is a position the search entered and decided, and this is where
+  // one is counted: at true entry, above the draw tests and the transposition
+  // probe and every other way out below. Counting further down made the two
+  // cheapest outcomes free—a drawn terminal and a transposition cutoff each
+  // returned an answer without reaching the increment—which understated nps by
+  // exactly what the table was saving, and let `go nodes N` run well past N,
+  // because the nodes the limit is meant to count were the ones it could not
+  // see.
   //
-  // The one node NOT counted here is a leaf that drops into quiescence:
-  // quiescence counts that position itself, and counting it twice would make
-  // every leaf worth two.
+  // This one increment covers the quiescence hand-off below too: a leaf is
+  // counted here and quiescence does not count itself, so every position costs
+  // exactly one node no matter which of the two searches resolves it.
+  report.nodes += 1;
 
   // Draw detection: 50-move rule or threefold repetition
   if (pos.is_fifty_move_draw() || pos.is_repetition_draw(report.ply)) {
-    report.nodes += 1;
     return CENTIPAWN_DRAW;
   }
 
@@ -676,8 +716,6 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // CHECK EXTENSION: Don't stop search while in check (tactical danger)
     depth = 1;
   }
-
-  report.nodes += 1;
 
   // PV NODES vs NON-PV NODES
   // A node searched with a full window (beta > alpha + 1) is a "PV node": it
@@ -1031,19 +1069,11 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
     reporter.send(report);
 
     last_iteration = std::chrono::steady_clock::now() - iteration_started;
-    const auto elapsed = report.elapsed();
 
-    // SOFT LIMIT: we have spent the budget for this move and we have a
-    // complete answer in hand. Stopping here costs nothing.
-    if (soft_time.has_value() && elapsed > *soft_time) {
-      break;
-    }
-
-    // AND DON'T START WHAT WE CANNOT FINISH. An iteration only pays for itself
-    // if it completes; one that the hard limit kills half-way is time spent
-    // for no answer at all. So if the next iteration is unlikely to fit, stop
-    // now while the previous one is still the best thing we have.
-    if (!detail::can_finish_next_iteration(elapsed, last_iteration, hard_time)) {
+    // Both time rules—"the budget is spent" and "the next ply will not fit"—
+    // are decided together in should_continue_deepening.
+    if (!detail::should_continue_deepening(report.elapsed(), last_iteration, soft_time,
+                                           hard_time)) {
       break;
     }
   }

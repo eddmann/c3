@@ -365,6 +365,37 @@ GoParams parse_go(const std::vector<std::string>& args, std::vector<std::string>
   return params;
 }
 
+// `bench [depth]`. Like `go`, this never throws: a depth we cannot read or
+// cannot honour is reported through `diagnostics` and replaced with something
+// workable, because refusing the whole command would just leave the user
+// staring at nothing.
+std::optional<std::uint8_t> parse_bench(const std::vector<std::string>& args,
+                                        std::vector<std::string>& diagnostics) {
+  if (args.empty()) {
+    return std::nullopt; // The default depth, chosen by the loop.
+  }
+
+  std::optional<std::uint8_t> depth;
+  try {
+    const auto requested = parse_u32_attr("depth", args[0]);
+    const auto clamped = std::clamp<std::uint32_t>(requested, 1, BENCH_MAX_DEPTH);
+
+    if (clamped != requested) {
+      diagnostics.push_back("bench depth " + args[0] + " is out of range, using " +
+                            std::to_string(clamped));
+    }
+    depth = static_cast<std::uint8_t>(clamped);
+  } catch (const std::exception& ex) {
+    diagnostics.push_back(std::string(ex.what()) + " (running bench at its default depth)");
+  }
+
+  if (args.size() > 1) {
+    diagnostics.emplace_back("bench takes only a depth, ignoring trailing tokens");
+  }
+
+  return depth;
+}
+
 SetOptionCommand parse_setoption(
     const std::vector<std::string>& args) { // NOLINT(readability-function-cognitive-complexity)
   if (args.empty() || args[0] != "name") {
@@ -480,13 +511,10 @@ UciCommand parse_command(const std::string& command) {
     }
     result.move = mv;
   } else if (head == "bench") {
-    result.type = CommandType::Bench;
     // The depth is optional: `bench` on its own is the number people compare
-    // between builds, and `bench <depth>` is for when a quick or a deep run is
-    // wanted instead.
-    if (!args.empty()) {
-      result.bench_depth = parse_u8_attr("depth", args[0]);
-    }
+    // between builds, and `bench <depth>` is for a quicker or deeper run.
+    result.type = CommandType::Bench;
+    result.bench_depth = parse_bench(args, result.diagnostics);
   } else if (head == "position") {
     result.type = CommandType::Position;
     result.position = parse_position(args);
@@ -526,9 +554,12 @@ namespace {
 constexpr std::int64_t ASSUMED_MOVES_REMAINING = 30;
 
 // Fraction of the clock held back for protocol and GUI latency, plus a floor
-// so that even a tiny clock keeps a few milliseconds of slack. Note that the
-// search subtracts a further safety margin of its own (TIME_SAFETY_MARGIN,
-// 5ms) from whatever budget we hand it: the two reserves stack.
+// so that even a tiny clock keeps a few milliseconds of slack. A further
+// reserve stacks on top of this one, but only on the HARD limit: the search
+// subtracts search::TIME_SAFETY_MARGIN (5ms) from it before polling, because
+// that is the limit it can be caught mid-iteration by. The soft limit is
+// checked between iterations, where being a few milliseconds late costs
+// nothing, so it is used as-is.
 constexpr std::int64_t TIME_RESERVE_DIVISOR = 20;
 constexpr auto MINIMUM_TIME_RESERVE = std::chrono::milliseconds{50};
 
@@ -547,6 +578,12 @@ constexpr auto MINIMUM_ALLOCATED_TIME = std::chrono::milliseconds{10};
 
 // How far past the move's budget a single iteration may run before it is
 // abandoned. See calculate_time_budget for why the slack is worth having.
+//
+// This is the m in hard = m x soft. The search pairs it with
+// search::ITERATION_GROWTH_FACTOR (the k in "start another iteration only
+// while elapsed + k x last <= hard"), so the two together say what a move may
+// really spend: up to m times its soft budget, and only while the next ply is
+// predicted to cost less than what remains of that.
 constexpr std::int64_t HARD_TIME_MULTIPLIER = 3;
 
 } // namespace
@@ -608,15 +645,28 @@ calculate_allocated_time(std::chrono::milliseconds time_left,
 TimeBudget calculate_time_budget(std::chrono::milliseconds time_left,
                                  std::optional<std::chrono::milliseconds> increment,
                                  std::optional<std::uint32_t> moves_to_go) noexcept {
-  const auto soft = calculate_allocated_time(time_left, increment, moves_to_go)
-                        .value_or(std::chrono::milliseconds{0});
+  // Capped here as well as in Limits: UCI puts no bound on `wtime`, and a
+  // clock of a few quintillion milliseconds makes every number downstream of
+  // it meaningless. See search::MAX_TIME_LIMIT.
+  const auto soft = std::min(calculate_allocated_time(time_left, increment, moves_to_go)
+                                 .value_or(std::chrono::milliseconds{0}),
+                             search::MAX_TIME_LIMIT);
 
   const auto reserve = std::max(time_left / TIME_RESERVE_DIVISOR, MINIMUM_TIME_RESERVE);
   const auto affordable = time_left > reserve ? time_left - reserve : std::chrono::milliseconds{0};
 
-  const auto hard = std::max(soft, std::min(soft * HARD_TIME_MULTIPLIER, affordable));
+  // The multiplication is GUARDED rather than performed and then clamped. On
+  // an absurd clock `soft * 3` overflows a signed 64-bit millisecond count,
+  // which is undefined behaviour, and the value it produces in practice is
+  // negative—so the engine would read its budget as "no time at all" and come
+  // back with no move. When the product could not fit under `affordable`
+  // anyway, `affordable` is already the answer and there is nothing to compute.
+  const auto headroom = soft < affordable / HARD_TIME_MULTIPLIER
+                            ? std::min(soft * HARD_TIME_MULTIPLIER, affordable)
+                            : affordable;
 
-  return TimeBudget{.soft = soft, .hard = hard};
+  return TimeBudget{.soft = soft,
+                    .hard = std::min(std::max(soft, headroom), search::MAX_TIME_LIMIT)};
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,8 +1066,11 @@ constexpr std::uint8_t BENCH_DEFAULT_DEPTH = 8;
 // The Engine's table is CLEARED before each position, which is the point: a
 // table still holding the previous position's results would make each search
 // cheaper by an amount that depends on the order of the list, and the total
-// would stop being reproducible. The engine's own game position is untouched—
-// bench searches copies—but the table is left empty afterwards.
+// would stop being reproducible. It is cleared once more at the end for the
+// same reason in reverse—bench is a measurement, and a measurement should not
+// leave its subject changed. Without that last clear the twelfth position's
+// results would sit in the table skewing whatever the session did next. The
+// engine's own game position is untouched throughout: bench searches copies.
 void run_bench(Engine& engine, std::uint8_t depth,
                const std::function<void(const std::string&)>& write_line) {
   search::NullReporter reporter;
@@ -1044,6 +1097,9 @@ void run_bench(Engine& engine, std::uint8_t depth,
     }
     write_line(line);
   }
+
+  // Leave the table as bench found it, not full of the last position.
+  engine.transposition_table().clear();
 
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started);

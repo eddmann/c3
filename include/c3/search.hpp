@@ -135,6 +135,21 @@ public:
 // asks for less has its soft limit pulled down to the hard one.
 // ---------------------------------------------------------------------------
 
+// Safety margin subtracted from the hard limit before the stopper polls it.
+// The clock is only consulted every few hundred nodes, and a `bestmove` still
+// has to be written afterwards, so the search aims to stop this much early.
+inline constexpr auto TIME_SAFETY_MARGIN = std::chrono::milliseconds{5};
+
+// Ceiling on any time limit, and the reason there is one: the search compares
+// budgets against steady_clock::duration, which counts NANOSECONDS in a signed
+// 64-bit integer and therefore overflows somewhere past 106 days. A GUI is
+// free to send `go wtime 9000000000000000000`—the UCI spec puts no bound on
+// the number, and a buggy or hostile one will—and a limit derived from that
+// wraps to a negative duration, which would make the engine stop instantly
+// rather than think for ever. A day is longer than any real move deserves and
+// leaves four orders of magnitude of headroom before the arithmetic can wrap.
+inline constexpr auto MAX_TIME_LIMIT = std::chrono::milliseconds{24 * 60 * 60 * 1000};
+
 struct Limits {
   std::optional<std::uint8_t> depth{};
   std::optional<std::uint64_t> nodes{};
@@ -423,29 +438,77 @@ SearchResult search(Position& pos, std::uint8_t depth);
 // finished. Each extra ply multiplies the tree by the effective branching
 // factor, so a fixed multiple of the last iteration is the natural estimate.
 //
-// Three, from measurement rather than theory. Timing consecutive iterations
-// in a Release build gives ratios that scatter widely—0.75x to 8.4x on
-// Kiwipete—because an aspiration window that fails has to re-search the root
-// and can cost several times a clean iteration. Three is near the middle of
-// that spread.
+// Four, from measurement rather than theory. Timing consecutive iterations in
+// a Release build gives ratios that scatter widely—0.75x to 8.4x measured
+// across startpos and Kiwipete—because an aspiration window that fails has to
+// re-search the root and can cost several times a clean iteration.
 //
-// The estimate is only ever that, and it is wrong in both directions: it will
-// sometimes refuse an iteration that would have fitted, and sometimes start
-// one the hard limit then kills. Erring high is the cheaper mistake. An
-// abandoned iteration produces nothing at all—the latching Stopper refuses
-// its transposition-table stores precisely because its scores are untrue—so
-// it costs a ply AND the time, while refusing one only costs the ply, and the
-// time goes back to the clock for the next move.
-inline constexpr int ITERATION_GROWTH_FACTOR = 3;
+// The estimate is wrong in both directions, and erring high is the cheaper
+// mistake. An abandoned iteration produces nothing at all—the latching Stopper
+// refuses its transposition-table stores precisely because its scores are
+// untrue—so it costs a ply AND the time, while refusing one costs only the
+// ply, and the time goes back to the clock for the next move.
+//
+// Together with uci::HARD_TIME_MULTIPLIER (the m in hard = m x soft), this is
+// the k in the rule the search actually applies:
+//
+//     start another iteration only while  elapsed + k x last <= hard
+//
+// so with m = 3 and k = 4 a search may commit to roughly three times its soft
+// budget, and stops looking for more once the next ply is predicted to cost
+// more than a quarter of what remains.
+inline constexpr int ITERATION_GROWTH_FACTOR = 4;
+
+// The same prediction, half as much again, used when soft and hard are the
+// same number—which is what `go movetime` produces.
+//
+// WHY IT DIFFERS. With headroom, a prediction that comes in low is absorbed:
+// the iteration overruns the soft limit and finishes anyway inside the hard
+// one. Without headroom there is nothing to absorb it, so the iteration is
+// killed and its entire cost is lost. The bar to clear is therefore higher.
+//
+// WHY SIX. Measured on startpos in a Release build, where the depth 9 -> 10
+// step is the anomaly the rule exists to catch (923ms against depth 9's
+// 136ms, a ratio of 6.8):
+//
+//   go movetime 1000   after depth 9 at 232ms, 6 x 138 predicts past 995ms
+//                      -> refused, and rightly: depth 10 would not have fitted
+//   go movetime 400    after depth 8 at ~90ms, 6 x ~50 predicts ~390ms
+//                      -> allowed, and rightly: depth 9 finished at 231ms
+//
+// Eight refuses that second one too and throws a whole ply away for nothing;
+// four admits the first and loses ~760ms to an iteration that is then killed.
+//
+// BUT THE TWO CASES ARE BARELY SEPARABLE, and it is worth being honest about
+// that. At each decision point the search has used almost exactly the same
+// FRACTION of its budget—232/995 and ~90/395, both about 0.23—so no rule
+// phrased in terms of elapsed-against-budget can cleanly tell them apart. What
+// actually differs is the true cost of the next iteration, which is not
+// knowable until it has been paid. Six lands on the right side of both, but
+// the second one is close enough that ordinary timing noise occasionally
+// pushes it over and costs a ply. Tuning nearer than this would be fitting to
+// noise; a real fix needs a better predictor than "the last iteration, times a
+// constant".
+inline constexpr int NO_HEADROOM_GROWTH_FACTOR = 6;
 
 // Exposed for tests
 namespace detail {
 
-// Would the next iteration finish before the hard limit? Answered from how
-// long the LAST one took, which is the only evidence available: an iteration's
-// cost is not knowable until it has been paid.
-[[nodiscard]] bool can_finish_next_iteration(std::chrono::steady_clock::duration elapsed,
+// Should iterative deepening start another iteration? Both time rules live
+// here so they are decided in one place and can be reasoned about—and tested—
+// without running a search:
+//
+//   1. The soft limit is spent. We have a complete answer; stop.
+//   2. The next iteration is predicted not to fit inside the hard limit.
+//      Its cost is estimated from the last one, which is the only evidence
+//      there is: an iteration's cost is not knowable until it has been paid.
+//
+// The prediction is measured against the hard limit MINUS TIME_SAFETY_MARGIN,
+// because that is where the stopper actually fires—comparing against the raw
+// limit would predict a finish the search is not allowed to reach.
+[[nodiscard]] bool should_continue_deepening(std::chrono::steady_clock::duration elapsed,
                                              std::chrono::steady_clock::duration last_iteration,
+                                             std::optional<std::chrono::milliseconds> soft_time,
                                              std::optional<std::chrono::milliseconds> hard_time);
 
 void order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,

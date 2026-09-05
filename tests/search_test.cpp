@@ -722,6 +722,47 @@ TEST(SearchTime, PlainTimeStillMeansBothLimits) {
   EXPECT_FALSE(none.hard_limit().has_value());
 }
 
+TEST(SearchTime, AbsurdClocksAreCappedBeforeTheyOverflow) {
+  // Budgets are compared against steady_clock::duration, which counts
+  // nanoseconds in a signed 64-bit integer. A limit of a few quintillion
+  // milliseconds—which a GUI is free to send—cannot be converted to one, and
+  // the wrap makes the engine stop instantly instead of thinking for ever.
+  search::Limits limits;
+  limits.time = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+
+  ASSERT_TRUE(limits.soft_limit().has_value());
+  ASSERT_TRUE(limits.hard_limit().has_value());
+  EXPECT_EQ(*limits.soft_limit(), search::MAX_TIME_LIMIT);
+  EXPECT_EQ(*limits.hard_limit(), search::MAX_TIME_LIMIT);
+
+  // The capped value survives the conversion the search actually performs.
+  const auto as_duration = std::chrono::steady_clock::duration{*limits.hard_limit()};
+  EXPECT_GT(as_duration.count(), 0);
+
+  search::Limits split;
+  split.soft_time = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+  split.hard_time = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+  EXPECT_EQ(*split.soft_limit(), search::MAX_TIME_LIMIT);
+  EXPECT_EQ(*split.hard_limit(), search::MAX_TIME_LIMIT);
+}
+
+TEST(SearchTime, SearchRunsCleanlyUnderAnAbsurdClock) {
+  // The arithmetic above is exercised for real here: under the sanitisers this
+  // is what catches a limit that wrapped on its way into the search.
+  Position pos = Position::startpos();
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 4;
+  limits.time = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+
+  const auto result = search::search(pos, limits, reporter);
+
+  // A clock that large is no limit at all, so the depth bound is what stops it.
+  EXPECT_EQ(result.depth, 4);
+  EXPECT_FALSE(result.pv.empty());
+}
+
 TEST(SearchTime, SoftLimitNeverExceedsTheHardOne) {
   // A soft limit past the hard one would promise time the search is not
   // allowed to take, so the ceiling wins.
@@ -736,29 +777,84 @@ TEST(SearchTime, SoftLimitNeverExceedsTheHardOne) {
 TEST(SearchTime, RefusesAnIterationThatCannotFinish) {
   using namespace std::chrono_literals;
 
-  // 100ms gone and the last iteration cost 60ms, so the next one is predicted
-  // at 3 x 60 = 180ms: 280ms in total. That fits under 300ms but not 200ms.
-  EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 60ms, 300ms));
-  EXPECT_FALSE(search::detail::can_finish_next_iteration(100ms, 60ms, 200ms));
+  // With headroom (soft < hard) the factor is 4. 40ms gone and a 60ms last
+  // iteration predicts 240ms more: 280ms in total, measured against the hard
+  // limit less the 5ms safety margin. The soft limit is set clear of the
+  // elapsed time so that only the affordability rule can answer here.
+  const auto soft = std::make_optional(100ms);
+  EXPECT_TRUE(search::detail::should_continue_deepening(40ms, 60ms, soft, 400ms));
+  EXPECT_FALSE(search::detail::should_continue_deepening(40ms, 60ms, soft, 250ms));
 
-  // Landing exactly on the limit still counts as affordable.
-  EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 100ms, 400ms));
+  // Landing exactly on the deadline still counts as affordable:
+  // 40 + 4 x 40 = 200, against 205 - 5.
+  EXPECT_TRUE(search::detail::should_continue_deepening(40ms, 40ms, soft, 205ms));
 
-  // No hard limit means there is nothing to be unable to afford.
-  EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 10000ms, std::nullopt));
+  // Without a hard limit there is nothing to be unable to afford.
+  EXPECT_TRUE(search::detail::should_continue_deepening(40ms, 10000ms, soft, std::nullopt));
 
   // The first iteration has no predecessor to measure, so it is never refused.
-  EXPECT_TRUE(search::detail::can_finish_next_iteration(std::chrono::steady_clock::duration::zero(),
+  EXPECT_TRUE(search::detail::should_continue_deepening(std::chrono::steady_clock::duration::zero(),
                                                         std::chrono::steady_clock::duration::zero(),
-                                                        1ms));
+                                                        std::nullopt, 6ms));
 }
 
+TEST(SearchTime, StopsOnceTheSoftBudgetIsSpent) {
+  using namespace std::chrono_literals;
+  const auto generous_hard = std::make_optional(10000ms);
+
+  // Under the soft limit: keep going. Past it: stop, however much the hard
+  // limit would still allow.
+  EXPECT_TRUE(search::detail::should_continue_deepening(50ms, 1ms, std::make_optional(100ms),
+                                                        generous_hard));
+  EXPECT_FALSE(search::detail::should_continue_deepening(150ms, 1ms, std::make_optional(100ms),
+                                                         generous_hard));
+
+  // Neither limit set is an unbounded search: it never stops on time.
+  EXPECT_TRUE(search::detail::should_continue_deepening(
+      std::chrono::hours{1}, std::chrono::hours{1}, std::nullopt, std::nullopt));
+}
+
+TEST(SearchTime, IsMoreCautiousWhenThereIsNoHeadroom) {
+  using namespace std::chrono_literals;
+
+  // `go movetime` makes soft and hard the same number. An iteration that
+  // overruns is then killed outright instead of being absorbed by the
+  // headroom, so the same prediction has to clear a higher bar: 4x with
+  // headroom, 6x without.
+  //
+  // 100ms gone, last iteration 50ms. With headroom the prediction is 200ms
+  // (300ms in total); without, 300ms (400ms). A 395ms deadline—400ms less the
+  // 5ms safety margin—admits the first and refuses the second.
+  EXPECT_TRUE(
+      search::detail::should_continue_deepening(100ms, 50ms, std::make_optional(200ms), 400ms));
+  EXPECT_FALSE(
+      search::detail::should_continue_deepening(100ms, 50ms, std::make_optional(400ms), 400ms));
+}
+
+namespace {
+
+// Records the depth of the last iteration the search actually reported. An
+// iteration the clock abandons never reaches the reporter, so this is how far
+// the search really got.
+struct LastReportedDepth : search::Reporter {
+  std::uint8_t depth{0};
+  std::size_t reports{0};
+
+  void send(const search::Report& report) override {
+    depth = report.depth;
+    reports += 1;
+  }
+};
+
+} // namespace
+
 TEST(SearchTime, SoftLimitStopsBetweenIterations) {
-  // No depth bound at all: only the soft limit can end this search, and it may
-  // only do so once an iteration is complete—so there is always a move to play.
+  // The soft limit is small and the hard limit is far away, so the only thing
+  // that can end this search is the between-iterations check—and that check
+  // only ever fires with a completed iteration in hand.
   Position pos = Position::startpos();
 
-  search::NullReporter reporter;
+  LastReportedDepth reporter;
   search::Limits limits;
   limits.soft_time = std::chrono::milliseconds{100};
   limits.hard_time = std::chrono::milliseconds{30000};
@@ -770,24 +866,44 @@ TEST(SearchTime, SoftLimitStopsBetweenIterations) {
   EXPECT_LT(elapsed, std::chrono::seconds{20}) << "the soft limit did not end the search";
   EXPECT_GE(result.depth, 1);
   EXPECT_FALSE(result.pv.empty()) << "stopping between iterations must leave a complete answer";
+
+  // Nothing was abandoned: what the search returns is exactly the last
+  // iteration it finished and reported.
+  EXPECT_EQ(result.depth, reporter.depth);
 }
 
-TEST(SearchTime, HardLimitStopsInsideAnIteration) {
-  // The soft limit is far away, so only the hard limit can end this search.
-  // It is the one the stopper polls, so it can and does cut in mid-iteration.
+TEST(SearchTime, HardLimitCutsAnIterationShort) {
+  // soft == hard is what `go movetime` produces: no headroom, so the only
+  // thing that can end the search is the limit the stopper polls, and that one
+  // fires wherever in the tree the search happens to be.
+  //
+  // The discriminating fact is the depth. Given the same depth bound and no
+  // clock at all the search reports every iteration up to it; with the clock
+  // it does not get that far, and the iteration it was in the middle of is
+  // never reported and never returned.
   Position pos = Position::startpos();
 
-  search::NullReporter reporter;
-  search::Limits limits;
-  limits.soft_time = std::chrono::milliseconds{30000};
-  limits.hard_time = std::chrono::milliseconds{100};
+  constexpr std::uint8_t DEPTH = 6;
 
-  const auto started = std::chrono::steady_clock::now();
-  const auto result = search::search(pos, limits, reporter);
-  const auto elapsed = std::chrono::steady_clock::now() - started;
+  LastReportedDepth without_clock;
+  search::Limits unclocked;
+  unclocked.depth = DEPTH;
+  search::search(pos, unclocked, without_clock);
 
-  EXPECT_LT(elapsed, std::chrono::seconds{20}) << "the hard limit did not end the search";
-  EXPECT_GE(result.depth, 1);
+  LastReportedDepth with_clock;
+  search::Limits clocked;
+  clocked.depth = DEPTH;
+  clocked.soft_time = std::chrono::milliseconds{5};
+  clocked.hard_time = std::chrono::milliseconds{5};
+  const auto result = search::search(pos, clocked, with_clock);
+
+  ASSERT_EQ(without_clock.depth, DEPTH) << "the unclocked run must reach the depth bound";
+  EXPECT_LT(with_clock.depth, without_clock.depth) << "the clock did not cut the search short";
+  EXPECT_LT(with_clock.reports, without_clock.reports);
+
+  // Whatever it managed to finish is what it returns: an abandoned iteration
+  // never becomes the answer.
+  EXPECT_EQ(result.depth, with_clock.depth);
 }
 
 TEST(SearchLimits, NodeLimitHoldsInACaptureHeavyPosition) {
