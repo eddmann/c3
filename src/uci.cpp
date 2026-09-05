@@ -4,10 +4,12 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -19,6 +21,7 @@
 #include <vector>
 
 #include "c3/about.hpp"
+#include "c3/attacks.hpp"
 #include "c3/engine.hpp"
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
@@ -40,6 +43,14 @@ template <typename T> T clamp_non_negative(T value) {
 
 template <typename T> T div_ceil(T value, T divisor) {
   return static_cast<T>((value + divisor - 1) / divisor);
+}
+
+UciMove to_uci_move(const Move& mv) {
+  return UciMove{
+      .from = mv.from,
+      .to = mv.to,
+      .promotion_piece = mv.promotion_piece,
+  };
 }
 
 std::vector<std::string> split_tokens(const std::string& line) {
@@ -132,6 +143,18 @@ std::uint8_t parse_u8_attr(const std::string& attr, const std::string& value) {
   }
 }
 
+std::uint32_t parse_u32_attr(const std::string& attr, const std::string& value) {
+  try {
+    const long long parsed = std::stoll(value);
+    if (parsed < 0 || parsed > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::out_of_range("out of range");
+    }
+    return static_cast<std::uint32_t>(parsed);
+  } catch (...) {
+    throw std::runtime_error("invalid value for '" + attr + "' attribute");
+  }
+}
+
 std::uint64_t parse_u64_attr(const std::string& attr, const std::string& value) {
   try {
     const long long parsed = std::stoll(value);
@@ -210,41 +233,98 @@ PositionCommand parse_position(const std::vector<std::string>& args) {
   };
 }
 
+// Applies one `<attribute> <value>` pair of a `go` command. Returns false when
+// the attribute is not one we know, so the caller can skip that single token.
+bool apply_go_attribute(GoParams& params, const std::string& attr, const std::string& value) {
+  if (attr == "depth") {
+    params.depth = parse_u8_attr(attr, value);
+  } else if (attr == "movetime") {
+    params.movetime = parse_duration_attr(attr, value);
+  } else if (attr == "wtime") {
+    params.wtime = parse_duration_attr(attr, value);
+  } else if (attr == "btime") {
+    params.btime = parse_duration_attr(attr, value);
+  } else if (attr == "winc") {
+    params.winc = parse_duration_attr(attr, value);
+  } else if (attr == "binc") {
+    params.binc = parse_duration_attr(attr, value);
+  } else if (attr == "nodes") {
+    params.nodes = parse_u64_attr(attr, value);
+  } else if (attr == "movestogo") {
+    params.movestogo = parse_u32_attr(attr, value);
+  } else if (attr == "mate") {
+    // "Find a mate in N moves." Such a mate takes N moves from us and N-1
+    // replies from the opponent, so 2N-1 plies of search are enough to see it.
+    // We approximate the request with that depth limit.
+    const auto moves_to_mate = parse_u8_attr(attr, value);
+    const int plies = (2 * static_cast<int>(moves_to_mate)) - 1;
+    params.depth = static_cast<std::uint8_t>(std::clamp(plies, 1, int{search::MAX_DEPTH}));
+  } else {
+    return false;
+  }
+
+  return true;
+}
+
+// `go` carries every search limit a GUI knows about, and GUIs keep inventing
+// new ones. The UCI spec therefore tells engines to IGNORE tokens they do not
+// understand: aborting the whole command would leave the GUI waiting for a
+// `bestmove` that never arrives, which loses the game on time.
 GoParams parse_go(const std::vector<std::string>& args) {
   GoParams params;
 
-  for (std::size_t i = 0; i < args.size();) {
+  std::size_t i = 0;
+  while (i < args.size()) {
     const std::string& attr = args[i];
 
+    // Value-less flags.
     if (attr == "infinite") {
-      return params;
+      params.infinite = true;
+      ++i;
+      continue;
     }
 
+    if (attr == "ponder") {
+      params.ponder = true;
+      ++i;
+      continue;
+    }
+
+    // `searchmoves` is followed by an open-ended list of moves, so it ends at
+    // the first token that is not a move (usually the next attribute).
+    if (attr == "searchmoves") {
+      ++i;
+      while (i < args.size()) {
+        const auto mv = parse_uci_move(args[i]);
+        if (!mv.has_value()) {
+          break;
+        }
+        params.searchmoves.push_back(*mv);
+        ++i;
+      }
+      continue;
+    }
+
+    // Everything below takes a value; a dangling attribute is ignored.
     if (i + 1 >= args.size()) {
-      throw std::runtime_error("missing value for '" + attr + "' attribute");
+      break;
     }
 
-    const std::string& value = args[i + 1];
+    // An unknown attribute costs one token, not two: the token after it may
+    // well be an attribute we do know, so we must not swallow it as a value.
+    i += apply_go_attribute(params, attr, args[i + 1]) ? 2 : 1;
+  }
 
-    if (attr == "depth") {
-      params.depth = parse_u8_attr(attr, value);
-    } else if (attr == "movetime") {
-      params.movetime = parse_duration_attr(attr, value);
-    } else if (attr == "wtime") {
-      params.wtime = parse_duration_attr(attr, value);
-    } else if (attr == "btime") {
-      params.btime = parse_duration_attr(attr, value);
-    } else if (attr == "winc") {
-      params.winc = parse_duration_attr(attr, value);
-    } else if (attr == "binc") {
-      params.binc = parse_duration_attr(attr, value);
-    } else if (attr == "nodes") {
-      params.nodes = parse_u64_attr(attr, value);
-    } else {
-      throw std::runtime_error("unknown attribute '" + attr + "'");
-    }
-
-    i += 2;
+  // `infinite` means "search until `stop`". Some GUIs send it alongside a
+  // clock; the flag wins, otherwise we would stop on a timer the GUI never
+  // intended to apply.
+  if (params.infinite) {
+    params.movetime.reset();
+    params.wtime.reset();
+    params.btime.reset();
+    params.winc.reset();
+    params.binc.reset();
+    params.movestogo.reset();
   }
 
   return params;
@@ -299,13 +379,20 @@ SetOptionCommand parse_setoption(
       throw std::runtime_error("missing value for 'hash' option");
     }
 
+    std::size_t size_mb = 0;
     try {
-      const std::size_t size_mb = std::stoull(*option.value);
-      if (size_mb < search::TT_MIN_SIZE_MB || size_mb > search::TT_MAX_SIZE_MB) {
-        throw std::runtime_error("invalid value for 'hash' option");
-      }
+      size_mb = std::stoull(*option.value);
     } catch (...) {
       throw std::runtime_error("could not parse value for 'hash' option");
+    }
+
+    // The range check lives outside the try: raising it inside would be caught
+    // by the catch-all above and misreported as a parse failure, hiding the
+    // real reason from whoever typed the command.
+    if (size_mb < search::TT_MIN_SIZE_MB || size_mb > search::TT_MAX_SIZE_MB) {
+      throw std::runtime_error("value for 'hash' option must be between " +
+                               std::to_string(search::TT_MIN_SIZE_MB) + " and " +
+                               std::to_string(search::TT_MAX_SIZE_MB) + " MB");
     }
   } else {
     throw std::runtime_error("unknown option '" + name + "'");
@@ -366,6 +453,12 @@ UciCommand parse_command(const std::string& command) {
   } else if (head == "setoption") {
     result.type = CommandType::SetOption;
     result.option = parse_setoption(args);
+  } else if (head == "debug" || head == "register" || head == "ponderhit") {
+    // Accepted and ignored on purpose. `debug` asks for extra `info string`
+    // tracing we do not produce, `register` only matters to engines that need
+    // a licence key, and `ponderhit` confirms a ponder search this engine
+    // never started. Silence is a valid answer to all three.
+    result.type = CommandType::NoOp;
   } else if (head == "stop") {
     result.type = CommandType::Stop;
   } else if (head == "quit") {
@@ -381,55 +474,123 @@ UciCommand parse_command(const std::string& command) {
 // Time management
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// How many more moves we assume the game lasts when the GUI does not say.
+// Spending 1/30th of the clock per move is deliberately cautious: the budget
+// is recomputed every move, so what we do not spend now stays available and
+// the allocation shrinks smoothly as the clock does.
+constexpr std::int64_t ASSUMED_MOVES_REMAINING = 30;
+
+// Fraction of the clock held back for protocol and GUI latency, plus a floor
+// so that even a tiny clock keeps a few milliseconds of slack.
+constexpr std::int64_t TIME_RESERVE_DIVISOR = 20;
+constexpr auto MINIMUM_TIME_RESERVE = std::chrono::milliseconds{50};
+
+// With `movestogo` the natural share is time_left / movestogo, but a GUI that
+// says "1 move to go" would have us burn the entire clock on one move. Never
+// commit more than half of what is left to a single move.
+constexpr std::int64_t MOVES_TO_GO_CAP_DIVISOR = 2;
+
+// Smallest budget we will ever hand the search. A zero-millisecond budget
+// makes the stopper fire before the first evaluation, so the search returns
+// no move at all. Ten milliseconds is enough for a depth-1 answer, and we
+// never claim more than actually remains on the clock.
+constexpr auto MINIMUM_ALLOCATED_TIME = std::chrono::milliseconds{10};
+
+} // namespace
+
+// TIME BUDGET FOR ONE MOVE
+//
+//   share     = time_left / movestogo          (or / 30 when movestogo is
+//                                               absent, capped at half the
+//                                               clock when it is present)
+//   allocated = min(share + increment/2, time_left - reserve)
+//   budget    = max(allocated, min(10ms, time_left))
+//
+// Half of the increment is added because the increment is credited after the
+// move: spending all of it would slowly drain the main clock.
 std::optional<std::chrono::milliseconds>
 calculate_allocated_time(std::chrono::milliseconds time_left,
-                         std::optional<std::chrono::milliseconds> increment) noexcept {
-  if (time_left.count() == 0) {
-    return time_left;
+                         std::optional<std::chrono::milliseconds> increment,
+                         std::optional<std::uint32_t> moves_to_go) noexcept {
+  if (time_left.count() <= 0) {
+    // Nothing left to spend: only the fallback move can save us now.
+    return std::chrono::milliseconds{0};
   }
 
-  const auto reserve = std::max(time_left / 20, std::chrono::milliseconds{50});
+  const auto reserve = std::max(time_left / TIME_RESERVE_DIVISOR, MINIMUM_TIME_RESERVE);
   const auto max_time = time_left > reserve ? time_left - reserve : std::chrono::milliseconds{0};
 
-  const auto allocated =
-      std::min(time_left / 30 + increment.value_or(std::chrono::milliseconds{0}) / 2, max_time);
+  auto share = time_left / ASSUMED_MOVES_REMAINING;
+  if (moves_to_go.has_value()) {
+    const auto moves = static_cast<std::int64_t>(std::max<std::uint32_t>(*moves_to_go, 1U));
+    share = std::min(time_left / moves, time_left / MOVES_TO_GO_CAP_DIVISOR);
+  }
 
-  return std::chrono::milliseconds{allocated.count()};
+  const auto allocated =
+      std::min(share + increment.value_or(std::chrono::milliseconds{0}) / 2, max_time);
+
+  return std::max(std::chrono::milliseconds{allocated.count()},
+                  std::min(MINIMUM_ALLOCATED_TIME, time_left));
 }
 
 // ---------------------------------------------------------------------------
 // Position helpers
 // ---------------------------------------------------------------------------
 
-Move to_engine_move(const UciMove& uci_move, const Position& pos) {
-  const auto piece = pos.board.piece_at(uci_move.from);
-  if (!piece.has_value()) {
-    throw std::runtime_error("no piece at from-square");
+namespace {
+
+// The generator produces PSEUDO-legal moves: they respect how the piece moves
+// but may leave our own king in check. Filtering them the way the search does
+// (make, test the mover's king, unmake) yields the exact legal move list.
+// A shared `legal_moves()` will replace this local helper later.
+MoveList legal_moves(const Position& pos) {
+  Position working = pos;
+  MoveList legal;
+
+  for (const auto& mv : pseudo_legal_moves(working)) {
+    const Colour mover = working.colour_to_move;
+    working.make_move(mv);
+    if (!is_in_check(mover, working.board)) {
+      legal.push_back(mv);
+    }
+    working.unmake_move(mv);
   }
 
-  const bool is_en_passant =
-      is_pawn(*piece) && pos.en_passant_square.has_value() && uci_move.to == *pos.en_passant_square;
+  return legal;
+}
 
-  const auto captured_piece =
-      is_en_passant ? std::make_optional(pawn(!colour(*piece))) : pos.board.piece_at(uci_move.to);
+} // namespace
 
-  return Move{
-      .piece = *piece,
-      .from = uci_move.from,
-      .to = uci_move.to,
-      .captured_piece = captured_piece,
-      .promotion_piece = uci_move.promotion_piece,
-      .is_en_passant = is_en_passant,
-  };
+// A UCI move string ("e2e4", "e7e8q") names only squares and a promotion
+// letter. Matching it against the legal move list does two jobs at once: it
+// rejects input the position does not allow—a wrong-side move, a promotion
+// suffix on a non-promoting move such as "e2e4q", anything a buggy GUI or a
+// typo produces—and it fills in what the string leaves out: which piece moves,
+// what it captures, and whether the capture is en passant.
+Move to_engine_move(const UciMove& uci_move, const Position& pos) {
+  for (const auto& mv : legal_moves(pos)) {
+    if (mv.from == uci_move.from && mv.to == uci_move.to &&
+        mv.promotion_piece == uci_move.promotion_piece) {
+      return mv;
+    }
+  }
+
+  throw std::runtime_error("illegal move for this position: " + to_uci_string(uci_move));
 }
 
 void apply_position_command(const PositionCommand& command, Position& pos) {
-  pos = Position::from_fen(command.fen);
+  // Built into a scratch position and only handed over once every move has
+  // been accepted: a half-applied move list would silently corrupt the game
+  // state the GUI believes we are holding.
+  Position next = Position::from_fen(command.fen);
 
   for (const auto& uci_move : command.moves) {
-    const Move mv = to_engine_move(uci_move, pos);
-    pos.make_move(mv);
+    next.make_move(to_engine_move(uci_move, next));
   }
+
+  pos = next;
 }
 
 // ---------------------------------------------------------------------------
@@ -471,22 +632,14 @@ void UciReporter::send(const search::Report& report) {
     if (!moves.empty()) {
       std::ostringstream pv_stream;
       for (std::size_t i = 0; i < moves.size(); ++i) {
-        pv_stream << to_uci_string(UciMove{
-            .from = moves[i].from,
-            .to = moves[i].to,
-            .promotion_piece = moves[i].promotion_piece,
-        });
+        pv_stream << to_uci_string(to_uci_move(moves[i]));
         if (i + 1 < moves.size()) {
           pv_stream << ' ';
         }
       }
 
       info.push_back("pv " + pv_stream.str());
-      best_move_ = UciMove{
-          .from = moves[0].from,
-          .to = moves[0].to,
-          .promotion_piece = moves[0].promotion_piece,
-      };
+      best_move_ = to_uci_move(moves[0]);
     }
   }
 
@@ -513,10 +666,62 @@ void UciReporter::send(const search::Report& report) {
 
 namespace {
 
+// A one-shot latch the search thread opens once it has something to report.
+// The UCI loop waits on it before interrupting a search: see SearchHandle.
+class SearchGate {
+public:
+  void open() {
+    {
+      const std::scoped_lock lock(mutex_);
+      open_ = true;
+    }
+    condition_.notify_all();
+  }
+
+  void wait() {
+    std::unique_lock lock(mutex_);
+    condition_.wait(lock, [this] { return open_; });
+  }
+
+private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool open_{false};
+};
+
+// Wraps UciReporter so that the first `info` line—i.e. the first completed
+// iterative-deepening iteration—also opens the search's gate.
+class GatedUciReporter : public UciReporter {
+public:
+  GatedUciReporter(std::ostream& out, std::mutex* mutex, SearchGate& gate)
+      : UciReporter(out, mutex), gate_(&gate) {}
+
+  void send(const search::Report& report) override {
+    UciReporter::send(report);
+    gate_->open();
+  }
+
+private:
+  SearchGate* gate_;
+};
+
+// The search runs on its own thread so the loop can keep reading stdin—the
+// GUI is allowed to send `stop` at any moment, including microseconds after
+// `go`. Two rules make that safe:
+//
+//   1. NEVER ABANDON A SEARCH THAT HAS NOTHING TO PLAY. `stop()` waits on the
+//      gate before raising the stop flag, so at least the depth-1 iteration
+//      gets to finish. The search thread also opens the gate when it exits,
+//      so a search that ends without reporting (an exhausted clock, a mated
+//      position) can never leave the loop waiting.
+//   2. JOIN BEFORE ANYTHING THE THREAD USES DIES. The thread writes to the
+//      output stream under a mutex owned by the loop, so it must be joined
+//      while both are still alive—hence the destructor, and the explicit
+//      stop() when stdin reaches EOF.
 struct SearchHandle {
   std::thread thread;
   std::shared_ptr<std::atomic_bool> stop_signal;
-  bool running{false};
+  std::shared_ptr<SearchGate> gate;
 
   SearchHandle() = default;
   ~SearchHandle() { stop(); }
@@ -528,24 +733,55 @@ struct SearchHandle {
   SearchHandle& operator=(SearchHandle&&) = delete;
 
   void stop() {
+    if (!thread.joinable()) {
+      return;
+    }
+
+    if (gate) {
+      gate->wait();
+    }
     if (stop_signal) {
       stop_signal->store(true, std::memory_order_release);
     }
-    if (thread.joinable()) {
-      thread.join();
-    }
-    running = false;
+
+    thread.join();
+    stop_signal.reset();
+    gate.reset();
   }
 };
+
+// Turns the clock half of a `go` command into a single search budget.
+std::optional<std::chrono::milliseconds> resolve_time_limit(const GoParams& params,
+                                                            Colour colour_to_move) {
+  if (params.infinite) {
+    return std::nullopt;
+  }
+
+  if (params.movetime.has_value()) {
+    return params.movetime;
+  }
+
+  const bool white = colour_to_move == Colour::White;
+  const auto time_left = white ? params.wtime : params.btime;
+  if (!time_left.has_value()) {
+    return std::nullopt;
+  }
+
+  return calculate_allocated_time(*time_left, white ? params.winc : params.binc, params.movestogo);
+}
 
 } // namespace
 
 namespace {
 void run_loop_impl(std::istream& in,
                    std::ostream& out) { // NOLINT(readability-function-cognitive-complexity)
+  // DECLARATION ORDER MATTERS: locals are destroyed in reverse, so the search
+  // handle (which joins the search thread) must be declared last. The thread
+  // writes to `out` while holding `out_mutex`; destroying either before the
+  // join would leave it writing through dead objects.
+  std::mutex out_mutex;
   Engine engine;
   SearchHandle search_handle;
-  std::mutex out_mutex;
 
   auto write_line = [&](const std::string& line) {
     std::scoped_lock lock(out_mutex);
@@ -644,36 +880,42 @@ void run_loop_impl(std::istream& in,
         search::Limits limits;
         limits.depth = cmd.go_params->depth;
         limits.nodes = cmd.go_params->nodes;
+        limits.time = resolve_time_limit(*cmd.go_params, engine.position().colour_to_move);
 
-        if (cmd.go_params->movetime.has_value()) {
-          limits.time = cmd.go_params->movetime;
-        } else {
-          const bool white = engine.position().colour_to_move == Colour::White;
-          const auto time_left = white ? cmd.go_params->wtime : cmd.go_params->btime;
-          const auto inc = white ? cmd.go_params->winc : cmd.go_params->binc;
-          limits.time =
-              time_left.has_value() ? calculate_allocated_time(*time_left, inc) : std::nullopt;
-        }
+        // FALLBACK MOVE
+        // A `go` must always be answered with a `bestmove`, and the search can
+        // legitimately come back empty-handed—stopped before its first
+        // iteration, or handed a clock that has already run out. Holding the
+        // first legal move of the root position in reserve means the only way
+        // to answer `bestmove (none)` is the honest one: there is no legal
+        // move at all (checkmate or stalemate).
+        const auto root_moves = legal_moves(engine.position());
+        const std::optional<UciMove> fallback_move =
+            root_moves.empty() ? std::nullopt : std::make_optional(to_uci_move(root_moves[0]));
 
         auto stop_signal = std::make_shared<std::atomic_bool>(false);
+        auto gate = std::make_shared<SearchGate>();
         Position pos_copy = engine.position();
 
-        search_handle.thread =
-            std::thread([pos_copy, limits, stop_signal, &out, &out_mutex]() mutable {
-              UciReporter reporter(out, &out_mutex);
+        search_handle.thread = std::thread(
+            [pos_copy, limits, stop_signal, gate, fallback_move, &out, &out_mutex]() mutable {
+              GatedUciReporter reporter(out, &out_mutex, *gate);
               search::search(pos_copy, limits, reporter, stop_signal);
 
-              const auto best = reporter.best_move();
-              std::scoped_lock lock(out_mutex);
-              if (best.has_value()) {
-                out << "bestmove " << to_uci_string(*best) << '\n' << std::flush;
-              } else {
-                out << "bestmove (none)" << '\n' << std::flush;
-              }
+              // A search that never reported (empty clock, no legal move) must
+              // still release anyone waiting to stop it.
+              gate->open();
+
+              const auto searched_move = reporter.best_move();
+              const auto best = searched_move.has_value() ? searched_move : fallback_move;
+
+              const std::scoped_lock lock(out_mutex);
+              out << "bestmove " << (best.has_value() ? to_uci_string(*best) : "(none)") << '\n'
+                  << std::flush;
             });
 
         search_handle.stop_signal = stop_signal;
-        search_handle.running = true;
+        search_handle.gate = gate;
         break;
       }
 
@@ -686,6 +928,9 @@ void run_loop_impl(std::istream& in,
         }
         break;
 
+      case CommandType::NoOp:
+        break;
+
       case CommandType::Stop:
         search_handle.stop();
         break;
@@ -695,9 +940,17 @@ void run_loop_impl(std::istream& in,
         return;
       }
     } catch (const std::exception& ex) {
-      write_line(std::string("error: ") + ex.what());
+      // UCI has no error channel: every line we print must be something a GUI
+      // can parse. `info string` is the protocol's free-text line, so a
+      // diagnostic can be shown or ignored without ever confusing the GUI.
+      write_line("info string " + std::string(ex.what()));
     }
   }
+
+  // stdin closed without a `quit` (a GUI crashed, or a pipe ran dry). Stop the
+  // search here rather than relying on the destructor: it makes the ordering
+  // explicit, and the search still reports its `bestmove` before we return.
+  search_handle.stop();
 }
 } // namespace
 
@@ -710,6 +963,11 @@ void run_loop() {
 }
 
 #ifdef C3_TESTING
+// LEGACY in-process harness — see the note in uci.hpp. It calls the search
+// directly instead of going through run_loop_impl, so `stop`/`quit` do
+// nothing and no thread is involved. The `UciLoop` tests exercise the real
+// loop and are authoritative for protocol behaviour; this one exists so
+// search-quality tests get byte-for-byte deterministic output.
 std::string run_script_for_test(
     const std::vector<std::string>& lines) { // NOLINT(readability-function-cognitive-complexity)
   std::ostringstream out;
@@ -779,16 +1037,7 @@ std::string run_script_for_test(
       search::Limits limits;
       limits.depth = cmd.go_params->depth;
       limits.nodes = cmd.go_params->nodes;
-
-      if (cmd.go_params->movetime.has_value()) {
-        limits.time = cmd.go_params->movetime;
-      } else {
-        const bool white = pos.colour_to_move == Colour::White;
-        const auto time_left = white ? cmd.go_params->wtime : cmd.go_params->btime;
-        const auto inc = white ? cmd.go_params->winc : cmd.go_params->binc;
-        limits.time =
-            time_left.has_value() ? calculate_allocated_time(*time_left, inc) : std::nullopt;
-      }
+      limits.time = resolve_time_limit(*cmd.go_params, pos.colour_to_move);
 
       search::Report report;
       search::Stopper stopper;
@@ -822,6 +1071,7 @@ std::string run_script_for_test(
       }
       break;
 
+    case CommandType::NoOp:
     case CommandType::Stop:
     case CommandType::Quit:
       break;
