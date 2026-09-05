@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "c3/attacks.hpp"
+#include "c3/castling.hpp"
 #include "c3/movegen.hpp"
 #include "c3/piece.hpp"
 #include "c3/position.hpp"
@@ -192,6 +193,29 @@ TEST(Attacks, BlackPawnAttacksBothSides) {
 TEST(Attacks, KnightAttacks) {
   const Position pos = parse_fen("8/8/8/8/3N4/8/8/8 w - - 0 1");
   assert_attacks_eq(pos, "d4", {"c2", "e2", "b3", "f3", "b5", "f5", "c6", "e6"});
+}
+
+// Attack tables are built with bit shifts, which happily carry a piece off one
+// edge of the board and back on at the other. These four positions are the ones
+// where a missing file mask would show up.
+TEST(Attacks, KnightOnAFileDoesNotWrapAround) {
+  const Position pos = parse_fen("8/8/8/8/8/8/N7/8 w - - 0 1");
+  assert_attacks_eq(pos, "a2", {"c1", "c3", "b4"});
+}
+
+TEST(Attacks, KnightOnHFileDoesNotWrapAround) {
+  const Position pos = parse_fen("8/8/8/7N/8/8/8/8 w - - 0 1");
+  assert_attacks_eq(pos, "h5", {"g3", "f4", "f6", "g7"});
+}
+
+TEST(Attacks, KingOnAFileDoesNotWrapAround) {
+  const Position pos = parse_fen("8/8/8/8/K7/8/8/8 w - - 0 1");
+  assert_attacks_eq(pos, "a4", {"a3", "a5", "b3", "b4", "b5"});
+}
+
+TEST(Attacks, KingOnHFileDoesNotWrapAround) {
+  const Position pos = parse_fen("8/8/8/8/8/8/8/7K w - - 0 1");
+  assert_attacks_eq(pos, "h1", {"g1", "g2", "h2"});
 }
 
 TEST(Attacks, BishopAttacksOnEmptyBoard) {
@@ -434,6 +458,52 @@ TEST(Movegen, EnPassantCaptureGeneratesBothCaptures) {
   EXPECT_EQ(
       std::count_if(moves.begin(), moves.end(), [](const Move& mv) { return mv.is_en_passant; }),
       2);
+}
+
+TEST(Movegen, RookCaptureOnCornerRemovesTheDefendersCastlingRight) {
+  // Capturing the a8 rook ends black's queenside castling, and moving the a1
+  // rook to get there ends white's.
+  Position pos = parse_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+  const auto moves = legal_moves(pos);
+
+  const auto capture = std::ranges::find_if(
+      moves, [](const Move& mv) { return mv.from == Square::A1 && mv.to == Square::A8; });
+  ASSERT_NE(capture, moves.end());
+
+  pos.make_move(*capture);
+
+  EXPECT_FALSE(pos.castling_rights.has(CastlingRight::BlackQueen));
+  EXPECT_FALSE(pos.castling_rights.has(CastlingRight::WhiteQueen));
+  EXPECT_TRUE(pos.castling_rights.has(CastlingRight::BlackKing));
+  EXPECT_TRUE(pos.castling_rights.has(CastlingRight::WhiteKing));
+}
+
+TEST(Movegen, PromotionCaptureOnCornerRemovesTheDefendersCastlingRight) {
+  // The rook leaves a8 without any rook of ours ever standing there, so the
+  // castling right has to be cleared from the destination square.
+  Position pos = parse_fen("r3k2r/1P6/8/8/8/8/8/R3K2R w KQkq - 0 1");
+  const auto moves = legal_moves(pos);
+
+  const auto promotion_capture = std::ranges::find_if(moves, [](const Move& mv) {
+    return mv.from == Square::B7 && mv.to == Square::A8 && mv.promotion_piece == Piece::WQ;
+  });
+  ASSERT_NE(promotion_capture, moves.end());
+
+  pos.make_move(*promotion_capture);
+
+  EXPECT_FALSE(pos.castling_rights.has(CastlingRight::BlackQueen));
+  EXPECT_TRUE(pos.castling_rights.has(CastlingRight::BlackKing));
+}
+
+TEST(Movegen, EnPassantCaptureExposingTheKingAlongTheRankIsIllegal) {
+  // Capturing en passant is the only move that empties two squares on the rank
+  // it leaves: both pawns disappear from the fifth rank, opening a line from
+  // the black rook on h5 straight to the white king on a5.
+  const Position pos = parse_fen("8/8/8/K2pP2r/8/8/8/7k w - d6 0 1");
+
+  const auto is_en_passant = [](const Move& mv) { return mv.is_en_passant; };
+  EXPECT_EQ(std::ranges::count_if(pseudo_legal_moves(pos), is_en_passant), 1);
+  EXPECT_EQ(std::ranges::count_if(legal_moves(pos), is_en_passant), 0);
 }
 
 TEST(Movegen, IgnoreFriendlyPieceCaptures) {
