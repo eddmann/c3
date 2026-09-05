@@ -11,7 +11,7 @@ Examples:
   python3 scripts/perft_benchmark.py --base main --test HEAD
 
   # With threshold
-  python3 scripts/perft_benchmark.py --base main --test HEAD --threshold 15.0
+  python3 scripts/perft_benchmark.py --base main --test HEAD --threshold 10.0
 
   # CI mode (structured output)
   python3 scripts/perft_benchmark.py --base main --test HEAD --ci

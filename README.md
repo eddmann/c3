@@ -98,9 +98,19 @@ All options are `-D<name>=ON|OFF` at configure time:
 | `C3_ENABLE_CLANG_TIDY`  | Run clang-tidy during the build                 | `OFF`              |
 | `C3_REGENERATE_MAGIC`   | Rebuild `include/c3/magic.hpp`                  | `OFF`              |
 
-GoogleTest is fetched at the commit tagged v1.14.0. An already installed GTest is
-reused when CMake finds one, and `-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=/path/to/googletest`
-points the build at a local checkout for fully offline work.
+GoogleTest is fetched at the commit tagged v1.14.0. An already installed GTest
+is reused instead when CMake finds one, which requires CMake 3.24 or newer
+(older versions always fetch), and
+`-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=/path/to/googletest` points the build at a
+local checkout for fully offline work.
+
+### Why the engine compiles twice in test builds
+
+A few helpers, such as `c3::uci::run_script_for_test`, exist only for the unit
+tests and sit behind the `C3_TESTING` macro. Defining it project-wide would
+compile that scaffolding into the released engine, so the sources are built as
+two libraries instead: `c3_core` without the define for the `c3` binary, and
+`c3_core_testing` with it for the test executable.
 
 ### Development (Debug + sanitizers)
 
@@ -183,6 +193,9 @@ are +/-2.94:
 | `--elo1`      | H1, the smallest gain worth detecting          | `5`     |
 | `--max-games` | Stop if no bound is crossed by this many games | `2000`  |
 | `--depth`     | Fixed search depth per move                    | `5`     |
+
+`make compare` and the strength-test workflow both raise the depth to 8; the
+script on its own stays at 5 so an ad-hoc run finishes quickly.
 
 ```bash
 # SPRT HEAD vs origin/main

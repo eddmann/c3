@@ -110,6 +110,9 @@ set(C3_CORE_SOURCES
 # Test-only helpers such as c3::uci::run_script_for_test live behind that
 # define, so building them separately keeps them out of the released engine
 # while the unit tests still get a library that exposes them.
+# Side effect: compile_commands.json then holds two entries per source file,
+# and an editor that picks the c3_core one greys out the C3_TESTING blocks as
+# inactive code. That is the shipped configuration, so it is the honest view.
 function(c3_add_core_library target)
   add_library(${target} STATIC ${C3_CORE_SOURCES})
   add_dependencies(${target} generate_magic)

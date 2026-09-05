@@ -16,9 +16,13 @@ endif()
 FetchContent_Declare(
   googletest
   GIT_REPOSITORY https://github.com/google/googletest.git
-  # Pinned to the commit tagged v1.14.0. A commit pin is the git equivalent of
-  # URL_HASH: the exact tree is fixed even if the tag is ever moved, which the
-  # previous release-zip download could not guarantee.
+  # v1.14.0, pinned by commit rather than by tag, since a tag can be moved.
+  # URL + URL_HASH on the release archive would pin the bytes exactly and cost
+  # a ~1 MB download instead of a full clone, and is the better option whenever
+  # the hash can be obtained; the archive was unreachable from the environment
+  # this was changed in, so its hash could not be computed or verified, and a
+  # commit sha is the strongest pin git offers. Do not add GIT_SHALLOW here: a
+  # shallow fetch wants a branch or tag, not a commit sha.
   GIT_TAG f8d7d77c06936315286eb55f8de22cd23c188571
   ${C3_GTEST_FIND_PACKAGE_ARGS}
 )
