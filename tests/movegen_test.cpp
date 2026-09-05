@@ -90,6 +90,15 @@ TEST(Attacks, DetectCheck) {
   EXPECT_TRUE(is_in_check(Colour::Black, board));
 }
 
+TEST(Attacks, SideWithoutKingIsNotInCheck) {
+  // Test and analysis positions are routinely set up without a king; there is
+  // no king square to probe, so there is nothing that can be in check.
+  Board board = Board::empty();
+  board.put_piece(Piece::WQ, Square::D1);
+
+  EXPECT_FALSE(is_in_check(Colour::Black, board));
+}
+
 TEST(Attacks, QueenAttacksHorizontal) {
   const Position pos = parse_fen("Q3k3/8/8/8/8/8/8/8 w - - 0 1");
   EXPECT_EQ(get_attackers(Square::E8, Colour::White, pos.board), Bitboard(Square::A8));

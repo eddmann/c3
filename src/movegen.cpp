@@ -26,7 +26,6 @@
 #include "c3/movegen.hpp"
 
 #include <array>
-#include <cassert>
 
 #include "c3/bitboard.hpp"
 #include "c3/magic.hpp"
@@ -346,11 +345,18 @@ bool is_attacked(Square square, Colour colour, const Board& board) {
 }
 
 // Check if a side's king is in check. Used for move legality filtering.
+//
+// A side may have no king at all: unit tests and analysis positions are often
+// built from a handful of pieces. No king means there is nothing to check, and
+// saying so here keeps us from probing the attack tables with the "square 64"
+// that scanning an empty bitboard reports.
 bool is_in_check(Colour colour, const Board& board) {
   const Bitboard king_bb = board.pieces(king(colour));
-  assert(king_bb != 0);
-  const Square king_square = Square::first_occupied(king_bb);
-  return is_attacked(king_square, !colour, board);
+  if (king_bb == 0) {
+    return false;
+  }
+
+  return is_attacked(Square::first_occupied(king_bb), !colour, board);
 }
 
 MoveList pseudo_legal_moves(const Position& pos) {
