@@ -143,9 +143,9 @@ inline constexpr auto KING_ATTACKS = make_king_attacks();
 
 constexpr std::array<std::uint8_t, 2> PAWN_START_RANKS = {1, 6};
 
-// The rank a pawn of each colour is marching towards. A pawn standing there has
+// The rank on which a pawn of each colour promotes. A pawn standing there has
 // already crossed the board and cannot advance any further.
-constexpr std::array<std::uint8_t, 2> PAWN_FINAL_RANKS = {7, 0};
+constexpr std::array<std::uint8_t, 2> PAWN_PROMOTION_RANKS = {7, 0};
 
 inline constexpr Bitboard WHITE_KING_CASTLING_PATH = Square::F1 | Square::G1;
 inline constexpr Bitboard BLACK_KING_CASTLING_PATH = Square::F8 | Square::G8;
@@ -154,6 +154,18 @@ inline constexpr Bitboard BLACK_QUEEN_CASTLING_PATH = Square::B8 | Square::C8 | 
 
 Bitboard pawn_attacks(Square square, Colour colour, const Board& board) {
   return PAWN_ATTACKS[colour_index(colour)][square.index()] & board.pieces_by_colour(!colour);
+}
+
+// The pawns of `colour` that attack `square`, found by reading the attack table
+// backwards: a pawn attacks a square exactly when a pawn of the opposite colour
+// standing on that square would attack the pawn. So we probe from the target
+// square with the colours swapped, and one table serves both directions.
+//
+// This answers two questions at once. "Which enemy pawns cover this square?" is
+// what attack detection needs, and "which of our pawns could capture onto the
+// en passant square?" is the same query asked from the other side.
+Bitboard pawn_attackers_of(Square square, Colour colour, const Board& board) {
+  return PAWN_ATTACKS[colour_index(!colour)][square.index()] & board.pieces(pawn(colour));
 }
 
 Bitboard knight_attacks(Square square) {
@@ -207,7 +219,7 @@ Bitboard pawn_advances(Square square, Colour colour, const Board& board) {
   // Legal play never leaves a pawn on rank 1 or 8, because it would have
   // promoted on arrival, but FEN syntax allows it and a GUI may hand us such a
   // position. Asking for the square ahead would step off the 64-square board.
-  if (square.rank() == PAWN_FINAL_RANKS[colour_index(colour)]) {
+  if (square.rank() == PAWN_PROMOTION_RANKS[colour_index(colour)]) {
     return 0;
   }
 
@@ -306,12 +318,10 @@ Bitboard castling_moves(CastlingRights rights, Colour colour, const Board& board
 
 } // namespace
 
-// Find pawns that can capture en passant to a given square.
-// Uses reverse attack lookup: which squares attack the en passant square?
-// Those are the potential source squares for capturing pawns.
+// Find pawns that can capture en passant to a given square: the pawns attacking
+// the empty square the double-pushed pawn skipped over.
 Bitboard en_passant_sources(Square en_passant_square, Colour colour, const Board& board) {
-  return PAWN_ATTACKS[colour_index(!colour)][en_passant_square.index()] &
-         board.pieces(pawn(colour));
+  return pawn_attackers_of(en_passant_square, colour, board);
 }
 
 Bitboard attacks_for(Piece piece, Square square, const Board& board) {
@@ -350,52 +360,35 @@ Bitboard attacks_for(Piece piece, Square square, const Board& board) {
 // =============================================================================
 
 Bitboard get_attackers(Square square, Colour colour, const Board& board) {
-  const Bitboard pawn_mask = pawn_attacks(square, !colour, board);
   const Bitboard knight_mask = knight_attacks(square);
   const Bitboard bishop_mask = bishop_attacks(square, board);
   const Bitboard rook_mask = rook_attacks(square, board);
   const Bitboard queen_mask = bishop_mask | rook_mask; // Queen = bishop + rook
   const Bitboard king_mask = king_attacks(square);
 
-  return (board.pieces(pawn(colour)) & pawn_mask) | (board.pieces(knight(colour)) & knight_mask) |
+  return pawn_attackers_of(square, colour, board) | (board.pieces(knight(colour)) & knight_mask) |
          (board.pieces(bishop(colour)) & bishop_mask) | (board.pieces(rook(colour)) & rook_mask) |
          (board.pieces(queen(colour)) & queen_mask) | (board.pieces(king(colour)) & king_mask);
 }
 
-// is_attacked answers the same question as get_attackers, but only "is there
-// one?", so it can stop at the first attacker it finds. That matters: this is
-// the hottest query in the engine, asked once for every move the legality
-// filter tries and again for every castling path, so it runs tens of millions
-// of times a second.
+// This is the hottest query in the engine: the legality filter asks it once for
+// every move it tries, so it runs tens of millions of times a second. The
+// obvious optimisation is to test the cheap leapers first and return at the
+// first attacker found, instead of building all six attacker sets.
 //
-// The order of the tests is deliberate. Knights, kings and pawns are answered
-// by a single array lookup and an AND. The sliding pieces cost a masked
-// multiply plus a lookup into an 841 KiB table that will not sit in L1, so they
-// are asked last and only when the cheap tests came up empty. A square nothing
-// attacks still costs the full set of tests; the saving is on the "yes"
-// answers, which are exactly the moves the legality filter has to throw away.
+// It was tried, and measured, and it did not pay. The branchless get_attackers
+// above has nothing to mispredict: its six sets are independent, so the
+// processor computes them side by side while it waits on the two magic table
+// lookups. An early-exit version serialises that work behind a chain of
+// branches, and the tests it hopes to skip are the sliding pieces, which have
+// to be asked last and are exactly the pieces that give most checks. Perft
+// timings for the two forms (startpos depth 5 and kiwipete depth 4, alternating
+// runs) came out the same to within the noise of the machine.
+//
+// So the simple form stays. get_attackers is the one place attacks are defined,
+// and callers that only need a yes or no read better for it.
 bool is_attacked(Square square, Colour colour, const Board& board) {
-  if ((board.pieces(knight(colour)) & KNIGHT_ATTACKS[square.index()]) != 0) {
-    return true;
-  }
-
-  if ((board.pieces(king(colour)) & KING_ATTACKS[square.index()]) != 0) {
-    return true;
-  }
-
-  // Reverse lookup again: a pawn of `colour` attacks this square exactly when
-  // the square, seen as a pawn of the opposite colour, attacks that pawn.
-  if ((board.pieces(pawn(colour)) & PAWN_ATTACKS[colour_index(!colour)][square.index()]) != 0) {
-    return true;
-  }
-
-  const Bitboard queens = board.pieces(queen(colour));
-
-  if (((board.pieces(bishop(colour)) | queens) & bishop_attacks(square, board)) != 0) {
-    return true;
-  }
-
-  return ((board.pieces(rook(colour)) | queens) & rook_attacks(square, board)) != 0;
+  return get_attackers(square, colour, board) != 0;
 }
 
 // Check if a side's king is in check. Used for move legality filtering.
@@ -595,7 +588,11 @@ MoveList filter_to_legal(Position& pos) {
 
 MoveList legal_moves(const Position& pos) {
   // The filter has to play moves out on a board, so it works on a copy and
-  // leaves the caller's position untouched.
+  // leaves the caller's position untouched. That copy is not free: a Position
+  // carries the board, the Zobrist key and the whole make/unmake history, so
+  // this helper is for callers off the search hot path (UCI, tests, tools).
+  // Code that already owns a mutable Position should make and unmake moves
+  // itself, the way perft does below.
   Position working = pos;
   return filter_to_legal(working);
 }
@@ -619,9 +616,14 @@ std::uint64_t perft(Position& pos, std::uint8_t depth) {
 
   const MoveList moves = filter_to_legal(pos);
 
-  // Bulk counting: at depth 1 every legal move is itself a leaf, so the size of
-  // the list is the answer. Since most of a perft tree lives at its last ply,
-  // skipping a make/unmake and a recursive call per leaf saves real time.
+  // Filtering first costs something: at every node above the last ply each legal
+  // move is now played twice, once by the filter and once by the recursion.
+  //
+  // Bulk counting is what pays for it. At depth 1 every legal move is itself a
+  // leaf, so the length of the filtered list is the answer and no move needs to
+  // be played a second time. A perft tree is nearly all leaves, so the saving
+  // at the last ply dwarfs the double work at the handful of nodes above it,
+  // and this is measurably faster than the make-then-test loop it replaced.
   if (depth == 1) {
     return moves.size();
   }
