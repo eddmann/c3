@@ -445,6 +445,93 @@ TEST(Eval, MirroringRanksAndColoursKeepsTheSameScore) {
   }
 }
 
+namespace {
+
+using RandomBoard = std::array<char, 64>;
+
+// Render a board (index 0 is a1, index 63 is h8) as the board field of a FEN,
+// which is written from rank 8 downwards with runs of empty squares counted.
+std::string to_fen_board_field(const RandomBoard& squares) {
+  std::string board;
+
+  for (int rank = 7; rank >= 0; --rank) {
+    int empty_run = 0;
+
+    for (int file = 0; file < 8; ++file) {
+      const char square =
+          squares[(static_cast<std::size_t>(rank) * 8) + static_cast<std::size_t>(file)];
+      if (square == '\0') {
+        ++empty_run;
+        continue;
+      }
+      if (empty_run > 0) {
+        board.push_back(static_cast<char>('0' + empty_run));
+        empty_run = 0;
+      }
+      board.push_back(square);
+    }
+
+    if (empty_run > 0) {
+      board.push_back(static_cast<char>('0' + empty_run));
+    }
+    if (rank > 0) {
+      board.push_back('/');
+    }
+  }
+
+  return board;
+}
+
+// Scatter two kings and a handful of other pieces over an empty board. Only two
+// rules are enforced, both of them the FEN parser's: exactly one king per side,
+// and no pawn on rank 1 or 8. Anything else goes—the evaluation is a pure
+// function of the pieces and has no opinion about whether a position could have
+// arisen from a real game.
+std::string random_position_fen(HashRng& rng) {
+  constexpr std::string_view PLACEABLE_PIECES = "PNBRQpnbrq";
+  constexpr std::size_t MAX_EXTRA_PIECES = 11;
+  constexpr int PLACEMENT_ATTEMPTS = 8;
+
+  const auto random_index = [&rng](std::size_t bound) {
+    return static_cast<std::size_t>(rng.next() % bound);
+  };
+
+  RandomBoard squares{};
+  squares.fill('\0');
+
+  // A board with no king would skip the king-safety term entirely, and a second
+  // king of the same colour is rejected by the parser.
+  for (const char king_char : {'K', 'k'}) {
+    std::size_t square = random_index(squares.size());
+    while (squares[square] != '\0') {
+      square = random_index(squares.size());
+    }
+    squares[square] = king_char;
+  }
+
+  const std::size_t extra_pieces = 1 + random_index(MAX_EXTRA_PIECES);
+  for (std::size_t piece = 0; piece < extra_pieces; ++piece) {
+    const char piece_char = PLACEABLE_PIECES[random_index(PLACEABLE_PIECES.size())];
+    const bool is_pawn = piece_char == 'P' || piece_char == 'p';
+
+    // Give up after a few tries rather than looping forever on a full board;
+    // one piece fewer makes no difference to what is being tested.
+    for (int attempt = 0; attempt < PLACEMENT_ATTEMPTS; ++attempt) {
+      const std::size_t square = random_index(squares.size());
+      const bool back_rank = square < 8 || square >= 56;
+      if (squares[square] != '\0' || (is_pawn && back_rank)) {
+        continue;
+      }
+      squares[square] = piece_char;
+      break;
+    }
+  }
+
+  return to_fen_board_field(squares) + (random_index(2) == 0 ? " w - - 0 1" : " b - - 0 1");
+}
+
+} // namespace
+
 TEST(Eval, RandomPositionsAreColourSymmetric) {
   // The hand-picked list above covers the cases somebody thought of. This one
   // does not: several hundred seeded random boards, each with two kings and a
@@ -452,70 +539,11 @@ TEST(Eval, RandomPositionsAreColourSymmetric) {
   // flipped the wrong way for one colour survives a curated list far more easily
   // than it survives this. Seeded, so any failure is reproducible.
   constexpr int POSITIONS = 400;
-  constexpr std::string_view PLACEABLE = "PNBRQpnbrq";
 
   HashRng rng(0xC0FFEE'1234'5678ULL);
 
-  const auto random_index = [&rng](std::size_t bound) {
-    return static_cast<std::size_t>(rng.next() % bound);
-  };
-
-  for (int attempt = 0; attempt < POSITIONS; ++attempt) {
-    std::array<char, 64> squares{};
-    squares.fill('\0');
-
-    // Exactly one king per side: the FEN parser rejects a second one, and a
-    // board with no king at all would skip the king-safety term entirely.
-    for (const char king_char : {'K', 'k'}) {
-      std::size_t square = random_index(64);
-      while (squares[square] != '\0') {
-        square = random_index(64);
-      }
-      squares[square] = king_char;
-    }
-
-    const std::size_t extra_pieces = 1 + random_index(11);
-    for (std::size_t piece = 0; piece < extra_pieces; ++piece) {
-      const char piece_char = PLACEABLE[random_index(PLACEABLE.size())];
-
-      for (int tries = 0; tries < 8; ++tries) {
-        const std::size_t square = random_index(64);
-        const bool back_rank = square < 8 || square >= 56;
-        const bool is_pawn = piece_char == 'P' || piece_char == 'p';
-        if (squares[square] != '\0' || (is_pawn && back_rank)) {
-          continue; // Occupied, or a pawn on a rank it can never stand on.
-        }
-        squares[square] = piece_char;
-        break;
-      }
-    }
-
-    // Squares run A1..H8, but a FEN is written from rank 8 downwards.
-    std::string board;
-    for (int rank = 7; rank >= 0; --rank) {
-      int empty_run = 0;
-      for (int file = 0; file < 8; ++file) {
-        const char square = squares[static_cast<std::size_t>((rank * 8) + file)];
-        if (square == '\0') {
-          ++empty_run;
-          continue;
-        }
-        if (empty_run > 0) {
-          board.push_back(static_cast<char>('0' + empty_run));
-          empty_run = 0;
-        }
-        board.push_back(square);
-      }
-      if (empty_run > 0) {
-        board.push_back(static_cast<char>('0' + empty_run));
-      }
-      if (rank > 0) {
-        board.push_back('/');
-      }
-    }
-
-    const std::string fen = board + (random_index(2) == 0 ? " w - - 0 1" : " b - - 0 1");
-    expect_colour_symmetric(fen);
+  for (int position = 0; position < POSITIONS; ++position) {
+    expect_colour_symmetric(random_position_fen(rng));
   }
 }
 
