@@ -63,6 +63,11 @@ void assert_legal_move_count(std::string_view fen, std::size_t count) {
   EXPECT_EQ(legal, count) << fen;
 }
 
+std::size_t moves_from_square(const MoveList& moves, Square from) {
+  return static_cast<std::size_t>(
+      std::ranges::count_if(moves, [from](const Move& mv) { return mv.from == from; }));
+}
+
 std::size_t castling_move_count(const MoveList& moves) {
   std::size_t count = 0;
   for (const auto& mv : moves) {
@@ -255,6 +260,19 @@ TEST(Movegen, PawnPromotionWithCapture) {
 
 TEST(Movegen, PawnPromotionWithAdvanceOrCapture) {
   assert_pseudo_legal_move_count("3q4/4P3/8/8/8/8/8/8 w - - 0 1", 8);
+}
+
+TEST(Movegen, WhitePawnOnPromotionRankHasNoAdvance) {
+  // Ranks 1 and 8 are unreachable for a pawn in a real game, but FEN syntax
+  // allows them, and a UCI GUI may hand us such a position. Advancing here
+  // would step off the 64-square board.
+  const Position pos = parse_fen("4k2P/8/8/8/8/8/8/4K3 w - - 0 1");
+  EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::H8), 0);
+}
+
+TEST(Movegen, BlackPawnOnPromotionRankHasNoAdvance) {
+  const Position pos = parse_fen("4k3/8/8/8/8/8/8/4Kp2 b - - 0 1");
+  EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::F1), 0);
 }
 
 TEST(Movegen, CastleKingSideOnly) {

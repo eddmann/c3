@@ -143,6 +143,10 @@ inline constexpr auto KING_ATTACKS = make_king_attacks();
 
 constexpr std::array<std::uint8_t, 2> PAWN_START_RANKS = {1, 6};
 
+// The rank a pawn of each colour is marching towards. A pawn standing there has
+// already crossed the board and cannot advance any further.
+constexpr std::array<std::uint8_t, 2> PAWN_FINAL_RANKS = {7, 0};
+
 inline constexpr Bitboard WHITE_KING_CASTLING_PATH = Square::F1 | Square::G1;
 inline constexpr Bitboard BLACK_KING_CASTLING_PATH = Square::F8 | Square::G8;
 inline constexpr Bitboard WHITE_QUEEN_CASTLING_PATH = Square::B1 | Square::C1 | Square::D1;
@@ -198,6 +202,13 @@ Bitboard rook_attacks(Square square, const Board& board) {
 }
 
 Bitboard pawn_advances(Square square, Colour colour, const Board& board) {
+  // Legal play never leaves a pawn on rank 1 or 8, because it would have
+  // promoted on arrival, but FEN syntax allows it and a GUI may hand us such a
+  // position. Asking for the square ahead would step off the 64-square board.
+  if (square.rank() == PAWN_FINAL_RANKS[colour_index(colour)]) {
+    return 0;
+  }
+
   const Square one_ahead = square.advance(colour);
 
   if (board.has_piece_at(one_ahead)) {
