@@ -95,8 +95,7 @@ inline constexpr std::size_t TT_DEFAULT_SIZE_MB = 64;
 // ---------------------------------------------------------------------------
 // Reporting and limits
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
+//
 // THE PLY CEILING
 // ---------------------------------------------------------------------------
 // MAX_DEPTH is not only the deepest iteration the engine will start; it is the
@@ -767,6 +766,14 @@ void order_quiescence_moves(MoveList& moves);
 // block in search.cpp for why.
 [[nodiscard]] std::uint8_t lmr_reduction(std::uint8_t depth, std::size_t move_number,
                                          bool is_pv_node);
+
+// The capture-only search alphabeta drops into at its leaves. Exposed so that
+// what it does and refuses to do—stand pat, resolve a check, prune a losing
+// capture—can be tested for itself, without a whole search wrapped round it.
+// `quiescence_depth` counts levels INTO quiescence, not search plies, and is
+// what QUIESCENCE_MAX_DEPTH bounds; callers start at 0.
+int quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, Report& report,
+               const Stopper& stopper, std::size_t quiescence_depth = 0);
 
 // `previous_move` is the move that led to this position; it is what the
 // counter-move table is keyed by, and it is empty at the root and immediately

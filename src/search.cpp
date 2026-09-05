@@ -913,6 +913,19 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // move can always "stand pat" (decline to capture) if no capture improves the
 // position. This prevents quiescence from searching forever.
 //
+// EXCEPT IN CHECK, WHERE STANDING PAT IS A LIE
+// "I do not have to capture" is the one claim a side in check cannot make: it
+// must answer the check or the game is over. A quiescence node that stands pat
+// in check therefore reports the static evaluation of a position the side to
+// move may not be allowed to keep—and the position it is hiding may be
+// checkmate, which no material count resembles. So in check quiescence takes
+// no stand-pat score at all, generates every legal reply rather than only the
+// captures (blocking and king moves are usually the only answers there are),
+// and returns a mate score if none of them is legal. That makes a check node
+// behave like a small alpha-beta node inside quiescence, which is what it is:
+// the position is not quiet, and pretending otherwise is how an engine walks
+// into a mate that was one ply past its horizon.
+//
 // QUIESCENCE MUST ASK THE STOPPER TOO
 // "Until the position is quiet" is not a bound anybody set. A middlegame with
 // both sides' pieces contesting the same squares can spend thousands of nodes
@@ -924,8 +937,8 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // Stopper makes sure that score is discarded rather than stored.
 // ---------------------------------------------------------------------------
 
-int quiescence(Position& pos, int alpha, int beta, std::size_t quiescence_depth, SearchContext& ctx,
-               Report& report, const Stopper& stopper) {
+int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, Report& report,
+                       const Stopper& stopper, std::size_t quiescence_depth) {
   if (stopper.should_stop(report)) {
     return 0;
   }
@@ -946,26 +959,34 @@ int quiescence(Position& pos, int alpha, int beta, std::size_t quiescence_depth,
   // decides to visit instead, which keeps every position worth exactly one
   // node whichever of the two searches resolves it.
 
-  // Stand-pat: static evaluation as the fallback
-  const int stand_pat = eval(pos);
+  const Colour colour_to_move = pos.colour_to_move;
+  const bool in_check = is_in_check(colour_to_move, pos.board);
 
-  // Beta cutoff: position is already too good, opponent won't allow this
-  if (stand_pat >= beta) {
-    return beta;
+  if (!in_check) {
+    // Stand-pat: static evaluation as the fallback
+    const int stand_pat = eval(pos);
+
+    // Beta cutoff: position is already too good, opponent won't allow this
+    if (stand_pat >= beta) {
+      return beta;
+    }
+
+    // Update alpha: we can always achieve at least the stand-pat score
+    alpha = std::max(alpha, stand_pat);
   }
 
-  // Update alpha: we can always achieve at least the stand-pat score
-  alpha = std::max(alpha, stand_pat);
-
-  const Colour colour_to_move = pos.colour_to_move;
-
-  // Only search noisy moves (captures and promotions). The list and its
-  // ordering scores come from the context's row for this quiescence depth, so
-  // this frame holds neither of them.
+  // Normally only the noisy moves (captures and promotions); in check, every
+  // legal reply, because the check has to be answered and the answer is often a
+  // quiet block or a king step. The list and its ordering scores come from the
+  // context's row for this quiescence depth, so this frame holds neither of
+  // them. Ordering is MVV-LVA either way—among evasions that simply means
+  // capturing the checker is tried first, which is usually right.
   MoveScratch& scratch = ctx.at_quiescence_depth(quiescence_depth);
   MoveList& moves = scratch.moves;
-  moves = pseudo_legal_noisy_moves(pos);
+  moves = in_check ? pseudo_legal_moves(pos) : pseudo_legal_noisy_moves(pos);
   OrderedMoves ordering(moves, scratch.scores);
+
+  std::size_t legal_moves = 0;
 
   for (std::size_t i = 0; i < moves.size(); ++i) {
     const Move mv = ordering.select(i);
@@ -978,12 +999,14 @@ int quiescence(Position& pos, int alpha, int beta, std::size_t quiescence_depth,
       continue;
     }
 
+    ++legal_moves;
+
     // The child is a position we are about to enter and decide, so it is
     // counted here—the callee will not count itself.
     report.nodes += 1;
 
     // Negamax: negate score and swap alpha/beta
-    const int score = -quiescence(pos, -beta, -alpha, quiescence_depth + 1, ctx, report, stopper);
+    const int score = -quiescence(pos, -beta, -alpha, ctx, report, stopper, quiescence_depth + 1);
 
     pos.unmake_move(mv);
 
@@ -991,6 +1014,17 @@ int quiescence(Position& pos, int alpha, int beta, std::size_t quiescence_depth,
       return beta; // Beta cutoff
     }
     alpha = std::max(alpha, score);
+  }
+
+  // In check with nothing legal to play is checkmate, and it is only reachable
+  // here because the in-check branch generated ALL the moves: with captures
+  // alone an empty list would mean "quiet", not "over". Stalemate cannot land
+  // here—a side with no legal move and no check is not in check by definition.
+  //
+  // The distance is counted from the root, so it is the alphabeta ply this
+  // quiescence started from plus however deep into quiescence we now are.
+  if (in_check && legal_moves == 0) {
+    return -CENTIPAWN_MATE + static_cast<int>(report.ply) + static_cast<int>(quiescence_depth);
   }
 
   return alpha;
@@ -1051,13 +1085,13 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // is a real one; it simply stops growing the tree in a direction that has
   // nowhere left to go. See THE PLY CEILING in search.hpp.
   if (report.ply >= MAX_DEPTH) {
-    return quiescence(pos, alpha, beta, 0, ctx, report, stopper);
+    return quiescence(pos, alpha, beta, ctx, report, stopper);
   }
 
   // Leaf node: drop into quiescence search
   if (depth == 0) {
     if (!is_in_check(pos.colour_to_move, pos.board)) {
-      return quiescence(pos, alpha, beta, 0, ctx, report, stopper);
+      return quiescence(pos, alpha, beta, ctx, report, stopper);
     }
     // CHECK EXTENSION: Don't stop search while in check (tactical danger).
     // This is the one place the recursion does not spend a ply of depth, so it

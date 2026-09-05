@@ -443,7 +443,12 @@ TEST(SearchPlySafety, ResolvesStaticallyAtThePlyCeiling) {
   // So a node that is already at the ceiling must answer without recursing.
   Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
 
-  const auto search_from_ply = [&pos](std::uint8_t ply) {
+  // Killers are the tell. Only the main search stores them, and only for a move
+  // it actually searched, so a context that comes back empty is proof that the
+  // node answered without recursing. A search that wrapped instead would have
+  // gone on to search a full depth-4 tree and left killers behind at plies 255,
+  // 0, 1, 2... — the root's own slots, filled in from 255 plies away.
+  const auto killers_stored_by = [&pos](std::uint8_t ply) {
     search::SearchContext ctx;
     search::TranspositionTable tt(1);
     search::Report report;
@@ -451,17 +456,26 @@ TEST(SearchPlySafety, ResolvesStaticallyAtThePlyCeiling) {
     search::Stopper stopper;
     MoveList pv;
     search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
-    return report;
+
+    int stored = 0;
+    for (int slot = 0; slot <= static_cast<int>(search::MAX_DEPTH); ++slot) {
+      const auto killer_ply = static_cast<std::uint8_t>(slot);
+      stored += static_cast<int>(ctx.killers.probe(killer_ply, 0).has_value());
+      stored += static_cast<int>(ctx.killers.probe(killer_ply, 1).has_value());
+    }
+    return std::make_pair(stored, report.max_ply);
   };
 
-  const auto at_ceiling = search_from_ply(search::MAX_DEPTH);
-  const auto at_root = search_from_ply(0);
+  const auto [at_ceiling, ceiling_max_ply] = killers_stored_by(search::MAX_DEPTH);
+  const auto [at_root, root_max_ply] = killers_stored_by(0);
 
-  EXPECT_LT(at_ceiling.nodes, at_root.nodes)
+  EXPECT_EQ(at_ceiling, 0)
       << "a node at the ply ceiling must resolve statically instead of recursing";
+  EXPECT_GT(at_root, 0) << "the same search from the root does recurse, and says so";
 
-  // ...and it stopped there rather than carrying on from a wrapped ply 0.
-  EXPECT_EQ(at_ceiling.max_ply, search::MAX_DEPTH);
+  // ...and it stopped at the ceiling rather than carrying on from a wrapped 0.
+  EXPECT_EQ(ceiling_max_ply, search::MAX_DEPTH);
+  EXPECT_LT(root_max_ply, search::MAX_DEPTH);
 }
 
 TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
@@ -482,6 +496,53 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
 
   EXPECT_GT(report.max_ply, DEPTH) << "a check at the horizon should have been extended";
   EXPECT_LE(report.max_ply, search::MAX_DEPTH);
+}
+
+// Quiescence -------------------------------------------------------------------
+
+namespace {
+
+// Quiescence with nothing around it: no alpha-beta parent, no iterative
+// deepening, so what comes back is quiescence's own opinion of the position.
+struct QuiescenceRun {
+  int eval{0};
+  std::uint64_t nodes{0};
+};
+
+QuiescenceRun quiesce(Position& pos, search::SearchContext& ctx, int alpha = CENTIPAWN_MIN,
+                      int beta = CENTIPAWN_MAX) {
+  search::Report report;
+  search::Stopper stopper;
+  const int eval = search::detail::quiescence(pos, alpha, beta, ctx, report, stopper);
+  return {eval, report.nodes};
+}
+
+QuiescenceRun quiesce(Position& pos, int alpha = CENTIPAWN_MIN, int beta = CENTIPAWN_MAX) {
+  search::SearchContext ctx;
+  return quiesce(pos, ctx, alpha, beta);
+}
+
+} // namespace
+
+TEST(SearchQuiescence, ReportsCheckmateInsteadOfStandingPat) {
+  // Standing pat says "I do not have to move"—and in check that is exactly the
+  // one thing the side to move cannot say. Here it is mated: the static
+  // evaluation calls the position merely bad, and a quiescence node that
+  // believed it would hand alpha-beta a losing position dressed up as a
+  // playable one, right at the horizon where nothing above can correct it.
+  Position pos = parse("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1");
+
+  EXPECT_LE(quiesce(pos).eval, -CENTIPAWN_MATE_THRESHOLD) << "quiescence stood pat in a checkmate";
+}
+
+TEST(SearchQuiescence, FindsAMateThatOnlyAppearsInsideTheCaptureSearch) {
+  // The same failure from the other side. Qxa8 is a capture, so quiescence
+  // searches it; the mate is only visible once the position AFTER it is
+  // resolved, and that position is a check.
+  Position pos = parse("r5k1/5ppp/8/8/8/8/8/Q5K1 w - - 0 1");
+
+  EXPECT_GE(quiesce(pos).eval, CENTIPAWN_MATE_THRESHOLD)
+      << "the mate behind the capture was hidden by a stand-pat in check";
 }
 
 // Transposition table layout, move packing and replacement ---------------------
