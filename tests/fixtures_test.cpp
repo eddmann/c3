@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "c3/eval.hpp"
 #include "fixtures.hpp"
 
 namespace {
@@ -35,7 +36,10 @@ TEST(Fixtures, LoadEvalKeepsSideToMoveSign) {
   ASSERT_NE(black, nullptr);
 
   EXPECT_GT(white->score, 0);
-  EXPECT_EQ(black->score, -white->score);
+  // The board-derived score negates when the side to move flips, but the tempo
+  // bonus is paid to whoever is on move rather than to a colour, so the pair
+  // adds up to two bonuses instead of cancelling to zero.
+  EXPECT_EQ(black->score + white->score, 2 * c3::TEMPO_BONUS);
 }
 
 TEST(Fixtures, LoadZobristStartPosition) {

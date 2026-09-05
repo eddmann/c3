@@ -483,7 +483,9 @@ TEST(SearchCorrectness, MatchesStartposDepth2) {
   const auto result = search::search(pos, limits, reporter);
 
   EXPECT_EQ(result.depth, 2);
-  EXPECT_EQ(result.eval, 0);
+  // Two plies of a symmetric position: every term cancels and what is left is
+  // the tempo bonus the side to move collects at the leaf.
+  EXPECT_EQ(result.eval, TEMPO_BONUS);
 
   const auto pv = pv_to_uci(result.pv);
   ASSERT_GE(pv.size(), 1U);

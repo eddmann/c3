@@ -224,27 +224,31 @@ TEST(Eval, MatchesFixtureEvals) {
 // Symmetry Tests
 // -----------------------------------------------------------------------------
 
-TEST(Eval, SymmetricPositionIsZero) {
-  // Perfectly symmetric position with equal material
+TEST(Eval, SymmetricPositionScoresOnlyTheTempoBonus) {
+  // Perfectly symmetric position with equal material: every term computed for
+  // White is computed identically for Black and cancels, so the only thing left
+  // is what the side to move is paid for holding the move.
   const auto pos = parse("4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1");
 
-  EXPECT_EQ(eval(pos), 0);
+  EXPECT_EQ(eval(pos), TEMPO_BONUS);
+  EXPECT_EQ(eval_material_and_psqt(pos), 0);
 }
 
-TEST(Eval, ColourFlipNegates) {
-  // Same position but with side to move flipped should negate eval.
+TEST(Eval, ColourFlipNegatesEverythingButTempo) {
+  // Same position with the side to move flipped. The board-derived half of the
+  // evaluation negates exactly; the tempo bonus does not, because it is paid to
+  // whoever is on move rather than to a colour. So the two scores do not cancel
+  // to zero—they cancel to two tempo bonuses.
+  //
   // Position: White has a rook advantage (a lone knight would be scored as an
   // insufficient-material draw, which would make this test pass vacuously).
   const auto white_to_move = parse("4k3/8/8/8/4R3/8/8/4K3 w - - 0 1");
   const auto black_to_move = parse("4k3/8/8/8/4R3/8/8/4K3 b - - 0 1");
 
-  const auto eval_white = eval(white_to_move);
-  const auto eval_black = eval(black_to_move);
+  ASSERT_NE(eval_material_and_psqt(white_to_move), 0);
 
-  ASSERT_NE(eval_white, 0);
-
-  // Eval from white's perspective should be negated when black moves
-  EXPECT_EQ(eval_white, -eval_black);
+  EXPECT_EQ(eval(white_to_move) + eval(black_to_move), 2 * TEMPO_BONUS);
+  EXPECT_EQ(eval_material_and_psqt(white_to_move), -eval_material_and_psqt(black_to_move));
 }
 
 // -----------------------------------------------------------------------------
@@ -397,18 +401,23 @@ int advantage(const Position& pos, Phase phase) {
 
 } // namespace
 
+// These three tests are about the BLEND, not about the terms being blended, so
+// they compare against eval_material_and_psqt: the same taper arithmetic with
+// nothing else mixed in. Adding the positional terms here would only make the
+// expected values harder to derive without testing the taper any harder.
+
 TEST(TaperedEval, FullArmiesReturnTheMiddlegameScore) {
   const auto pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
   ASSERT_EQ(game_phase(pos.board), PHASE_MAX);
 
-  EXPECT_EQ(eval(pos), advantage(pos, Phase::Middlegame));
+  EXPECT_EQ(eval_material_and_psqt(pos), advantage(pos, Phase::Middlegame));
 }
 
 TEST(TaperedEval, PieceLessPositionsReturnTheEndgameScore) {
   const auto pos = parse("4k3/4p3/8/8/8/8/PP6/4K3 w - - 0 1");
   ASSERT_EQ(game_phase(pos.board), 0);
 
-  EXPECT_EQ(eval(pos), advantage(pos, Phase::Endgame));
+  EXPECT_EQ(eval_material_and_psqt(pos), advantage(pos, Phase::Endgame));
 }
 
 TEST(TaperedEval, PartialArmiesLandBetweenTheTwoScores) {
@@ -423,8 +432,8 @@ TEST(TaperedEval, PartialArmiesLandBetweenTheTwoScores) {
   const int endgame = advantage(pos, Phase::Endgame);
   ASSERT_NE(middlegame, endgame);
 
-  EXPECT_GE(eval(pos), std::min(middlegame, endgame));
-  EXPECT_LE(eval(pos), std::max(middlegame, endgame));
+  EXPECT_GE(eval_material_and_psqt(pos), std::min(middlegame, endgame));
+  EXPECT_LE(eval_material_and_psqt(pos), std::max(middlegame, endgame));
 }
 
 // -----------------------------------------------------------------------------
@@ -496,14 +505,18 @@ bool test_has_bishop_pair(const Board& board, Colour side) {
   return (bishops & dark) != 0 && (bishops & ~dark) != 0;
 }
 
-// eval() the slow way: walk both piece lists, twice, and taper the result.
-// This is the reference the incremental evaluation has to reproduce exactly.
+// Material and piece squares the slow way: walk both piece lists, twice, and
+// taper the result. This is the reference the incremental evaluation has to
+// reproduce exactly, and its counterpart in the engine is
+// eval_material_and_psqt() rather than eval()—the positional terms in eval() do
+// not come from the accumulator at all, so folding them in here would test the
+// terms instead of the running totals these tests exist to check.
 //
-// The taper, clamp and side-to-move flip below deliberately mirror eval()'s own
-// arithmetic rather than deriving it independently: only the accumulator is
+// The taper, clamp and side-to-move flip below deliberately mirror the engine's
+// own arithmetic rather than deriving it independently: only the accumulator is
 // under test here, so everything downstream of it is held constant on purpose.
 // A change to the taper formula has to be made in both places.
-int reference_eval(const Position& pos) {
+int reference_material_and_psqt(const Position& pos) {
   if (has_insufficient_material(pos.board)) {
     return CENTIPAWN_DRAW;
   }
@@ -545,7 +558,8 @@ void expect_accumulator_is_sound(const Position& pos, std::string_view context) 
   expect_side_totals_match(live, rebuilt, Colour::Black, context);
 
   EXPECT_EQ(live.phase(), rebuilt.phase()) << context << " (phase)";
-  EXPECT_EQ(eval(pos), reference_eval(pos)) << context << " (eval)";
+  EXPECT_EQ(eval_material_and_psqt(pos), reference_material_and_psqt(pos))
+      << context << " (material and piece squares)";
 }
 
 constexpr std::array<std::string_view, 8> ACCUMULATOR_FENS = {
@@ -718,4 +732,250 @@ TEST(EvalAccumulator, SurvivesRandomPlayouts) {
   // Guard against the loop silently doing nothing (an empty move list on the
   // very first ply would otherwise leave this test vacuously green).
   EXPECT_GT(plies_played, 200);
+}
+
+// -----------------------------------------------------------------------------
+// Pawn structure
+// -----------------------------------------------------------------------------
+// Every position below is a PAIR of boards that differ in exactly one
+// structural fact. The squares are chosen so that the piece-square tables, the
+// material count and the game phase come out identical on both boards, which is
+// what makes each assertion a statement about the term under test rather than
+// about the tables underneath it.
+
+TEST(PawnStructure, PassedPawnBeatsBlockedPawn) {
+  // White's d5 pawn is passed in the first position (no black pawn on the c, d
+  // or e files ahead of it) and stopped in the second. b7 and c7 are worth the
+  // same on the pawn table, and White's b2 pawn denies Black a passer of its own
+  // either way, so who owns a passed pawn is the only difference.
+  const auto passed = parse("4k3/1p6/8/3P4/8/8/1P6/4K3 w - - 0 1");
+  const auto blocked = parse("4k3/2p5/8/3P4/8/8/1P6/4K3 w - - 0 1");
+
+  EXPECT_GT(eval(passed), eval(blocked));
+}
+
+TEST(PawnStructure, DoubledPawnsAreWorseThanSpreadPawns) {
+  // c2+c3 against c2+f3. Both boards hold two pawns, both pawns are isolated on
+  // both boards, and c3 and f3 are worth the same on the pawn table—so the pawns
+  // getting in each other's way on the c-file is the whole difference.
+  const auto doubled = parse("7k/8/8/8/8/2P5/2P5/7K w - - 0 1");
+  const auto spread = parse("7k/8/8/8/8/5P2/2P5/7K w - - 0 1");
+
+  EXPECT_GT(eval(spread), eval(doubled));
+}
+
+TEST(PawnStructure, IsolatedPawnsAreWorseThanConnectedPawns) {
+  // a2+c2 can never defend each other; a2+b2 can. The pawn table gives 5+10
+  // either way, so the boards differ only in whether the pawns are neighbours.
+  const auto isolated = parse("7k/8/8/8/8/8/P1P5/7K w - - 0 1");
+  const auto connected = parse("7k/8/8/8/8/8/PP6/7K w - - 0 1");
+
+  EXPECT_GT(eval(connected), eval(isolated));
+}
+
+// -----------------------------------------------------------------------------
+// King safety
+// -----------------------------------------------------------------------------
+
+TEST(KingSafety, PawnShieldBeatsAnOpenWing) {
+  // The same king and the same pawns, two different corners: on g1 the king sits
+  // behind f2/g2/h2, on b1 it has walked away from its shelter and the a, b and
+  // c files are wide open. b1 and g1 are worth the same on both king tables, and
+  // White's queen on d4 sees the same squares either way, so the king's cover is
+  // the only thing that changes.
+  const auto sheltered = parse("3qk3/8/8/8/3Q4/8/5PPP/6K1 w - - 0 1");
+  const auto exposed = parse("3qk3/8/8/8/3Q4/8/5PPP/1K6 w - - 0 1");
+
+  EXPECT_GT(eval(sheltered), eval(exposed));
+}
+
+TEST(KingSafety, PiecesAimedAtTheKingAreAPenalty) {
+  // White has pawns on both wings, so the shield and open-file terms score the
+  // same whichever corner the king picks. Black's rook, knight and queen all
+  // bear down on the squares around g1 and none of them touch b1: the difference
+  // is purely how many enemy pieces are looking at the king.
+  const auto attacked = parse("4k1r1/8/8/8/5n1q/8/PPP2PPP/6K1 w - - 0 1");
+  const auto safe = parse("4k1r1/8/8/8/5n1q/8/PPP2PPP/1K6 w - - 0 1");
+
+  EXPECT_GT(eval(safe), eval(attacked));
+}
+
+// -----------------------------------------------------------------------------
+// Rooks
+// -----------------------------------------------------------------------------
+
+TEST(RookEval, OpenFileBeatsAFileBlockedByItsOwnPawn) {
+  // a1 and b1 are worth the same on the rook table, and White's b2 pawn stands on
+  // both boards. From a1 the rook owns an open file; from b1 it stares at the
+  // back of its own pawn. Mobility pushes the same way here, which is precisely
+  // why an open file is worth having.
+  const auto open_file = parse("4k3/8/8/8/8/8/1P6/R6K w - - 0 1");
+  const auto blocked_file = parse("4k3/8/8/8/8/8/1P6/1R5K w - - 0 1");
+
+  EXPECT_GT(eval(open_file), eval(blocked_file));
+}
+
+TEST(RookEval, SeventhRankIsWorthMoreThanThePieceSquareTableAlone) {
+  // A rook has fourteen moves from anywhere on an otherwise empty board, so a7
+  // and a6 score the same for mobility and both sit on an open file. The
+  // piece-square table already prefers a7; the seventh-rank term says the
+  // preference should be BIGGER than the table alone, because a rook on the
+  // seventh rank cages a king stuck on the eighth.
+  const auto seventh = parse("4k3/R7/8/8/8/8/8/7K w - - 0 1");
+  const auto sixth = parse("4k3/8/R7/8/8/8/8/7K w - - 0 1");
+
+  const int piece_square_gain = eval_psqt(Colour::White, seventh.board, Phase::Middlegame) -
+                                eval_psqt(Colour::White, sixth.board, Phase::Middlegame);
+
+  EXPECT_GT(eval(seventh) - eval(sixth), piece_square_gain);
+}
+
+// -----------------------------------------------------------------------------
+// Mobility
+// -----------------------------------------------------------------------------
+
+TEST(Mobility, FreeBishopBeatsABishopBehindItsOwnPawn) {
+  // c5+d5 and e5+f5 score identically on the pawn table, are connected passers
+  // in both cases, and neither pair changes any other term. The one thing that
+  // does change is that e5 stands on the bishop's only diagonal.
+  const auto free_bishop = parse("k7/8/8/2PP4/8/8/8/B6K w - - 0 1");
+  const auto blocked_bishop = parse("k7/8/8/4PP2/8/8/8/B6K w - - 0 1");
+
+  EXPECT_GT(eval(free_bishop), eval(blocked_bishop));
+}
+
+// -----------------------------------------------------------------------------
+// Tempo
+// -----------------------------------------------------------------------------
+
+TEST(Tempo, HavingTheMoveIsWorthSomething) {
+  // The starting position is perfectly symmetric, so every other term cancels.
+  // Whatever is left over is the value of being the side that gets to move.
+  EXPECT_GT(eval(Position::startpos()), 0);
+}
+
+// -----------------------------------------------------------------------------
+// The terms on their own
+// -----------------------------------------------------------------------------
+// The tests above ask whether eval() as a whole prefers the right positions,
+// which is what actually matters. These ask the individual term functions
+// directly, where nothing else can cancel out or reinforce them—so they can pin
+// down details the whole-evaluation tests can only bound, such as an open file
+// beating a semi-open one or the attacker penalty running into its cap.
+
+TEST(PawnStructureTerm, PassedPawnsGrowWithTheRankAndCountDoubleInTheEndgame) {
+  // Both pawns are isolated, so that penalty cancels out of the comparison and
+  // what is left is the passed-pawn bonus at two different distances from home.
+  const auto near_promotion = parse("4k3/3P4/8/8/8/8/8/4K3 w - - 0 1");
+  const auto just_started = parse("4k3/8/8/8/8/8/3P4/4K3 w - - 0 1");
+
+  const auto advanced = eval_pawn_structure(Colour::White, near_promotion.board);
+  const auto at_home = eval_pawn_structure(Colour::White, just_started.board);
+
+  EXPECT_GT(advanced.middlegame, at_home.middlegame);
+  EXPECT_GT(advanced.endgame, at_home.endgame);
+
+  // The whole point of the endgame column: with no pieces left to blockade it, a
+  // runner is worth far more than the same runner in a crowded middlegame.
+  EXPECT_GT(advanced.endgame, advanced.middlegame);
+}
+
+TEST(PawnStructureTerm, StackedPawnsAreChargedOncePerPawnInFrontOfThem) {
+  // Three pawns on the c-file against the same three pawns fanned out over the
+  // b, c and d files at the same ranks. Both sets are equally advanced, so the
+  // passed-pawn bonus is identical and what is left is two doubled penalties
+  // (the c2 and c3 pawns each have a friendly pawn ahead of them) plus three
+  // isolated ones (nothing on the b- or d-file to defend any of them).
+  const auto tripled = parse("4k3/8/8/8/2P5/2P5/2P5/4K3 w - - 0 1");
+  const auto spread = parse("4k3/8/8/8/3P4/2P5/1P6/4K3 w - - 0 1");
+
+  const auto stacked = eval_pawn_structure(Colour::White, tripled.board);
+  const auto healthy = eval_pawn_structure(Colour::White, spread.board);
+
+  EXPECT_EQ(stacked.middlegame - healthy.middlegame,
+            (2 * DOUBLED_PAWN_PENALTY.middlegame) + (3 * ISOLATED_PAWN_PENALTY.middlegame));
+  EXPECT_EQ(stacked.endgame - healthy.endgame,
+            (2 * DOUBLED_PAWN_PENALTY.endgame) + (3 * ISOLATED_PAWN_PENALTY.endgame));
+}
+
+TEST(RookTerm, OpenFileBeatsSemiOpenBeatsBlocked) {
+  // The same rook on the same square, with the a-file empty, holding an enemy
+  // pawn, and holding one of our own.
+  const auto open = parse("4k3/8/8/8/8/8/8/R3K3 w - - 0 1");
+  const auto semi_open = parse("4k3/p7/8/8/8/8/8/R3K3 w - - 0 1");
+  const auto blocked = parse("4k3/8/8/8/8/8/P7/R3K3 w - - 0 1");
+
+  EXPECT_EQ(eval_rooks(Colour::White, open.board), ROOK_OPEN_FILE);
+  EXPECT_EQ(eval_rooks(Colour::White, semi_open.board), ROOK_SEMI_OPEN_FILE);
+  EXPECT_EQ(eval_rooks(Colour::White, blocked.board), PhaseScore{});
+}
+
+TEST(RookTerm, SeventhRankNeedsSomethingToAttack) {
+  // Both rooks stand on the seventh rank of an open file. The bonus is only paid
+  // in the first position, where the enemy king is stuck on the eighth rank with
+  // the rook cutting it off; in the second the king has walked out and the
+  // seventh rank is just another empty row.
+  const auto king_cut_off = parse("4k3/R7/8/8/8/8/8/4K3 w - - 0 1");
+  const auto king_in_the_open = parse("8/R7/4k3/8/8/8/8/4K3 w - - 0 1");
+
+  const auto cutting = eval_rooks(Colour::White, king_cut_off.board);
+  const auto merely_placed = eval_rooks(Colour::White, king_in_the_open.board);
+
+  EXPECT_EQ(cutting.middlegame - merely_placed.middlegame, ROOK_ON_SEVENTH.middlegame);
+  EXPECT_EQ(cutting.endgame - merely_placed.endgame, ROOK_ON_SEVENTH.endgame);
+
+  // The one rook bonus that is bigger in the endgame, because in an ending a
+  // rook on the seventh is frequently the whole win.
+  EXPECT_GT(ROOK_ON_SEVENTH.endgame, ROOK_ON_SEVENTH.middlegame);
+}
+
+TEST(KingSafetyTerm, AttackersHurtUntilTheCap) {
+  const auto pos = parse("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1");
+  const auto safety = [&pos](int attackers) {
+    return eval_king_safety(Colour::White, pos.board, attackers).middlegame;
+  };
+
+  EXPECT_GT(safety(0), safety(1));
+  EXPECT_GT(safety(1), safety(2));
+
+  // Beyond the cap the term stops responding. Attacks really do compound, but
+  // this evaluation has no tuning data behind it, and an unbounded king-safety
+  // term is how an engine talks itself into sacrificing a rook for a fantasy.
+  EXPECT_EQ(safety(KING_ZONE_MAX_ATTACKERS), safety(KING_ZONE_MAX_ATTACKERS + 10));
+
+  // King safety has no opinion at all about endgames; the taper switches it off.
+  EXPECT_EQ(eval_king_safety(Colour::White, pos.board, 3).endgame, 0);
+}
+
+TEST(KingSafetyTerm, ShieldIsCappedAtOnePawnPerFile) {
+  // Doubled pawns in front of the king are not extra shelter: g2 and g3 cover
+  // the same file, so the second one earns nothing.
+  const auto three_files = parse("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1");
+  const auto stacked = parse("4k3/8/8/8/8/6P1/5PPP/6K1 w - - 0 1");
+
+  EXPECT_EQ(eval_king_safety(Colour::White, three_files.board, 0),
+            eval_king_safety(Colour::White, stacked.board, 0));
+}
+
+TEST(PieceActivityTerm, MinorsIgnoreSquaresEnemyPawnsCover) {
+  // A knight on d4 reaches eight squares. Black pawns on c6 and e6 cover b5, d5
+  // and f5; two of those are knight moves, and a knight that lands on one is
+  // simply lost, so they do not count as mobility.
+  const auto unopposed = parse("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1");
+  const auto hemmed_in = parse("4k3/8/2p1p3/8/3N4/8/8/4K3 w - - 0 1");
+
+  const auto free_knight = eval_piece_activity(Colour::White, unopposed.board);
+  const auto watched_knight = eval_piece_activity(Colour::White, hemmed_in.board);
+
+  EXPECT_GT(free_knight.mobility.middlegame, watched_knight.mobility.middlegame);
+}
+
+TEST(PieceActivityTerm, CountsThePiecesLookingAtTheEnemyKing) {
+  // The f-file rook sees f7 and f8, both next to the black king on e8. The
+  // a-file rook sees neither, and is the same piece on the same rank.
+  const auto aimed_at_the_king = parse("4k3/8/8/8/8/8/8/4KR2 w - - 0 1");
+  const auto pointed_elsewhere = parse("4k3/8/8/8/8/8/8/R3K3 w - - 0 1");
+
+  EXPECT_EQ(eval_piece_activity(Colour::White, aimed_at_the_king.board).king_zone_attackers, 1);
+  EXPECT_EQ(eval_piece_activity(Colour::White, pointed_elsewhere.board).king_zone_attackers, 0);
 }
