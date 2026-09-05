@@ -514,11 +514,17 @@ TEST(SearchCorrectness, MatchesStartposDepth2) {
   EXPECT_EQ(result.depth, 2);
   EXPECT_EQ(result.eval, 0);
 
+  // Nb1c3 and Ng1f3 are mirror images of one another in the starting position and
+  // score EXACTLY the same, as do Nb8c6 and Ng8f6 in reply. Which one comes back
+  // is a tie broken by move ordering, not a preference the search has, so the
+  // test asks for a developing knight move rather than pinning the coin flip.
+  // (It used to pin "g1f3": the order an unstable std::sort happened to leave
+  // equal-scoring moves in before ordering became a deterministic selection.)
   const auto pv = pv_to_uci(result.pv);
   ASSERT_GE(pv.size(), 1U);
-  EXPECT_EQ(pv[0], "g1f3");
+  EXPECT_TRUE(pv[0] == "b1c3" || pv[0] == "g1f3") << "unexpected first move " << pv[0];
   if (pv.size() > 1) {
-    EXPECT_EQ(pv[1], "g8f6");
+    EXPECT_TRUE(pv[1] == "b8c6" || pv[1] == "g8f6") << "unexpected reply " << pv[1];
   }
 }
 

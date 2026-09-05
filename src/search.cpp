@@ -17,13 +17,14 @@
 #include "c3/search.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
@@ -105,72 +106,6 @@ bool has_non_pawn_material(const Board& board, Colour colour) {
 // =============================================================================
 constexpr int FUTILITY_MARGIN[] = {0, 100, 300}; // margins for depth 0, 1, 2
 constexpr int FUTILITY_DEPTH = 2;
-
-// =============================================================================
-// MVV-LVA: Most Valuable Victim - Least Valuable Attacker
-// =============================================================================
-// The best captures tend to be: high-value pieces captured by low-value pieces.
-// PxQ (pawn takes queen) is almost always good; QxP might lose the queen.
-//
-// Score = (victim_value * 100) - attacker_value
-// Higher scores = better captures = searched first
-//
-// Multiplying the victim by 100 makes the victim dominate: every capture of a
-// queen sorts above every capture of a rook, whatever did the capturing. The
-// attacker's value then breaks ties within a victim class, cheapest first—if
-// two pieces can take the queen, try the one we mind losing least. So PxQ
-// beats NxQ beats QxQ, and all of them beat QxP.
-//
-// The values themselves live in PIECE_VALUES (eval.hpp); this ordering only
-// depends on their relative sizes, not on the exact numbers.
-//
-// Returns negative so that std::sort orders best captures first (ascending).
-// =============================================================================
-
-constexpr int MVV_VICTIM_WEIGHT = 100;
-
-int capture_priority_score(const Move& mv) {
-  if (mv.captured_piece.has_value()) {
-    const auto victim_value = PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)];
-    const auto attacker_value = PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
-    return -((victim_value * MVV_VICTIM_WEIGHT) - attacker_value);
-  }
-
-  if (mv.promotion_piece.has_value()) {
-    return 1;
-  }
-
-  return 0;
-}
-
-// PROMOTIONS ARE NOT CAPTURES BY THE PROMOTED PIECE
-// Feeding the promoted piece to MVV-LVA as the ATTACKER inverts the ranking a
-// promotion deserves: the more valuable the piece the pawn becomes, the worse
-// its "least valuable attacker" score, so =N sorted ahead of =Q and every node
-// with a promotion spent its first move on the one promotion nobody wants.
-//
-// What a promotion actually does is trade a pawn for the piece it becomes, so
-// it is scored like a capture whose victim is the new piece and whose attacker
-// is the pawn. A move that both captures and promotes earns both halves, which
-// is right: it is two gains in one move.
-//
-// Higher is better here, the opposite of capture_priority_score() above; that
-// one is a leftover of ordering by ascending sort and goes away with it.
-int noisy_move_score(const Move& mv) {
-  int score = 0;
-
-  if (mv.captured_piece.has_value()) {
-    score += (PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)] * MVV_VICTIM_WEIGHT) -
-             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
-  }
-
-  if (mv.promotion_piece.has_value()) {
-    score += (PIECE_VALUES[static_cast<std::size_t>(*mv.promotion_piece)] * MVV_VICTIM_WEIGHT) -
-             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
-  }
-
-  return score;
-}
 
 } // namespace
 
@@ -563,48 +498,192 @@ int eval_out(int eval, std::uint8_t ply) {
 // of O(b^d). That's the difference between depth 16 and depth 8!
 //
 // Our ordering priority:
-//   1. TT move (proven best from previous search)
-//   2. Captures by MVV-LVA (likely to be good)
-//   3. Promotions (creating a queen is usually good)
-//   4. Killer moves (caused cutoffs at this ply before)
-//   5. Quiet moves (lowest priority)
+//   1. Hash move          the move a previous, usually deeper, search found
+//                         best in this very position
+//   2. Captures and promotions, ranked by MVV-LVA
+//   3. Killer 1           the quiet move that most recently caused a cutoff
+//                         at this ply
+//   4. Killer 2           the one before it
+//   5. Everything else    the quiet moves
+//
+// MVV-LVA: MOST VALUABLE VICTIM, LEAST VALUABLE ATTACKER
+// The best captures tend to be high-value pieces taken by low-value ones. PxQ
+// (pawn takes queen) is almost always good; QxP might lose the queen.
+// Multiplying the victim by MVV_VICTIM_WEIGHT makes the victim dominate: every
+// capture of a queen ranks above every capture of a rook, whatever did the
+// capturing. Subtracting the attacker then breaks ties within a victim class,
+// cheapest attacker first—if two pieces can take the queen, try the one we
+// mind losing least. So PxQ beats NxQ beats QxQ, and all of them beat QxP.
+// The values live in PIECE_VALUES (eval.hpp); the ordering depends only on
+// their relative sizes, not on the exact numbers.
+//
+// SCORE ONCE, THEN PICK LAZILY
+// The obvious implementation is a full sort with a comparator that scores both
+// moves it is handed. That gets two things wrong.
+//
+// First, such a comparator re-scores the same move on every comparison it takes
+// part in: sorting n moves costs O(n log n) comparisons and therefore twice
+// that many scorings, where n would do. Scoring is not free—it reads piece
+// values, compares against the hash move and both killers, and (once history
+// arrives) probes a table—so that repetition is most of the cost of ordering.
+//
+// Second, and worse, a full sort puts the whole list in order when the search
+// will usually look at the first move or two and leave. With decent ordering a
+// node that fails high does so on its FIRST move around nine times in ten;
+// every comparison spent arranging the rest of the list bought nothing.
+//
+// So each move is scored exactly once into a parallel array, and the loop then
+// asks for one move at a time: scan the moves not yet searched, swap the
+// highest-scoring one into place, hand it over. That is a selection sort
+// abandoned as soon as the caller stops asking. Picking k moves out of n costs
+// O(k*n), which for the k = 1 a cutoff usually needs is a single pass instead
+// of a whole sort. In the worst case—every move searched—it is the O(n^2) that
+// selection sort always is, but on at most a couple of hundred 8-byte moves
+// that stay in cache, and by then the node has paid far more for the searches
+// themselves than for any ordering.
 // ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int MVV_VICTIM_WEIGHT = 100;
+
+// PROMOTIONS ARE NOT CAPTURES BY THE PROMOTED PIECE
+// Feeding the promoted piece to MVV-LVA as the ATTACKER inverts the ranking a
+// promotion deserves: the more valuable the piece the pawn becomes, the worse
+// its "least valuable attacker" score, so =N ranked ahead of =Q and every node
+// with a promotion spent its first move on the one promotion nobody wants.
+//
+// What a promotion actually does is trade a pawn for the piece it becomes, so
+// it is scored like a capture whose victim is the new piece and whose attacker
+// is the pawn. A move that both captures and promotes earns both halves, which
+// is right: it is two gains in one move.
+int noisy_move_score(const Move& mv) {
+  int score = 0;
+
+  if (mv.captured_piece.has_value()) {
+    score += (PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)] * MVV_VICTIM_WEIGHT) -
+             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  }
+
+  if (mv.promotion_piece.has_value()) {
+    score += (PIECE_VALUES[static_cast<std::size_t>(*mv.promotion_piece)] * MVV_VICTIM_WEIGHT) -
+             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  }
+
+  return score;
+}
+
+// Ordering bands. The gaps are wide enough that nothing can score its way out
+// of its band: the richest move imaginable—a promotion to queen that also
+// captures a queen—is worth about 180,000 above ORDER_NOISY, which still
+// leaves it far below the hash move.
+constexpr int ORDER_HASH_MOVE = 100'000'000;
+constexpr int ORDER_NOISY = 1'000'000;
+constexpr int ORDER_KILLER_1 = 900'000;
+constexpr int ORDER_KILLER_2 = 800'000;
+
+// The busiest legal position anyone has constructed offers 218 moves, and 256
+// is the round number engines conventionally allow for. Nothing is written past
+// it: a position that somehow offered more would simply have its surplus moves
+// searched in generation order (see select()), never scored out of bounds.
+constexpr std::size_t MAX_SCORED_MOVES = MOVE_LIST_RESERVE;
+
+class OrderedMoves {
+public:
+  // Main search: the full priority list above.
+  OrderedMoves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
+               const std::optional<Move>& hash_move)
+      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)) {
+    const auto killer1 = killers.probe(ply, 0);
+    const auto killer2 = killers.probe(ply, 1);
+
+    for (std::size_t i = 0; i < scored_; ++i) {
+      scores_[i] = score(moves_[i], hash_move, killer1, killer2);
+    }
+  }
+
+  // Quiescence: every move there is a capture or a promotion, so MVV-LVA is
+  // the whole ordering—there are no killers or quiet moves to rank.
+  explicit OrderedMoves(MoveList& moves)
+      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)) {
+    for (std::size_t i = 0; i < scored_; ++i) {
+      scores_[i] = noisy_move_score(moves_[i]);
+    }
+  }
+
+  // Hand over the best move not yet searched, swapping it into `index` so that
+  // `moves` ends up in searched order and the tail stays untouched. Ties keep
+  // generation order, which is what makes a search reproducible.
+  const Move& select(std::size_t index) {
+    if (index >= scored_) {
+      return moves_[index];
+    }
+
+    std::size_t best = index;
+    for (std::size_t i = index + 1; i < scored_; ++i) {
+      if (scores_[i] > scores_[best]) {
+        best = i;
+      }
+    }
+
+    if (best != index) {
+      std::swap(moves_[index], moves_[best]);
+      std::swap(scores_[index], scores_[best]);
+    }
+
+    return moves_[index];
+  }
+
+private:
+  static int score(const Move& mv, const std::optional<Move>& hash_move,
+                   const std::optional<Move>& killer1, const std::optional<Move>& killer2) {
+    // The hash move is the best move a previous (usually deeper) search found
+    // here, so nothing outranks it—not even a queen capture.
+    if (hash_move.has_value() && mv == *hash_move) {
+      return ORDER_HASH_MOVE;
+    }
+
+    if (mv.captured_piece.has_value() || mv.promotion_piece.has_value()) {
+      return ORDER_NOISY + noisy_move_score(mv);
+    }
+
+    if (killer1.has_value() && mv == *killer1) {
+      return ORDER_KILLER_1;
+    }
+
+    if (killer2.has_value() && mv == *killer2) {
+      return ORDER_KILLER_2;
+    }
+
+    return 0;
+  }
+
+  MoveList& moves_;
+  std::size_t scored_;
+  // Deliberately left uninitialised: entries [0, scored_) are written by the
+  // constructor before anything reads them, and zeroing a kilobyte at every
+  // node would cost more than the ordering it serves.
+  std::array<int, MAX_SCORED_MOVES> scores_; // NOLINT(*-member-init)
+};
+
+} // namespace
 
 void detail::order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
                          const std::optional<Move>& hash_move) {
-  const auto killer1 = killers.probe(ply, 0);
-  const auto killer2 = killers.probe(ply, 1);
-
-  std::ranges::sort(moves, [&](const Move& a, const Move& b) {
-    const auto score = [&](const Move& mv) {
-      // The hash move is the best move a previous (usually deeper) search
-      // found here, so nothing outranks it—not even a queen capture.
-      if (hash_move.has_value() && mv == *hash_move) {
-        return std::numeric_limits<int>::min();
-      }
-      if (mv.captured_piece.has_value()) {
-        return capture_priority_score(mv);
-      }
-      if (mv.promotion_piece.has_value()) {
-        return 1;
-      }
-      if (killer1.has_value() && mv == *killer1) {
-        return 2;
-      }
-      if (killer2.has_value() && mv == *killer2) {
-        return 3;
-      }
-      return 4;
-    };
-
-    return score(a) < score(b);
-  });
+  // The eager form: run the lazy selection all the way to the end. The search
+  // itself never calls this—it asks for one move at a time and usually stops
+  // after the first—but "the whole list, in order" is what a test can read.
+  OrderedMoves ordering(moves, killers, ply, hash_move);
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    ordering.select(i);
+  }
 }
 
 void detail::order_quiescence_moves(MoveList& moves) {
-  std::ranges::sort(moves, [](const Move& a, const Move& b) {
-    return noisy_move_score(a) > noisy_move_score(b);
-  });
+  OrderedMoves ordering(moves);
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    ordering.select(i);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -657,9 +736,11 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
 
   // Only search noisy moves (captures and promotions)
   MoveList moves = pseudo_legal_noisy_moves(pos);
-  detail::order_quiescence_moves(moves);
+  OrderedMoves ordering(moves);
 
-  for (const auto& mv : moves) {
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    const Move mv = ordering.select(i);
+
     pos.make_move(mv);
 
     // Skip illegal moves (leave king in check)
@@ -848,7 +929,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // search is finding would make us search the same move twice.
   const std::optional<Move> hash_move = decode_tt_move(hash_move_packed, moves);
 
-  detail::order_moves(moves, killers, report.ply, hash_move);
+  OrderedMoves ordering(moves, killers, report.ply, hash_move);
 
   bool has_searched_one = false;
   Bound tt_bound = Bound::Upper;
@@ -856,10 +937,12 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // The best move THIS search finds, kept apart from `hash_move` above.
   std::optional<Move> best_move = std::nullopt;
 
-  // The hash move is simply the first entry of `moves` now, so it goes through
-  // the same loop as everything else: same legality check, same PVS treatment,
-  // and—crucially—exactly once.
-  for (const auto& mv : moves) {
+  // The hash move is simply the first move the ordering hands over, so it goes
+  // through the same loop as everything else: same legality check, same PVS
+  // treatment, and—crucially—exactly once.
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    const Move mv = ordering.select(i);
+
     pos.make_move(mv);
 
     if (is_in_check(colour_to_move, pos.board)) {
