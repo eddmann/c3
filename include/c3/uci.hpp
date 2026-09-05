@@ -37,6 +37,29 @@
 // the search does with the two. `go movetime` is the exception—there the GUI
 // really has named a single deadline, so both limits are that number.
 //
+// THE `bench` COMMAND (not part of UCI)
+// `bench [depth]` searches a fixed list of positions to a fixed depth and
+// reports the total node count. Its whole value is that the number is
+// REPRODUCIBLE: two runs of the same build must print the same total, so a
+// change to search or evaluation announces itself as a changed bench, and two
+// builds that print the same number are searching the same tree. That is why
+// the transposition table is cleared before each position—a table carried over
+// from the previous one would make the total depend on the order and on
+// whatever the engine happened to be doing beforehand.
+//
+// It runs on the main thread, so nothing else is answered until it finishes,
+// and it leaves the transposition table empty. Neither matters: bench is a
+// tool for whoever is developing the engine, not something a GUI sends.
+//
+// Output is `info string` lines, including the final
+//
+//     info string bench nodes <N> nps <M>
+//
+// Some engines print a bare `<N> nodes <M> nps` for scripts to grep. This one
+// does not: every line this engine writes has to be a line a GUI can parse and
+// skip, and bare text is not. Scripts can match on the `bench nodes` line just
+// as easily.
+//
 // Anything else we want to say—diagnostics, warnings about input we did not
 // understand—travels as `info string ...`, the protocol's free-text line. The
 // UCI spec requires unknown commands and unknown tokens to be tolerated rather
@@ -71,6 +94,7 @@ enum class CommandType {
   DoMove,
   Position,
   Go,
+  Bench,
   SetOption,
   Stop,
   Quit,
@@ -138,6 +162,7 @@ struct SetOptionCommand {
 struct UciCommand {
   CommandType type{CommandType::Init};
   std::optional<std::uint8_t> perft_depth{};
+  std::optional<std::uint8_t> bench_depth{};
   std::optional<UciMove> move{};
   std::optional<PositionCommand> position{};
   std::optional<GoParams> go_params{};

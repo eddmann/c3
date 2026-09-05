@@ -916,6 +916,85 @@ TEST(UciLoop, SecondGoReusesTheTableTheFirstOneFilled) {
   EXPECT_LT(counts[1], counts[0] / 2) << output;
 }
 
+// -----------------------------------------------------------------------------
+// bench
+// -----------------------------------------------------------------------------
+
+namespace {
+
+// The `info string bench nodes <N> nps <M>` line's node total, or nullopt when
+// the run did not produce one.
+std::optional<std::uint64_t> bench_total(const std::string& output) {
+  for (const auto& line : lines_starting_with(output, "info string bench nodes ")) {
+    std::istringstream fields(line.substr(std::string("info string bench nodes ").size()));
+    std::uint64_t nodes = 0;
+    if (fields >> nodes) {
+      return nodes;
+    }
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
+TEST(UciBench, RunsEveryPositionAndTotalsTheNodes) {
+  const auto output = run_uci("bench 1\nquit\n");
+
+  // One line per position, then the timing line and the total.
+  const auto positions = lines_starting_with(output, "info string bench position ");
+  EXPECT_EQ(positions.size(), 12U) << output;
+
+  const auto total = bench_total(output);
+  ASSERT_TRUE(total.has_value()) << output;
+  EXPECT_GT(*total, 0U) << output;
+  EXPECT_NE(output.find(" nps "), std::string::npos) << output;
+}
+
+TEST(UciBench, TwoRunsAgreeExactly) {
+  // The whole point of bench: the same build searching the same positions must
+  // reach the same total, or the number cannot be compared between builds.
+  // Clearing the table before each position is what makes that true.
+  const auto first = bench_total(run_uci("bench 1\nquit\n"));
+  const auto second = bench_total(run_uci("bench 1\nquit\n"));
+
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(*first, *second);
+}
+
+TEST(UciBench, IsUnaffectedByWhatCameBeforeIt) {
+  // A search run first leaves the table full. If bench inherited it, its total
+  // would depend on the session's history rather than on the engine.
+  const auto cold = bench_total(run_uci("bench 1\nquit\n"));
+  const auto warm = bench_total(run_uci("position startpos\ngo depth 4\nbench 1\nquit\n"));
+
+  ASSERT_TRUE(cold.has_value());
+  ASSERT_TRUE(warm.has_value());
+  EXPECT_EQ(*cold, *warm);
+}
+
+TEST(UciBench, DeeperRunsSearchMore) {
+  const auto shallow = bench_total(run_uci("bench 1\nquit\n"));
+  const auto deeper = bench_total(run_uci("bench 3\nquit\n"));
+
+  ASSERT_TRUE(shallow.has_value());
+  ASSERT_TRUE(deeper.has_value());
+  EXPECT_GT(*deeper, *shallow);
+}
+
+TEST(UciBench, EveryLineIsAValidUciLine) {
+  // bench is a developer tool, but it still writes to the same stream a GUI is
+  // reading, so it may not emit bare text.
+  const auto output = run_uci("bench 1\nquit\n");
+
+  for (const auto& line : split_lines(output)) {
+    if (line.empty()) {
+      continue;
+    }
+    EXPECT_EQ(line.rfind("info ", 0), 0U) << "not a UCI line: " << line;
+  }
+}
+
 TEST(UciLoop, HashOptionStopsTheSearchBeforeResizingTheTable) {
   // Resizing frees the memory the search is reading, so the search must be
   // joined before the table is touched. The visible consequence is that the

@@ -1,12 +1,14 @@
 #include "c3/uci.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -477,6 +479,14 @@ UciCommand parse_command(const std::string& command) {
       throw std::runtime_error("invalid move");
     }
     result.move = mv;
+  } else if (head == "bench") {
+    result.type = CommandType::Bench;
+    // The depth is optional: `bench` on its own is the number people compare
+    // between builds, and `bench <depth>` is for when a quick or a deep run is
+    // wanted instead.
+    if (!args.empty()) {
+      result.bench_depth = parse_u8_attr("depth", args[0]);
+    }
   } else if (head == "position") {
     result.type = CommandType::Position;
     result.position = parse_position(args);
@@ -958,6 +968,93 @@ void start_search(SearchHandle& handle, const GoParams& params, const Position& 
   handle.gate = gate;
 }
 
+// ---------------------------------------------------------------------------
+// BENCH
+// ---------------------------------------------------------------------------
+// Twelve positions chosen to make the total node count mean something. A bench
+// dominated by one kind of position would only measure the search's behaviour
+// there, so the list spans what a game actually contains: the opening (where
+// the branching factor is highest), quiet middlegames, sharp tactical ones
+// (where the quiescence search does most of the work), and endgames (where the
+// tree is narrow and deep and the transposition table matters most).
+//
+// startpos and Kiwipete are in the list because they are the two positions
+// everyone recognises—if a bench looks wrong, they are the first thing to
+// check against by hand.
+//
+// The list is FIXED. Changing it changes the bench number, which is the one
+// thing the bench must not do for reasons unrelated to the search itself.
+// ---------------------------------------------------------------------------
+
+constexpr std::array<const char*, 12> BENCH_POSITIONS = {
+    // Opening: the start position, and a symmetrical closed opening.
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "rnbqkb1r/pp3ppp/4pn2/2pp4/3P4/2N1PN2/PPP2PPP/R1BQKB1R w KQkq - 0 6",
+    // Kiwipete and friends: dense middlegames full of captures and castling.
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    // Tactical: promotions, hanging pieces, forcing lines.
+    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    // Queenless middlegame: quiet, and dominated by piece activity.
+    "2r3k1/pp3pp1/4p2p/3nP3/3P4/P4N2/1P3PPP/2R3K1 w - - 0 25",
+    // Endgames: narrow and deep, where the table earns the most.
+    "8/8/4R3/5k2/8/8/4K3/6r1 w - - 0 50",
+    "8/8/8/4k3/8/4K3/4P3/8 w - - 0 60",
+    "8/5ppp/8/8/8/8/5PPP/4K1k1 w - - 0 45",
+};
+
+// Deep enough that the search does real work at every position, shallow enough
+// that a Release build finishes the whole list in a few seconds (measured at
+// roughly 2.4s; depth 9 was over 7s, which is too slow to run casually).
+constexpr std::uint8_t BENCH_DEFAULT_DEPTH = 8;
+
+// Runs the bench on the main thread and reports the total.
+//
+// The Engine's table is CLEARED before each position, which is the point: a
+// table still holding the previous position's results would make each search
+// cheaper by an amount that depends on the order of the list, and the total
+// would stop being reproducible. The engine's own game position is untouched—
+// bench searches copies—but the table is left empty afterwards.
+void run_bench(Engine& engine, std::uint8_t depth,
+               const std::function<void(const std::string&)>& write_line) {
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = depth;
+
+  std::uint64_t total_nodes = 0;
+  const auto started = std::chrono::steady_clock::now();
+
+  for (std::size_t i = 0; i < BENCH_POSITIONS.size(); ++i) {
+    engine.transposition_table().clear();
+
+    Position pos = Position::from_fen(BENCH_POSITIONS[i]);
+    const auto result =
+        search::search(pos, engine.transposition_table(), limits, reporter, nullptr);
+
+    total_nodes += result.nodes;
+
+    std::string line = "info string bench position " + std::to_string(i + 1) + "/" +
+                       std::to_string(BENCH_POSITIONS.size()) + " depth " +
+                       std::to_string(result.depth) + " nodes " + std::to_string(result.nodes);
+    if (!result.pv.empty()) {
+      line += " bestmove " + to_uci_string(to_uci_move(result.pv[0]));
+    }
+    write_line(line);
+  }
+
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  const auto ms = std::max<std::int64_t>(elapsed.count(), 1);
+  const auto nps = total_nodes * 1000 / static_cast<std::uint64_t>(ms);
+
+  write_line("info string bench time " + std::to_string(ms) + " ms");
+  write_line("info string bench nodes " + std::to_string(total_nodes) + " nps " +
+             std::to_string(nps));
+}
+
 } // namespace
 
 namespace {
@@ -1072,6 +1169,13 @@ void run_loop_impl(std::istream& in,
         search_handle.stop();
         start_search(search_handle, *cmd.go_params, engine.position(), engine.transposition_table(),
                      out, out_mutex);
+        break;
+
+      case CommandType::Bench:
+        // Runs on this thread and clears the table as it goes, so any search
+        // in flight has to be gone first.
+        search_handle.stop();
+        run_bench(engine, cmd.bench_depth.value_or(BENCH_DEFAULT_DEPTH), write_line);
         break;
 
       case CommandType::SetOption:
@@ -1231,6 +1335,10 @@ std::string run_script_for_test(
       // has already validated the value, which is all these tests check.
       break;
 
+    case CommandType::Bench:
+      // Not offered here: bench needs an Engine (for the table it clears
+      // between positions) and this harness only has a bare Position. The
+      // `UciLoop` tests drive the real loop, which is where bench lives.
     case CommandType::NoOp:
     case CommandType::Stop:
     case CommandType::Quit:
