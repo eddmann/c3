@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -80,7 +81,7 @@ std::size_t moves_from_square(const MoveList& moves, Square from) {
 
 // The deepest fixtures are marked in the fixture file rather than hidden in a
 // second file, so the whole suite stays in one place and one loader.
-enum class PerftFixtureSet { Everyday, Slow };
+enum class PerftFixtureSet : std::uint8_t { Everyday, Slow };
 
 bool is_slow_perft_record(const fixtures::PerftRecord& record) {
   return record.name.starts_with("slow-");
@@ -685,7 +686,7 @@ TEST(Movegen, RookCaptureOnCornerRemovesTheDefendersCastlingRight) {
   Position pos = parse_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
   const auto moves = legal_moves(pos);
 
-  const auto capture = std::ranges::find_if(
+  const auto* const capture = std::ranges::find_if(
       moves, [](const Move& mv) { return mv.from == Square::A1 && mv.to == Square::A8; });
   ASSERT_NE(capture, moves.end());
 
@@ -703,7 +704,7 @@ TEST(Movegen, PromotionCaptureOnCornerRemovesTheDefendersCastlingRight) {
   Position pos = parse_fen("r3k2r/1P6/8/8/8/8/8/R3K2R w KQkq - 0 1");
   const auto moves = legal_moves(pos);
 
-  const auto promotion_capture = std::ranges::find_if(moves, [](const Move& mv) {
+  const auto* const promotion_capture = std::ranges::find_if(moves, [](const Move& mv) {
     return mv.from == Square::B7 && mv.to == Square::A8 && mv.promotion_piece == Piece::WQ;
   });
   ASSERT_NE(promotion_capture, moves.end());
