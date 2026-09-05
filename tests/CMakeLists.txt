@@ -77,6 +77,12 @@ add_dependencies(c3_tests generate_magic)
 include(GoogleTest)
 gtest_discover_tests(c3_tests)
 
+# The deep perft fixtures skip themselves unless C3_SLOW_PERFT is set; this
+# entry supplies it, so they can be run with `ctest -L slow`.
+add_test(NAME Perft.SlowOptIn COMMAND c3_tests --gtest_filter=Perft.SlowFixturesMatch)
+set_tests_properties(Perft.SlowOptIn PROPERTIES
+  ENVIRONMENT "C3_SLOW_PERFT=1" LABELS slow TIMEOUT 900)
+
 if(Python3_Interpreter_FOUND)
   add_test(NAME Fastchess.SummaryFixture
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/run_fastchess_gauntlet.py

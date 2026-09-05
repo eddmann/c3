@@ -18,15 +18,15 @@
 //
 // 3. PSEUDO-LEGAL THEN FILTER
 //    We generate "pseudo-legal" moves (moves that follow piece movement rules)
-//    then filter out moves that leave our king in check. This is often faster
-//    than generating only legal moves directly, especially with bitboards.
+//    then filter out the ones that leave our king in check, by playing each
+//    move and taking it back. Generating only legal moves directly is faster
+//    but far more intricate; see legal_moves below for the full trade-off.
 //
 // =============================================================================
 
 #include "c3/movegen.hpp"
 
 #include <array>
-#include <cassert>
 
 #include "c3/bitboard.hpp"
 #include "c3/magic.hpp"
@@ -143,6 +143,10 @@ inline constexpr auto KING_ATTACKS = make_king_attacks();
 
 constexpr std::array<std::uint8_t, 2> PAWN_START_RANKS = {1, 6};
 
+// The rank on which a pawn of each colour promotes. A pawn standing there has
+// already crossed the board and cannot advance any further.
+constexpr std::array<std::uint8_t, 2> PAWN_PROMOTION_RANKS = {7, 0};
+
 inline constexpr Bitboard WHITE_KING_CASTLING_PATH = Square::F1 | Square::G1;
 inline constexpr Bitboard BLACK_KING_CASTLING_PATH = Square::F8 | Square::G8;
 inline constexpr Bitboard WHITE_QUEEN_CASTLING_PATH = Square::B1 | Square::C1 | Square::D1;
@@ -150,6 +154,18 @@ inline constexpr Bitboard BLACK_QUEEN_CASTLING_PATH = Square::B8 | Square::C8 | 
 
 Bitboard pawn_attacks(Square square, Colour colour, const Board& board) {
   return PAWN_ATTACKS[colour_index(colour)][square.index()] & board.pieces_by_colour(!colour);
+}
+
+// The pawns of `colour` that attack `square`, found by reading the attack table
+// backwards: a pawn attacks a square exactly when a pawn of the opposite colour
+// standing on that square would attack the pawn. So we probe from the target
+// square with the colours swapped, and one table serves both directions.
+//
+// This answers two questions at once. "Which enemy pawns cover this square?" is
+// what attack detection needs, and "which of our pawns could capture onto the
+// en passant square?" is the same query asked from the other side.
+Bitboard pawn_attackers_of(Square square, Colour colour, const Board& board) {
+  return PAWN_ATTACKS[colour_index(!colour)][square.index()] & board.pieces(pawn(colour));
 }
 
 Bitboard knight_attacks(Square square) {
@@ -177,8 +193,10 @@ Bitboard king_attacks(Square square) {
 // occupancy bits and shifting produces a unique index for each blocker pattern.
 // This index looks up the precomputed attack bitboard.
 //
-// The trade-off: we need ~2MB of lookup tables, but attack generation becomes
-// a single multiply, shift, and array lookup—extremely fast.
+// The trade-off is memory: the two tables hold 107,648 attack bitboards between
+// them (102,400 for rooks, 5,248 for bishops), which is about 841 KiB. In
+// exchange, attack generation becomes a single multiply, shift, and array
+// lookup—extremely fast.
 //
 // See magic.hpp for the precomputed tables and magic numbers.
 // =============================================================================
@@ -198,6 +216,13 @@ Bitboard rook_attacks(Square square, const Board& board) {
 }
 
 Bitboard pawn_advances(Square square, Colour colour, const Board& board) {
+  // Legal play never leaves a pawn on rank 1 or 8, because it would have
+  // promoted on arrival, but FEN syntax allows it and a GUI may hand us such a
+  // position. Asking for the square ahead would step off the 64-square board.
+  if (square.rank() == PAWN_PROMOTION_RANKS[colour_index(colour)]) {
+    return 0;
+  }
+
   const Square one_ahead = square.advance(colour);
 
   if (board.has_piece_at(one_ahead)) {
@@ -229,15 +254,30 @@ Bitboard pawn_advances(Square square, Colour colour, const Board& board) {
 // We only check the squares the KING passes through (F1/D1 for white).
 // =============================================================================
 
+// A castling right in a FEN is only a claim about the past, and in an edited or
+// hand-written position the pieces it talks about may not be there at all.
+// Confirm both are home before offering the move: otherwise a king sitting on
+// d1 would happily "castle" to g1, landing two files from where a rook never
+// stood.
+bool castling_pieces_at_home(Colour colour, Square king_home, Square rook_home,
+                             const Board& board) {
+  return (board.pieces(king(colour)) & king_home) != 0 &&
+         (board.pieces(rook(colour)) & rook_home) != 0;
+}
+
 Bitboard white_castling(CastlingRights rights, const Board& board) {
   Bitboard moves = 0;
 
-  if ((rights & CastlingRight::WhiteKing) && !board.has_occupancy_at(WHITE_KING_CASTLING_PATH) &&
+  if ((rights & CastlingRight::WhiteKing) &&
+      castling_pieces_at_home(Colour::White, Square::E1, Square::H1, board) &&
+      !board.has_occupancy_at(WHITE_KING_CASTLING_PATH) &&
       !is_attacked(Square::F1, Colour::Black, board)) {
     moves |= Square::G1;
   }
 
-  if ((rights & CastlingRight::WhiteQueen) && !board.has_occupancy_at(WHITE_QUEEN_CASTLING_PATH) &&
+  if ((rights & CastlingRight::WhiteQueen) &&
+      castling_pieces_at_home(Colour::White, Square::E1, Square::A1, board) &&
+      !board.has_occupancy_at(WHITE_QUEEN_CASTLING_PATH) &&
       !is_attacked(Square::D1, Colour::Black, board)) {
     moves |= Square::C1;
   }
@@ -248,12 +288,16 @@ Bitboard white_castling(CastlingRights rights, const Board& board) {
 Bitboard black_castling(CastlingRights rights, const Board& board) {
   Bitboard moves = 0;
 
-  if ((rights & CastlingRight::BlackKing) && !board.has_occupancy_at(BLACK_KING_CASTLING_PATH) &&
+  if ((rights & CastlingRight::BlackKing) &&
+      castling_pieces_at_home(Colour::Black, Square::E8, Square::H8, board) &&
+      !board.has_occupancy_at(BLACK_KING_CASTLING_PATH) &&
       !is_attacked(Square::F8, Colour::White, board)) {
     moves |= Square::G8;
   }
 
-  if ((rights & CastlingRight::BlackQueen) && !board.has_occupancy_at(BLACK_QUEEN_CASTLING_PATH) &&
+  if ((rights & CastlingRight::BlackQueen) &&
+      castling_pieces_at_home(Colour::Black, Square::E8, Square::A8, board) &&
+      !board.has_occupancy_at(BLACK_QUEEN_CASTLING_PATH) &&
       !is_attacked(Square::D8, Colour::White, board)) {
     moves |= Square::C8;
   }
@@ -274,12 +318,10 @@ Bitboard castling_moves(CastlingRights rights, Colour colour, const Board& board
 
 } // namespace
 
-// Find pawns that can capture en passant to a given square.
-// Uses reverse attack lookup: which squares attack the en passant square?
-// Those are the potential source squares for capturing pawns.
+// Find pawns that can capture en passant to a given square: the pawns attacking
+// the empty square the double-pushed pawn skipped over.
 Bitboard en_passant_sources(Square en_passant_square, Colour colour, const Board& board) {
-  return PAWN_ATTACKS[colour_index(!colour)][en_passant_square.index()] &
-         board.pieces(pawn(colour));
+  return pawn_attackers_of(en_passant_square, colour, board);
 }
 
 Bitboard attacks_for(Piece piece, Square square, const Board& board) {
@@ -318,33 +360,55 @@ Bitboard attacks_for(Piece piece, Square square, const Board& board) {
 // =============================================================================
 
 Bitboard get_attackers(Square square, Colour colour, const Board& board) {
-  const Bitboard pawn_mask = pawn_attacks(square, !colour, board);
   const Bitboard knight_mask = knight_attacks(square);
   const Bitboard bishop_mask = bishop_attacks(square, board);
   const Bitboard rook_mask = rook_attacks(square, board);
   const Bitboard queen_mask = bishop_mask | rook_mask; // Queen = bishop + rook
   const Bitboard king_mask = king_attacks(square);
 
-  return (board.pieces(pawn(colour)) & pawn_mask) | (board.pieces(knight(colour)) & knight_mask) |
+  return pawn_attackers_of(square, colour, board) | (board.pieces(knight(colour)) & knight_mask) |
          (board.pieces(bishop(colour)) & bishop_mask) | (board.pieces(rook(colour)) & rook_mask) |
          (board.pieces(queen(colour)) & queen_mask) | (board.pieces(king(colour)) & king_mask);
 }
 
+// This is the hottest query in the engine: the legality filter asks it once for
+// every move it tries, so it runs tens of millions of times a second. The
+// obvious optimisation is to test the cheap leapers first and return at the
+// first attacker found, instead of building all six attacker sets.
+//
+// It was tried, and measured, and it did not pay. The branchless get_attackers
+// above has nothing to mispredict: its six sets are independent, so the
+// processor computes them side by side while it waits on the two magic table
+// lookups. An early-exit version serialises that work behind a chain of
+// branches, and the tests it hopes to skip are the sliding pieces, which have
+// to be asked last and are exactly the pieces that give most checks. Perft
+// timings for the two forms (startpos depth 5 and kiwipete depth 4, alternating
+// runs) came out the same to within the noise of the machine.
+//
+// So the simple form stays. get_attackers is the one place attacks are defined,
+// and callers that only need a yes or no read better for it.
 bool is_attacked(Square square, Colour colour, const Board& board) {
   return get_attackers(square, colour, board) != 0;
 }
 
 // Check if a side's king is in check. Used for move legality filtering.
+//
+// A side may have no king at all: unit tests and analysis positions are often
+// built from a handful of pieces. No king means there is nothing to check, and
+// saying so here keeps us from probing the attack tables with the "square 64"
+// that scanning an empty bitboard reports.
 bool is_in_check(Colour colour, const Board& board) {
   const Bitboard king_bb = board.pieces(king(colour));
-  assert(king_bb != 0);
-  const Square king_square = Square::first_occupied(king_bb);
-  return is_attacked(king_square, !colour, board);
+  if (king_bb == 0) {
+    return false;
+  }
+
+  return is_attacked(Square::first_occupied(king_bb), !colour, board);
 }
 
 MoveList pseudo_legal_moves(const Position& pos) {
   MoveList moves;
-  moves.reserve(MAX_LEGAL_MOVES);
+  moves.reserve(MOVE_LIST_RESERVE);
 
   const Colour colour_to_move = pos.colour_to_move;
 
@@ -413,7 +477,7 @@ MoveList pseudo_legal_moves(const Position& pos) {
 
 MoveList pseudo_legal_noisy_moves(const Position& pos) {
   MoveList moves;
-  moves.reserve(MAX_LEGAL_MOVES);
+  moves.reserve(MOVE_LIST_RESERVE);
 
   const Colour colour_to_move = pos.colour_to_move;
   const Bitboard captures_mask = pos.board.pieces_by_colour(!colour_to_move);
@@ -479,6 +543,61 @@ MoveList pseudo_legal_noisy_moves(const Position& pos) {
 }
 
 // =============================================================================
+// PSEUDO-LEGAL THEN FILTER: FROM CANDIDATE MOVES TO LEGAL MOVES
+// =============================================================================
+// A pseudo-legal move obeys the movement rules of its piece but may still be
+// illegal, because it leaves (or puts) its own king under attack. There are two
+// ways to weed those out:
+//
+//   1. Never generate them. Before generating, work out which of our pieces are
+//      pinned against the king and along which ray each may still move, plus,
+//      when we are in check, the squares that block or capture the checker.
+//      Nothing illegal is ever produced, but the bookkeeping is substantial and
+//      easy to get subtly wrong (en passant alone has two ways to expose a king).
+//
+//   2. Generate everything, then play each move and ask whether our king ended
+//      up attacked. That is what this engine does: one make/unmake and one
+//      is_in_check per candidate move, and the rules live in exactly one place.
+//
+// The trade-off is speed for simplicity. Option 2 pays a make/unmake for moves
+// that turn out to be illegal (a handful per position in practice, since pins
+// are rare) and calls is_in_check for every candidate. For an engine written to
+// be read, that is a good deal: correctness here is worth far more than the few
+// percent, and the search recoups some of it by pruning most branches before
+// their moves are ever filtered.
+// =============================================================================
+
+namespace {
+
+// Filters in place. Every move is taken back, so `pos` is left exactly as found.
+MoveList filter_to_legal(Position& pos) {
+  MoveList moves = pseudo_legal_moves(pos);
+
+  std::erase_if(moves, [&pos](const Move& mv) {
+    pos.make_move(mv);
+    // make_move has flipped the side to move, so the mover is now the opponent.
+    const bool leaves_own_king_attacked = is_in_check(pos.opponent_colour(), pos.board);
+    pos.unmake_move(mv);
+    return leaves_own_king_attacked;
+  });
+
+  return moves;
+}
+
+} // namespace
+
+MoveList legal_moves(const Position& pos) {
+  // The filter has to play moves out on a board, so it works on a copy and
+  // leaves the caller's position untouched. That copy is not free: a Position
+  // carries the board, the Zobrist key and the whole make/unmake history, so
+  // this helper is for callers off the search hot path (UCI, tests, tools).
+  // Code that already owns a mutable Position should make and unmake moves
+  // itself, the way perft does below.
+  Position working = pos;
+  return filter_to_legal(working);
+}
+
+// =============================================================================
 // PERFT: Performance Test / Move Generation Validation
 // =============================================================================
 // Perft counts all leaf nodes at a given depth. It's the gold standard for
@@ -495,16 +614,25 @@ std::uint64_t perft(Position& pos, std::uint8_t depth) {
     return 1;
   }
 
+  const MoveList moves = filter_to_legal(pos);
+
+  // Filtering first costs something: at every node above the last ply each legal
+  // move is now played twice, once by the filter and once by the recursion.
+  //
+  // Bulk counting is what pays for it. At depth 1 every legal move is itself a
+  // leaf, so the length of the filtered list is the answer and no move needs to
+  // be played a second time. A perft tree is nearly all leaves, so the saving
+  // at the last ply dwarfs the double work at the handful of nodes above it,
+  // and this is measurably faster than the make-then-test loop it replaced.
+  if (depth == 1) {
+    return moves.size();
+  }
+
   std::uint64_t nodes = 0;
 
-  for (const auto& mv : pseudo_legal_moves(pos)) {
+  for (const auto& mv : moves) {
     pos.make_move(mv);
-
-    // Filter out moves that leave own king in check (pseudo-legal → legal)
-    if (!is_in_check(pos.opponent_colour(), pos.board)) {
-      nodes += perft(pos, static_cast<std::uint8_t>(depth - 1));
-    }
-
+    nodes += perft(pos, static_cast<std::uint8_t>(depth - 1));
     pos.unmake_move(mv);
   }
 

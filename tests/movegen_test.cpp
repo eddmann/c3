@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <ranges>
 #include <string_view>
 
 #include "c3/attacks.hpp"
+#include "c3/castling.hpp"
 #include "c3/movegen.hpp"
 #include "c3/piece.hpp"
 #include "c3/position.hpp"
@@ -47,20 +49,53 @@ void assert_pseudo_legal_move_count(std::string_view fen, std::size_t count) {
 }
 
 void assert_legal_move_count(std::string_view fen, std::size_t count) {
-  Position pos = parse_fen(fen);
-  std::size_t legal = 0;
+  EXPECT_EQ(legal_moves(parse_fen(fen)).size(), count) << fen;
+}
 
-  for (const auto& mv : pseudo_legal_moves(pos)) {
-    pos.make_move(mv);
+// Whatever is_attacked does internally, it must answer exactly what the full
+// attacker set says: callers pick between the two on cost, never on meaning.
+void assert_attacked_matches_attackers(std::string_view fen) {
+  const Position pos = parse_fen(fen);
 
-    if (!is_in_check(pos.opponent_colour(), pos.board)) {
-      ++legal;
+  for (std::uint8_t index = 0; index < 64; ++index) {
+    const Square square = Square::from_index(index);
+
+    for (const Colour attacker : {Colour::White, Colour::Black}) {
+      EXPECT_EQ(is_attacked(square, attacker, pos.board),
+                get_attackers(square, attacker, pos.board) != 0)
+          << fen << " " << square;
+    }
+  }
+}
+
+std::size_t moves_from_square(const MoveList& moves, Square from) {
+  return static_cast<std::size_t>(
+      std::ranges::count_if(moves, [from](const Move& mv) { return mv.from == from; }));
+}
+
+// The deepest fixtures are marked in the fixture file rather than hidden in a
+// second file, so the whole suite stays in one place and one loader.
+enum class PerftFixtureSet { Everyday, Slow };
+
+bool is_slow_perft_record(const fixtures::PerftRecord& record) {
+  return record.name.starts_with("slow-");
+}
+
+void assert_perft_fixtures_match(PerftFixtureSet set) {
+  const auto records = fixtures::load_perft(fixtures::perft_path());
+  std::size_t checked = 0;
+
+  for (const auto& record : records) {
+    if (is_slow_perft_record(record) != (set == PerftFixtureSet::Slow)) {
+      continue;
     }
 
-    pos.unmake_move(mv);
+    Position pos = Position::from_fen(record.fen);
+    EXPECT_EQ(record.nodes, perft(pos, static_cast<std::uint8_t>(record.depth))) << record.name;
+    ++checked;
   }
 
-  EXPECT_EQ(legal, count) << fen;
+  EXPECT_GT(checked, 0);
 }
 
 std::size_t castling_move_count(const MoveList& moves) {
@@ -83,6 +118,23 @@ TEST(Attacks, DetectCheck) {
   board.put_piece(Piece::WN, Square::D6);
 
   EXPECT_TRUE(is_in_check(Colour::Black, board));
+}
+
+TEST(Attacks, SideWithoutKingIsNotInCheck) {
+  // Test and analysis positions are routinely set up without a king; there is
+  // no king square to probe, so there is nothing that can be in check.
+  Board board = Board::empty();
+  board.put_piece(Piece::WQ, Square::D1);
+
+  EXPECT_FALSE(is_in_check(Colour::Black, board));
+}
+
+TEST(Attacks, IsAttackedAgreesWithAttackerSet) {
+  assert_attacked_matches_attackers("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  assert_attacked_matches_attackers(
+      "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+  assert_attacked_matches_attackers("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1");
+  assert_attacked_matches_attackers("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
 }
 
 TEST(Attacks, QueenAttacksHorizontal) {
@@ -143,6 +195,29 @@ TEST(Attacks, BlackPawnAttacksBothSides) {
 TEST(Attacks, KnightAttacks) {
   const Position pos = parse_fen("8/8/8/8/3N4/8/8/8 w - - 0 1");
   assert_attacks_eq(pos, "d4", {"c2", "e2", "b3", "f3", "b5", "f5", "c6", "e6"});
+}
+
+// Attack tables are built with bit shifts, which happily carry a piece off one
+// edge of the board and back on at the other. These four positions are the ones
+// where a missing file mask would show up.
+TEST(Attacks, KnightOnAFileDoesNotWrapAround) {
+  const Position pos = parse_fen("8/8/8/8/8/8/N7/8 w - - 0 1");
+  assert_attacks_eq(pos, "a2", {"c1", "c3", "b4"});
+}
+
+TEST(Attacks, KnightOnHFileDoesNotWrapAround) {
+  const Position pos = parse_fen("8/8/8/7N/8/8/8/8 w - - 0 1");
+  assert_attacks_eq(pos, "h5", {"g3", "f4", "f6", "g7"});
+}
+
+TEST(Attacks, KingOnAFileDoesNotWrapAround) {
+  const Position pos = parse_fen("8/8/8/8/K7/8/8/8 w - - 0 1");
+  assert_attacks_eq(pos, "a4", {"a3", "a5", "b3", "b4", "b5"});
+}
+
+TEST(Attacks, KingOnHFileDoesNotWrapAround) {
+  const Position pos = parse_fen("8/8/8/8/8/8/8/7K w - - 0 1");
+  assert_attacks_eq(pos, "h1", {"g1", "g2", "h2"});
 }
 
 TEST(Attacks, BishopAttacksOnEmptyBoard) {
@@ -213,6 +288,25 @@ TEST(Movegen, LegalMoveCountInCheckIsLimited) {
   assert_legal_move_count("rnbqkbnr/1pp1p1pp/p2p1p2/1B6/8/4P3/PPPP1PPP/RNBQK1NR b KQq - 0 1", 7);
 }
 
+TEST(Movegen, GeneratesTheMostCrowdedKnownPosition) {
+  // 218 legal moves is the highest count found for a legal chess position, and
+  // the figure MOVE_LIST_RESERVE is sized from.
+  const Position pos = parse_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1");
+  const auto moves = legal_moves(pos);
+
+  EXPECT_EQ(moves.size(), 218);
+  EXPECT_LE(moves.size(), MOVE_LIST_RESERVE);
+}
+
+TEST(Movegen, LegalMovesRejectMovesByAPinnedPiece) {
+  // The knight on e2 is the only thing between the king on e1 and the rook on
+  // e8, so every knight move is pseudo-legal yet none of them is legal.
+  const Position pos = parse_fen("4r3/8/8/8/8/8/4N3/4K3 w - - 0 1");
+
+  EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::E2), 6);
+  EXPECT_EQ(moves_from_square(legal_moves(pos), Square::E2), 0);
+}
+
 TEST(Movegen, WhitePawnMoves) {
   assert_pseudo_legal_move_count("8/8/8/8/8/8/4P3/8 w - - 0 1", 2);
 }
@@ -255,6 +349,48 @@ TEST(Movegen, PawnPromotionWithCapture) {
 
 TEST(Movegen, PawnPromotionWithAdvanceOrCapture) {
   assert_pseudo_legal_move_count("3q4/4P3/8/8/8/8/8/8 w - - 0 1", 8);
+}
+
+TEST(Movegen, WhitePawnOnPromotionRankHasNoAdvance) {
+  // Ranks 1 and 8 are unreachable for a pawn in a real game, but FEN syntax
+  // allows them, and a UCI GUI may hand us such a position. Advancing here
+  // would step off the 64-square board.
+  const Position pos = parse_fen("4k2P/8/8/8/8/8/8/4K3 w - - 0 1");
+  EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::H8), 0);
+}
+
+TEST(Movegen, BlackPawnOnPromotionRankHasNoAdvance) {
+  const Position pos = parse_fen("4k3/8/8/8/8/8/8/4Kp2 b - - 0 1");
+  EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::F1), 0);
+}
+
+TEST(Movegen, NoCastlingWhenKingHasLeftItsHomeSquare) {
+  // Castling rights in a FEN can disagree with the pieces on the board; the
+  // king must actually stand on e1/e8 for a castling move to make sense.
+  const Position pos = parse_fen("4k3/8/8/8/8/8/8/R2K3R w KQ - 0 1");
+  EXPECT_EQ(castling_move_count(pseudo_legal_moves(pos)), 0);
+}
+
+TEST(Movegen, OnlyKingSideCastlingWhenQueenRookIsMissing) {
+  const Position pos = parse_fen("4k3/8/8/8/8/8/8/4K2R w KQ - 0 1");
+  const auto moves = pseudo_legal_moves(pos);
+
+  EXPECT_EQ(castling_move_count(moves), 1);
+
+  const auto castling_move =
+      *std::ranges::find_if(moves, [](const Move& mv) { return mv.is_castling(); });
+  EXPECT_EQ(castling_move.to, Square::G1);
+}
+
+TEST(Movegen, OnlyQueenSideCastlingWhenKingRookIsMissing) {
+  const Position pos = parse_fen("r3k3/8/8/8/8/8/8/4K3 b kq - 0 1");
+  const auto moves = pseudo_legal_moves(pos);
+
+  EXPECT_EQ(castling_move_count(moves), 1);
+
+  const auto castling_move =
+      *std::ranges::find_if(moves, [](const Move& mv) { return mv.is_castling(); });
+  EXPECT_EQ(castling_move.to, Square::C8);
 }
 
 TEST(Movegen, CastleKingSideOnly) {
@@ -327,6 +463,52 @@ TEST(Movegen, EnPassantCaptureGeneratesBothCaptures) {
       2);
 }
 
+TEST(Movegen, RookCaptureOnCornerRemovesTheDefendersCastlingRight) {
+  // Capturing the a8 rook ends black's queenside castling, and moving the a1
+  // rook to get there ends white's.
+  Position pos = parse_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+  const auto moves = legal_moves(pos);
+
+  const auto capture = std::ranges::find_if(
+      moves, [](const Move& mv) { return mv.from == Square::A1 && mv.to == Square::A8; });
+  ASSERT_NE(capture, moves.end());
+
+  pos.make_move(*capture);
+
+  EXPECT_FALSE(pos.castling_rights.has(CastlingRight::BlackQueen));
+  EXPECT_FALSE(pos.castling_rights.has(CastlingRight::WhiteQueen));
+  EXPECT_TRUE(pos.castling_rights.has(CastlingRight::BlackKing));
+  EXPECT_TRUE(pos.castling_rights.has(CastlingRight::WhiteKing));
+}
+
+TEST(Movegen, PromotionCaptureOnCornerRemovesTheDefendersCastlingRight) {
+  // The rook leaves a8 without any rook of ours ever standing there, so the
+  // castling right has to be cleared from the destination square.
+  Position pos = parse_fen("r3k2r/1P6/8/8/8/8/8/R3K2R w KQkq - 0 1");
+  const auto moves = legal_moves(pos);
+
+  const auto promotion_capture = std::ranges::find_if(moves, [](const Move& mv) {
+    return mv.from == Square::B7 && mv.to == Square::A8 && mv.promotion_piece == Piece::WQ;
+  });
+  ASSERT_NE(promotion_capture, moves.end());
+
+  pos.make_move(*promotion_capture);
+
+  EXPECT_FALSE(pos.castling_rights.has(CastlingRight::BlackQueen));
+  EXPECT_TRUE(pos.castling_rights.has(CastlingRight::BlackKing));
+}
+
+TEST(Movegen, EnPassantCaptureExposingTheKingAlongTheRankIsIllegal) {
+  // Capturing en passant is the only move that empties two squares on the rank
+  // it leaves: both pawns disappear from the fifth rank, opening a line from
+  // the black rook on h5 straight to the white king on a5.
+  const Position pos = parse_fen("8/8/8/K2pP2r/8/8/8/7k w - d6 0 1");
+
+  const auto is_en_passant = [](const Move& mv) { return mv.is_en_passant; };
+  EXPECT_EQ(std::ranges::count_if(pseudo_legal_moves(pos), is_en_passant), 1);
+  EXPECT_EQ(std::ranges::count_if(legal_moves(pos), is_en_passant), 0);
+}
+
 TEST(Movegen, IgnoreFriendlyPieceCaptures) {
   assert_pseudo_legal_move_count("8/8/5p2/5P2/3N4/8/8/8 w - - 0 1", 7);
 }
@@ -334,11 +516,16 @@ TEST(Movegen, IgnoreFriendlyPieceCaptures) {
 // Perft -------------------------------------------------------------------
 
 TEST(Perft, FixturesMatch) {
-  const auto records = fixtures::load_perft(fixtures::perft_path());
+  assert_perft_fixtures_match(PerftFixtureSet::Everyday);
+}
 
-  for (const auto& record : records) {
-    Position pos = Position::from_fen(record.fen);
-    const auto nodes = perft(pos, static_cast<std::uint8_t>(record.depth));
-    EXPECT_EQ(record.nodes, nodes) << record.name;
+// The deepest positions count millions of nodes, which takes a minute or more
+// in this build because every move is checked by ASan and UBSan. They stay
+// opt-in so the everyday suite remains quick.
+TEST(Perft, SlowFixturesMatch) {
+  if (std::getenv("C3_SLOW_PERFT") == nullptr) {
+    GTEST_SKIP() << "set C3_SLOW_PERFT=1 to run the deep perft fixtures";
   }
+
+  assert_perft_fixtures_match(PerftFixtureSet::Slow);
 }
