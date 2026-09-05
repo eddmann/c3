@@ -50,6 +50,22 @@ void assert_legal_move_count(std::string_view fen, std::size_t count) {
   EXPECT_EQ(legal_moves(parse_fen(fen)).size(), count) << fen;
 }
 
+// is_attacked short-circuits while get_attackers collects every attacker; the
+// two must always agree about whether the square is attacked at all.
+void assert_attacked_matches_attackers(std::string_view fen) {
+  const Position pos = parse_fen(fen);
+
+  for (std::uint8_t index = 0; index < 64; ++index) {
+    const Square square = Square::from_index(index);
+
+    for (const Colour attacker : {Colour::White, Colour::Black}) {
+      EXPECT_EQ(is_attacked(square, attacker, pos.board),
+                get_attackers(square, attacker, pos.board) != 0)
+          << fen << " " << square;
+    }
+  }
+}
+
 std::size_t moves_from_square(const MoveList& moves, Square from) {
   return static_cast<std::size_t>(
       std::ranges::count_if(moves, [from](const Move& mv) { return mv.from == from; }));
@@ -84,6 +100,14 @@ TEST(Attacks, SideWithoutKingIsNotInCheck) {
   board.put_piece(Piece::WQ, Square::D1);
 
   EXPECT_FALSE(is_in_check(Colour::Black, board));
+}
+
+TEST(Attacks, IsAttackedAgreesWithAttackerSet) {
+  assert_attacked_matches_attackers("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  assert_attacked_matches_attackers(
+      "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+  assert_attacked_matches_attackers("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1");
+  assert_attacked_matches_attackers("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
 }
 
 TEST(Attacks, QueenAttacksHorizontal) {

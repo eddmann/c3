@@ -359,8 +359,40 @@ Bitboard get_attackers(Square square, Colour colour, const Board& board) {
          (board.pieces(queen(colour)) & queen_mask) | (board.pieces(king(colour)) & king_mask);
 }
 
+// is_attacked answers the same question as get_attackers, but only "is there
+// one?", so it can stop at the first attacker it finds. That matters: this is
+// the hottest query in the engine, asked once for every move the legality
+// filter tries and again for every castling path, so it runs tens of millions
+// of times a second.
+//
+// The order of the tests is deliberate. Knights, kings and pawns are answered
+// by a single array lookup and an AND. The sliding pieces cost a masked
+// multiply plus a lookup into an 841 KiB table that will not sit in L1, so they
+// are asked last and only when the cheap tests came up empty. Checks are given
+// by sliders more often than not, but when a leaper is giving check we are done
+// after a handful of instructions.
 bool is_attacked(Square square, Colour colour, const Board& board) {
-  return get_attackers(square, colour, board) != 0;
+  if ((board.pieces(knight(colour)) & KNIGHT_ATTACKS[square.index()]) != 0) {
+    return true;
+  }
+
+  if ((board.pieces(king(colour)) & KING_ATTACKS[square.index()]) != 0) {
+    return true;
+  }
+
+  // Reverse lookup again: a pawn of `colour` attacks this square exactly when
+  // the square, seen as a pawn of the opposite colour, attacks that pawn.
+  if ((board.pieces(pawn(colour)) & PAWN_ATTACKS[colour_index(!colour)][square.index()]) != 0) {
+    return true;
+  }
+
+  const Bitboard queens = board.pieces(queen(colour));
+
+  if (((board.pieces(bishop(colour)) | queens) & bishop_attacks(square, board)) != 0) {
+    return true;
+  }
+
+  return ((board.pieces(rook(colour)) | queens) & rook_attacks(square, board)) != 0;
 }
 
 // Check if a side's king is in check. Used for move legality filtering.
