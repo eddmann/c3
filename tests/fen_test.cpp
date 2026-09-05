@@ -51,17 +51,23 @@ TEST(Fen, ParseErrorWithWrongNumberOfRows) {
 }
 
 TEST(Fen, ParseErrorWithWrongNumberOfSquares) {
-  expect_parse_error("8/8/8/8/8/8/8/7 w - - 0 1", "board must contain 64 squares");
-  expect_parse_error("8/8/8/8/8/8/8/9 w - - 0 1", "board must contain 64 squares");
+  expect_parse_error("8/8/8/8/8/8/8/7 w - - 0 1", "rank must contain exactly 8 files");
+  expect_parse_error("8/8/8/8/8/8/8/9 w - - 0 1", "rank must contain exactly 8 files");
+}
+
+// "0" is not a shorter way of writing no empty squares; allowing it would let
+// one position be spelled several ways.
+TEST(Fen, ParseErrorWithAZeroEmptySquareCount) {
+  expect_parse_error("8/8/8/8/8/8/8/08 w - - 0 1", "empty square count must be between 1 and 8");
 }
 
 // A rank that overruns its eight files used to keep writing past square 63,
 // shifting a bitboard by 64 (undefined behaviour) before the total-square check
 // ever ran. Each rank is now bounded as it is filled.
 TEST(Fen, ParseErrorWithARankThatOverrunsItsFiles) {
-  expect_parse_error("PPPPPPPPP/8/8/8/8/8/8/8 w - - 0 1", "board must contain 64 squares");
-  expect_parse_error("44P/8/8/8/8/8/8/8 w - - 0 1", "board must contain 64 squares");
-  expect_parse_error("8/8/8/8/8/8/8/44P w - - 0 1", "board must contain 64 squares");
+  expect_parse_error("PPPPPPPPP/8/8/8/8/8/8/8 w - - 0 1", "rank must contain exactly 8 files");
+  expect_parse_error("44P/8/8/8/8/8/8/8 w - - 0 1", "rank must contain exactly 8 files");
+  expect_parse_error("8/8/8/8/8/8/8/44P w - - 0 1", "rank must contain exactly 8 files");
 }
 
 TEST(Fen, ParseErrorWithInvalidPiece) {
@@ -150,6 +156,20 @@ TEST(Fen, ParseErrorWithUnsupportedEnPassantSquare) {
                      "en passant square f3 requires a white pawn on f4 and black to move");
   expect_parse_error("8/8/8/8/5P2/8/8/8 w - f3 0 1",
                      "en passant square f3 requires a white pawn on f4 and black to move");
+}
+
+// The double push also has to have had somewhere to go: both the square it
+// jumped over and the square it started on must still be empty. A capture onto
+// an occupied en passant square would put two pieces on one square.
+TEST(Fen, ParseErrorWithBlockedEnPassantSquare) {
+  expect_parse_error("k7/8/5B2/4Pp2/8/8/8/K7 w - f6 0 1",
+                     "en passant square f6 and the square f7 behind it must both be empty");
+  expect_parse_error("k7/5b2/8/4Pp2/8/8/8/K7 w - f6 0 1",
+                     "en passant square f6 and the square f7 behind it must both be empty");
+  expect_parse_error("k7/8/8/8/4pP2/5B2/8/K7 b - f3 0 1",
+                     "en passant square f3 and the square f2 behind it must both be empty");
+  expect_parse_error("k7/8/8/8/4pP2/8/5b2/K7 b - f3 0 1",
+                     "en passant square f3 and the square f2 behind it must both be empty");
 }
 
 // Pawns cannot exist on the ranks they promote on, so such a board is a typo

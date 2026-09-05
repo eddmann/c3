@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "c3/bitboard.hpp"
 #include "c3/board.hpp"
 #include "c3/piece.hpp"
 #include "c3/square.hpp"
@@ -58,11 +59,11 @@ TEST(BoardDeathTest, PutPieceRefusesAnOccupiedSquare) {
   auto board = Board::empty();
   board.put_piece(Piece::WP, Square::E4);
 
-  EXPECT_DEBUG_DEATH(board.put_piece(Piece::BQ, Square::E4), "");
+  EXPECT_DEBUG_DEATH(board.put_piece(Piece::BQ, Square::E4), "put_piece expects an empty square");
 }
 
 TEST(BoardDeathTest, RemovePieceRefusesAnEmptySquare) {
   auto board = Board::empty();
 
-  EXPECT_DEBUG_DEATH(board.remove_piece(Square::E4), "");
+  EXPECT_DEBUG_DEATH(board.remove_piece(Square::E4), "remove_piece expects an occupied square");
 }

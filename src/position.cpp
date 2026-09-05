@@ -113,6 +113,10 @@ std::uint64_t Position::compute_key() const {
 // =============================================================================
 
 void Position::make_move(const Move& mv) {
+  // A legal game never captures a king; this catches a broken legality filter.
+  assert((!mv.captured_piece.has_value() || !is_king(*mv.captured_piece)) &&
+         "move captures a king");
+
   // Save state that can't be derived from the move alone.
   // This enables unmake_move to restore the exact previous position.
   const detail::HistoryEntry history{

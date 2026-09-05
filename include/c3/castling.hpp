@@ -43,10 +43,13 @@ enum class CastlingRight : std::uint8_t {
 // standard technique in production engines.
 //
 // Masking the to-square against e1/e8 looks too eager—surely a rook landing on
-// e1 should not end white's rights?—but it cannot do harm: while a right is
-// still held the king is standing on that square, so nothing can move onto it,
-// and once the king has left the right is already gone. Position::from_fen
-// enforces exactly that invariant, rejecting rights that no king and rook back up.
+// e1 should not end white's rights?—but it cannot do harm. While a right is
+// still held the king is standing on that square, so nothing else can move onto
+// it; and once the king has left, the right is already gone. Position::from_fen
+// enforces that invariant, rejecting castling rights that no king and rook back
+// up. A Position built directly, field by field, can still violate it—but the
+// mask only ever DROPS rights, never grants them, so the worst such a position
+// can suffer is losing a right it had no business claiming.
 inline constexpr std::array<std::uint8_t, 64> CASTLING_RIGHTS_MASK = [] {
   constexpr std::uint8_t ALL = 0b1111;
   std::array<std::uint8_t, 64> masks{};

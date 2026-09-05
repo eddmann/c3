@@ -410,7 +410,8 @@ TEST(Position, HistoryGrowsPastTheReserveWithoutTrippingAnInvariant) {
   Position pos = Position::startpos();
   const auto initial_key = pos.key;
 
-  constexpr int PLIES = 300;
+  // Deliberately past HISTORY_RESERVE, so the vector really does reallocate.
+  constexpr int PLIES = static_cast<int>(Position::HISTORY_RESERVE) + 16;
   for (int ply = 0; ply < PLIES; ++ply) {
     pos.make_null_move();
   }

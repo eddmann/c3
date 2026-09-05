@@ -36,6 +36,11 @@ public:
   // pick, and a wrong cap turns a rare but legal game into a crash.
   inline static constexpr std::size_t HISTORY_RESERVE = 1024;
 
+  // Deprecated spelling of HISTORY_RESERVE, kept for one cycle so branches
+  // written against the old name still compile. It never was a maximum: the
+  // history stack may grow past it. Prefer HISTORY_RESERVE.
+  inline static constexpr std::size_t MAX_HISTORY = HISTORY_RESERVE;
+
   Board board{};
   Colour colour_to_move{Colour::White};
   CastlingRights castling_rights{CastlingRights::none()};

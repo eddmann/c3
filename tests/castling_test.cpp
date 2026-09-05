@@ -66,17 +66,23 @@ TEST(CastlingRights, RemoveCastlingRightsForAKingStartSquare) {
 }
 
 TEST(CastlingRights, RemoveCastlingRightsForEveryRelevantSquare) {
-  const std::array<std::pair<Square, CastlingRight>, 4> corners = {{
-      {Square::A1, CastlingRight::WhiteQueen},
-      {Square::H1, CastlingRight::WhiteKing},
-      {Square::A8, CastlingRight::BlackQueen},
-      {Square::H8, CastlingRight::BlackKing},
+  // Each corner costs exactly one right; the rest must survive untouched, which
+  // only a comparison against the whole expected set can show.
+  const std::array<std::pair<Square, CastlingRights>, 4> corners = {{
+      {Square::A1, CastlingRights::from({CastlingRight::WhiteKing, CastlingRight::BlackKing,
+                                         CastlingRight::BlackQueen})},
+      {Square::H1, CastlingRights::from({CastlingRight::WhiteQueen, CastlingRight::BlackKing,
+                                         CastlingRight::BlackQueen})},
+      {Square::A8, CastlingRights::from({CastlingRight::WhiteKing, CastlingRight::WhiteQueen,
+                                         CastlingRight::BlackKing})},
+      {Square::H8, CastlingRights::from({CastlingRight::WhiteKing, CastlingRight::WhiteQueen,
+                                         CastlingRight::BlackQueen})},
   }};
 
-  for (const auto& [square, right] : corners) {
+  for (const auto& [square, surviving] : corners) {
     auto rights = CastlingRights::all();
     rights.remove_for_square(square);
-    EXPECT_FALSE(rights.has(right)) << square;
+    EXPECT_EQ(rights, surviving) << square;
   }
 }
 

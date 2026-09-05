@@ -129,8 +129,8 @@ TEST(Piece, CollectionsMatchExpectedOrdering) {
 // means a caller lost track of the piece it was walking. Debug builds abort at
 // the offending call rather than silently wrapping around to the far rank.
 TEST(SquareDeathTest, AdvanceOffTheBoardIsRejected) {
-  EXPECT_DEBUG_DEATH((void)Square::A1.advance(Colour::Black), "");
-  EXPECT_DEBUG_DEATH((void)Square::H8.advance(Colour::White), "");
+  EXPECT_DEBUG_DEATH((void)Square::A1.advance(Colour::Black), "advance stepped off the board");
+  EXPECT_DEBUG_DEATH((void)Square::H8.advance(Colour::White), "advance stepped off the board");
 }
 
 TEST(Piece, FitsInASingleByte) {

@@ -112,7 +112,7 @@ Board parse_board(std::string_view str) {
 
   const auto require_full_rank = [](std::uint8_t files) {
     if (files != 8) {
-      throw make_error("board must contain 64 squares");
+      throw make_error("rank must contain exactly 8 files");
     }
   };
 
@@ -129,9 +129,16 @@ Board parse_board(std::string_view str) {
     }
 
     if (std::isdigit(static_cast<unsigned char>(c)) != 0) {
+      // A run of empty squares is written 1-8. "0" is not a shorter way of
+      // writing nothing, it is a malformed rank, and accepting it would let the
+      // same position be spelled several ways and stop round-tripping.
+      if (c == '0') {
+        throw make_error("empty square count must be between 1 and 8");
+      }
+
       file = static_cast<std::uint8_t>(file + (c - '0'));
       if (file > 8) {
-        throw make_error("board must contain 64 squares");
+        throw make_error("rank must contain exactly 8 files");
       }
       continue;
     }
@@ -168,7 +175,7 @@ Board parse_board(std::string_view str) {
     }();
 
     if (file > 7) {
-      throw make_error("board must contain 64 squares");
+      throw make_error("rank must contain exactly 8 files");
     }
 
     board.put_piece(piece, Square::from_file_and_rank(file, rank));
@@ -190,6 +197,21 @@ Board parse_board(std::string_view str) {
 // home, and the Zobrist key folds in the en passant file. A FEN that lies about
 // any of these does not misbehave where the lie is—it misbehaves several plies
 // later, in code that looks innocent.
+//
+// from_fen rejects, in full:
+//
+//   - a pawn on rank 1 or rank 8
+//   - more than one king of either colour
+//   - a castling right whose king is not on e1/e8, or whose rook is not on the
+//     matching corner
+//   - an en passant square without the double-pushed pawn beside it, without
+//     that pawn's opponent to move, or with either the square itself or the
+//     square the pawn started on occupied
+//   - a full move counter of zero (numbering starts at move one)
+//
+// Deliberately NOT rejected: a board with no king at all. Stripping a position
+// down to one piece is how this engine's tests isolate move generation and
+// evaluation, so kingless boards stay legal input.
 // =============================================================================
 
 void validate_pawn_placement(const Board& board) {
@@ -273,6 +295,18 @@ void validate_en_passant_square(const Board& board, Colour colour_to_move,
     std::ostringstream oss;
     oss << "en passant square " << square << " requires a " << colour_name(pusher) << " pawn on "
         << pawn_square << " and " << colour_name(!pusher) << " to move";
+    throw make_error(oss.str());
+  }
+
+  // The push also has to have been possible: the pawn jumped over this square
+  // from the one behind it, so both must still be empty. An occupied en passant
+  // square is the dangerous case—move generation would happily produce a capture
+  // onto it, landing a second piece on a square that already has one.
+  const Square origin_square = square.advance(!pusher);
+  if (board.has_piece_at(square) || board.has_piece_at(origin_square)) {
+    std::ostringstream oss;
+    oss << "en passant square " << square << " and the square " << origin_square
+        << " behind it must both be empty";
     throw make_error(oss.str());
   }
 }

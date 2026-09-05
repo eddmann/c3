@@ -20,17 +20,21 @@
 // answer "where are all pieces of type X?" instantly. We maintain both in sync.
 //
 // occupancy_ is the union of the two colour bitboards. It is stored rather than
-// recomputed because sliding-piece attack lookups (magic bitboards) need it for
-// every rook, bishop and queen on every node of the search: an OR is cheap, but
-// not paying for it at all is cheaper, and put_piece/remove_piece already touch
-// the same cache line.
+// recomputed on demand because every sliding-piece attack lookup (magic
+// bitboards) needs it, for every rook, bishop and queen, on every node of the
+// search. The OR it replaces is cheap, but not doing it at all is cheaper, and
+// keeping it current costs one extra bitwise op inside put_piece/remove_piece.
 //
 // Why not just one representation?
 //   - Mailbox alone: Finding all knights requires scanning 64 squares
 //   - Bitboards alone: Finding what's on E4 requires checking 12 bitboards
-//   - Hybrid: Both operations are O(1) at the cost of ~200 bytes extra memory
+//   - Hybrid: Both operations are O(1), for one extra copy of the position
 //
-// The memory cost is negligible; the speed gain is significant.
+// A Board is 248 bytes: 128 for the mailbox (std::optional<Piece> is 2 bytes
+// now that Piece is a single byte—it used to be 8, which alone made a Board
+// 624 bytes), 96 for the per-piece bitboards, 16 for the colour bitboards and 8
+// for the occupancy. Small enough that copying one is cheap and several fit in
+// L1 alongside everything else the search is touching.
 //
 // =============================================================================
 
@@ -66,8 +70,9 @@ public:
   // overwrite the mailbox entry while leaving the displaced piece's bit set in
   // its own bitboard—a "phantom" piece that the mailbox denies and the bitboards
   // insist on. Such a desync typically only surfaces plies later, in an
-  // unrelated evaluation or attack lookup, so sanitizer builds stop here
-  // instead. Callers that mean to replace a piece must remove_piece first.
+  // unrelated evaluation or attack lookup, so Debug builds abort here instead.
+  // Release builds do not check: the assert is the whole enforcement, so callers
+  // that mean to replace a piece must remove_piece first either way.
   void put_piece(Piece piece, Square square) noexcept {
     assert(!has_piece_at(square) && "put_piece expects an empty square");
 
