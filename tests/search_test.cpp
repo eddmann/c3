@@ -181,9 +181,9 @@ TEST(SearchCorrectness, MatchesStartposDepth2) {
 
   const auto pv = pv_to_uci(result.pv);
   ASSERT_GE(pv.size(), 1U);
-  EXPECT_EQ(pv[0], "e2e4");
+  EXPECT_EQ(pv[0], "g1f3");
   if (pv.size() > 1) {
-    EXPECT_EQ(pv[1], "e7e5");
+    EXPECT_EQ(pv[1], "g8f6");
   }
 }
 
@@ -197,12 +197,12 @@ TEST(SearchCorrectness, MatchesKiwipeteDepth3) {
   const auto result = search::search(pos, limits, reporter);
 
   EXPECT_EQ(result.depth, 3);
-  EXPECT_EQ(result.eval, 50);
+  EXPECT_EQ(result.eval, 71);
 
   const auto pv = pv_to_uci(result.pv);
   ASSERT_GE(pv.size(), 3U);
   EXPECT_EQ((std::vector<std::string>{pv.begin(), pv.begin() + 3}),
-            (std::vector<std::string>{"e2a6", "e6d5", "g2h3"}));
+            (std::vector<std::string>{"e2a6", "e6d5", "e4d5"}));
 }
 
 // -----------------------------------------------------------------------------

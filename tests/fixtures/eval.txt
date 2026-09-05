@@ -1,6 +1,13 @@
 # name|fen|score_cp
+# Scores are in centipawns from the side-to-move's perspective, produced by the
+# tapered evaluation (material + piece-square tables, blended by game phase).
 startpos|rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1|0
-kiwipete|r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1|55
-white-rook-king|8/8/8/8/8/8/8/R3K2R w - - 0 1|990
-black-to-move-same|8/8/8/8/8/8/8/R3K2R b - - 0 1|-990
-endgame-kings|8/8/8/3k4/8/8/3K4/8 w - - 0 1|-30
+kiwipete|r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1|105
+white-rook-king|8/8/8/8/8/8/8/R3K2R w - - 0 1|1008
+black-to-move-same|8/8/8/8/8/8/8/R3K2R b - - 0 1|-1008
+# Bare kings and a lone bishop cannot mate: dead draws, scored exactly zero.
+endgame-kings|8/8/8/3k4/8/8/3K4/8 w - - 0 1|0
+insufficient-lone-bishop|4k3/8/8/8/8/8/8/4KB2 w - - 0 1|0
+# Rook endgame: with the board nearly empty the taper leans on the endgame king
+# table, which rewards White's centralised king and punishes Black's cornered one.
+endgame-central-king|k7/8/8/8/3K4/8/8/7R w - - 0 1|595
