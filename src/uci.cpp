@@ -535,6 +535,10 @@ constexpr std::int64_t MOVES_TO_GO_CAP_DIVISOR = 2;
 // guarantees the reply; this floor only improves its quality.
 constexpr auto MINIMUM_ALLOCATED_TIME = std::chrono::milliseconds{10};
 
+// How far past the move's budget a single iteration may run before it is
+// abandoned. See calculate_time_budget for why the slack is worth having.
+constexpr std::int64_t HARD_TIME_MULTIPLIER = 3;
+
 } // namespace
 
 // TIME BUDGET FOR ONE MOVE
@@ -570,6 +574,39 @@ calculate_allocated_time(std::chrono::milliseconds time_left,
 
   return std::max(std::chrono::milliseconds{allocated.count()},
                   std::min(MINIMUM_ALLOCATED_TIME, time_left));
+}
+
+// SOFT AND HARD BUDGET FOR ONE MOVE
+//
+//   soft = calculate_allocated_time(...)          "what this move is worth"
+//   hard = min(soft * 3, time_left - reserve)     "what we must not exceed"
+//
+// WHY THREE TIMES. The soft limit is an average, and averages are wrong on the
+// interesting moves: the iteration that finds a refutation, fails low and has
+// to re-search the whole root costs several times a quiet one. Cutting that
+// iteration off at the average throws away everything it has done and plays
+// the move it was in the middle of refuting. Three times the budget is enough
+// slack for that iteration to finish, while still being a hard stop—and what
+// we borrow here is not lost, because the next move's share is recomputed from
+// whatever is actually left on the clock.
+//
+// WHY THE CLOCK STILL WINS. Three times a healthy budget can exceed the whole
+// remaining clock in a time scramble, so the reserve-adjusted clock caps it.
+// The hard limit is never below the soft one: when the floor in
+// calculate_allocated_time has already raised soft above what the clock can
+// afford, there is nothing left to hold back and the two coincide.
+TimeBudget calculate_time_budget(std::chrono::milliseconds time_left,
+                                 std::optional<std::chrono::milliseconds> increment,
+                                 std::optional<std::uint32_t> moves_to_go) noexcept {
+  const auto soft = calculate_allocated_time(time_left, increment, moves_to_go)
+                        .value_or(std::chrono::milliseconds{0});
+
+  const auto reserve = std::max(time_left / TIME_RESERVE_DIVISOR, MINIMUM_TIME_RESERVE);
+  const auto affordable = time_left > reserve ? time_left - reserve : std::chrono::milliseconds{0};
+
+  const auto hard = std::max(soft, std::min(soft * HARD_TIME_MULTIPLIER, affordable));
+
+  return TimeBudget{.soft = soft, .hard = hard};
 }
 
 // ---------------------------------------------------------------------------
@@ -810,24 +847,37 @@ struct SearchHandle {
   }
 };
 
-// Turns the clock half of a `go` command into a single search budget.
-std::optional<std::chrono::milliseconds> resolve_time_limit(const GoParams& params,
-                                                            Colour colour_to_move) {
+// Turns the clock half of a `go` command into the search's two time limits.
+//
+//   `infinite`, or a bare `depth`/`nodes` search: no clock at all. The GUI has
+//       named the bound itself, and inventing a deadline on top of it would
+//       silently answer a different question than the one asked.
+//   `movetime`: the GUI has said exactly how long to think, so there is
+//       nothing to manage—soft and hard are both that number.
+//   a clock: the allocation is what we mean to spend, with headroom above it
+//       for an iteration that turns out expensive (see calculate_time_budget).
+void apply_time_limits(search::Limits& limits, const GoParams& params, Colour colour_to_move) {
   if (params.infinite) {
-    return std::nullopt;
+    return;
   }
 
   if (params.movetime.has_value()) {
-    return params.movetime;
+    limits.soft_time = params.movetime;
+    limits.hard_time = params.movetime;
+    return;
   }
 
   const bool white = colour_to_move == Colour::White;
   const auto time_left = white ? params.wtime : params.btime;
   if (!time_left.has_value()) {
-    return std::nullopt;
+    return;
   }
 
-  return calculate_allocated_time(*time_left, white ? params.winc : params.binc, params.movestogo);
+  const auto budget =
+      calculate_time_budget(*time_left, white ? params.winc : params.binc, params.movestogo);
+
+  limits.soft_time = budget.soft;
+  limits.hard_time = budget.hard;
 }
 
 // Runs one search on `handle`'s thread and reports its result.
@@ -854,7 +904,7 @@ void start_search(SearchHandle& handle, const GoParams& params, const Position& 
   search::Limits limits;
   limits.depth = params.depth;
   limits.nodes = params.nodes;
-  limits.time = resolve_time_limit(params, root.colour_to_move);
+  apply_time_limits(limits, params, root.colour_to_move);
 
   const auto root_moves = legal_moves(root);
   const std::optional<UciMove> fallback_move =
@@ -1147,7 +1197,7 @@ std::string run_script_for_test(
       search::Limits limits;
       limits.depth = cmd.go_params->depth;
       limits.nodes = cmd.go_params->nodes;
-      limits.time = resolve_time_limit(*cmd.go_params, pos.colour_to_move);
+      apply_time_limits(limits, *cmd.go_params, pos.colour_to_move);
 
       search::Report report;
       search::Stopper stopper;

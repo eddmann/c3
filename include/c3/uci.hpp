@@ -29,6 +29,14 @@
 // LIKELY. It does not make it certain: only the fallback move above
 // guarantees that the GUI gets a reply at all.
 //
+// RULE 3: A CLOCK BUYS TWO LIMITS, NOT ONE
+// What the GUI sends is a clock, not a deadline, and the engine turns it into
+// a pair: a soft limit (what this move is worth, checked between iterations)
+// and a hard limit (what it must not exceed, polled inside the search). See
+// calculate_time_budget in uci.cpp for the arithmetic and search.hpp for what
+// the search does with the two. `go movetime` is the exception—there the GUI
+// really has named a single deadline, so both limits are that number.
+//
 // Anything else we want to say—diagnostics, warnings about input we did not
 // understand—travels as `info string ...`, the protocol's free-text line. The
 // UCI spec requires unknown commands and unknown tokens to be tolerated rather
@@ -148,6 +156,19 @@ UciCommand parse_command(const std::string& command);
 calculate_allocated_time(std::chrono::milliseconds time_left,
                          std::optional<std::chrono::milliseconds> increment,
                          std::optional<std::uint32_t> moves_to_go = std::nullopt) noexcept;
+
+// The pair of limits the search wants: what we mean to spend on this move, and
+// what we must not exceed. See calculate_time_budget in uci.cpp for how the
+// hard limit is derived from the soft one.
+struct TimeBudget {
+  std::chrono::milliseconds soft{};
+  std::chrono::milliseconds hard{};
+};
+
+[[nodiscard]] TimeBudget
+calculate_time_budget(std::chrono::milliseconds time_left,
+                      std::optional<std::chrono::milliseconds> increment,
+                      std::optional<std::uint32_t> moves_to_go = std::nullopt) noexcept;
 
 // Resolves a UCI move string against the legal moves of `pos`; throws if the
 // move is not legal there.

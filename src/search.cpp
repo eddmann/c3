@@ -169,6 +169,37 @@ std::optional<std::uint8_t> Report::moves_until_mate() const {
 }
 
 // ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+std::optional<std::chrono::milliseconds> Limits::hard_limit() const {
+  return hard_time.has_value() ? hard_time : time;
+}
+
+std::optional<std::chrono::milliseconds> Limits::soft_limit() const {
+  const auto soft = soft_time.has_value() ? soft_time : time;
+  const auto hard = hard_limit();
+
+  if (!soft.has_value()) {
+    return hard;
+  }
+
+  // A soft limit beyond the hard one would promise time the search is not
+  // allowed to take, so the ceiling wins.
+  return hard.has_value() ? std::make_optional(std::min(*soft, *hard)) : soft;
+}
+
+bool detail::can_finish_next_iteration(std::chrono::steady_clock::duration elapsed,
+                                       std::chrono::steady_clock::duration last_iteration,
+                                       std::optional<std::chrono::milliseconds> hard_time) {
+  if (!hard_time.has_value()) {
+    return true;
+  }
+
+  return elapsed + (last_iteration * ITERATION_GROWTH_FACTOR) <= *hard_time;
+}
+
+// ---------------------------------------------------------------------------
 // Stopper
 // ---------------------------------------------------------------------------
 
@@ -886,9 +917,14 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
 SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal) {
+  const auto soft_time = limits.soft_limit();
+  const auto hard_time = limits.hard_limit();
+
   Stopper stopper(std::move(stop_signal));
   stopper.at_nodes(limits.nodes);
-  stopper.at_elapsed(limits.time);
+  // Only the hard limit is polled inside the tree. The soft limit is a
+  // between-iterations decision, made at the bottom of the loop below.
+  stopper.at_elapsed(hard_time);
 
   // Mark everything already in the table as belonging to a previous search.
   // Those entries stay readable—they are still true—but they become the first
@@ -923,7 +959,12 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
   MoveList best_pv;
   std::uint8_t best_depth = 0;
 
+  // How long the iteration that just finished took. It is the only estimate we
+  // have of what the next one will cost.
+  auto last_iteration = std::chrono::steady_clock::duration::zero();
+
   for (std::uint8_t depth = 1; depth <= max_depth; ++depth) {
+    const auto iteration_started = std::chrono::steady_clock::now();
     MoveList pv;
 
     const bool do_aspiration =
@@ -988,6 +1029,23 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
     report.pv = std::make_pair(sanitised_pv, sanitised_eval);
     report.tt_stats = {tt.usage(), tt.capacity()};
     reporter.send(report);
+
+    last_iteration = std::chrono::steady_clock::now() - iteration_started;
+    const auto elapsed = report.elapsed();
+
+    // SOFT LIMIT: we have spent the budget for this move and we have a
+    // complete answer in hand. Stopping here costs nothing.
+    if (soft_time.has_value() && elapsed > *soft_time) {
+      break;
+    }
+
+    // AND DON'T START WHAT WE CANNOT FINISH. An iteration only pays for itself
+    // if it completes; one that the hard limit kills half-way is time spent
+    // for no answer at all. So if the next iteration is unlikely to fit, stop
+    // now while the previous one is still the best thing we have.
+    if (!detail::can_finish_next_iteration(elapsed, last_iteration, hard_time)) {
+      break;
+    }
   }
 
   SearchResult result;

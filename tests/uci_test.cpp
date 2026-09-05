@@ -109,6 +109,39 @@ TEST(UciTime, MatchesExpectedAllocations) {
   EXPECT_EQ(long_inc, std::make_optional(85500ms));
 }
 
+TEST(UciTime, BudgetGivesTheSoftLimitRoomToOverrun) {
+  // The soft limit is still the old allocation; the hard limit is three times
+  // it, so an iteration that turns out expensive can finish instead of being
+  // thrown away half-done.
+  const auto blitz = uci::calculate_time_budget(180000ms, std::make_optional(2000ms));
+
+  EXPECT_EQ(blitz.soft, 7000ms);
+  EXPECT_EQ(blitz.hard, 21000ms);
+  EXPECT_EQ(blitz.soft, uci::calculate_allocated_time(180000ms, std::make_optional(2000ms)));
+}
+
+TEST(UciTime, BudgetNeverPromisesMoreThanTheClockHolds) {
+  // Three times a healthy budget can exceed the whole remaining clock. What is
+  // left after the reserve is the real ceiling.
+  const auto scramble = uci::calculate_time_budget(5000ms, std::make_optional(500ms));
+
+  EXPECT_EQ(scramble.soft, 416ms);
+  EXPECT_EQ(scramble.hard, 1248ms); // 3 x 416, comfortably inside 5000 - 250
+  EXPECT_LE(scramble.hard, 5000ms - 250ms);
+
+  // With almost nothing left, the floor has already claimed everything the
+  // clock can afford, so there is no headroom to give and the two coincide.
+  const auto desperate = uci::calculate_time_budget(20ms, std::nullopt);
+  EXPECT_EQ(desperate.hard, desperate.soft);
+}
+
+TEST(UciTime, BudgetHardLimitIsNeverBelowTheSoftOne) {
+  for (const auto clock : {10ms, 60ms, 500ms, 5000ms, 60000ms, 600000ms}) {
+    const auto budget = uci::calculate_time_budget(clock, std::nullopt);
+    EXPECT_GE(budget.hard, budget.soft) << "clock " << clock.count() << "ms";
+  }
+}
+
 TEST(UciReporter, PrintsInfoAndTracksBestMove) {
   std::ostringstream out;
   uci::UciReporter reporter(out);

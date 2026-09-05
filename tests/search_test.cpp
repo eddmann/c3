@@ -699,6 +699,92 @@ TEST(SearchLimits, RespectsNodeLimit) {
   EXPECT_LE(result.nodes, 600);
 }
 
+// -----------------------------------------------------------------------------
+// Soft and hard time limits
+// -----------------------------------------------------------------------------
+
+TEST(SearchTime, PlainTimeStillMeansBothLimits) {
+  // Every caller that has one number in mind keeps working: `time` fills in
+  // for whichever of the two was not named.
+  search::Limits both;
+  both.time = std::chrono::milliseconds{500};
+  EXPECT_EQ(both.soft_limit(), std::chrono::milliseconds{500});
+  EXPECT_EQ(both.hard_limit(), std::chrono::milliseconds{500});
+
+  search::Limits split;
+  split.soft_time = std::chrono::milliseconds{100};
+  split.hard_time = std::chrono::milliseconds{300};
+  EXPECT_EQ(split.soft_limit(), std::chrono::milliseconds{100});
+  EXPECT_EQ(split.hard_limit(), std::chrono::milliseconds{300});
+
+  const search::Limits none;
+  EXPECT_FALSE(none.soft_limit().has_value());
+  EXPECT_FALSE(none.hard_limit().has_value());
+}
+
+TEST(SearchTime, SoftLimitNeverExceedsTheHardOne) {
+  // A soft limit past the hard one would promise time the search is not
+  // allowed to take, so the ceiling wins.
+  search::Limits limits;
+  limits.soft_time = std::chrono::milliseconds{900};
+  limits.hard_time = std::chrono::milliseconds{200};
+
+  EXPECT_EQ(limits.soft_limit(), std::chrono::milliseconds{200});
+  EXPECT_EQ(limits.hard_limit(), std::chrono::milliseconds{200});
+}
+
+TEST(SearchTime, RefusesAnIterationThatCannotFinish) {
+  using namespace std::chrono_literals;
+
+  // 100ms gone, the last iteration cost 60ms, so the next one is predicted at
+  // 120ms: 220ms in total. It fits under 300ms but not under 200ms.
+  EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 60ms, 300ms));
+  EXPECT_FALSE(search::detail::can_finish_next_iteration(100ms, 60ms, 200ms));
+
+  // Exactly on the limit still counts as affordable.
+  EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 50ms, 200ms));
+
+  // No hard limit means nothing to be unable to afford.
+  EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 10000ms, std::nullopt));
+}
+
+TEST(SearchTime, SoftLimitStopsBetweenIterations) {
+  // No depth bound at all: only the soft limit can end this search, and it may
+  // only do so once an iteration is complete—so there is always a move to play.
+  Position pos = Position::startpos();
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.soft_time = std::chrono::milliseconds{100};
+  limits.hard_time = std::chrono::milliseconds{30000};
+
+  const auto started = std::chrono::steady_clock::now();
+  const auto result = search::search(pos, limits, reporter);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_LT(elapsed, std::chrono::seconds{20}) << "the soft limit did not end the search";
+  EXPECT_GE(result.depth, 1);
+  EXPECT_FALSE(result.pv.empty()) << "stopping between iterations must leave a complete answer";
+}
+
+TEST(SearchTime, HardLimitStopsInsideAnIteration) {
+  // The soft limit is far away, so only the hard limit can end this search.
+  // It is the one the stopper polls, so it can and does cut in mid-iteration.
+  Position pos = Position::startpos();
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.soft_time = std::chrono::milliseconds{30000};
+  limits.hard_time = std::chrono::milliseconds{100};
+
+  const auto started = std::chrono::steady_clock::now();
+  const auto result = search::search(pos, limits, reporter);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_LT(elapsed, std::chrono::seconds{20}) << "the hard limit did not end the search";
+  EXPECT_GE(result.depth, 1);
+}
+
 TEST(SearchLimits, NodeLimitHoldsInACaptureHeavyPosition) {
   // Quiescence used to run without ever asking the stopper, so once the search
   // dropped into a thicket of captures the node limit stopped applying: the

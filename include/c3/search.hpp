@@ -108,10 +108,47 @@ public:
   void send(const Report&) override {}
 };
 
+// ---------------------------------------------------------------------------
+// TWO TIME LIMITS, NOT ONE
+// ---------------------------------------------------------------------------
+// A single deadline forces a bad choice. Set it where the engine should
+// normally stop thinking and it will be cut off mid-iteration whenever a
+// position turns out to be hard, throwing away everything that iteration had
+// cost. Set it where the engine must not overrun and the engine will happily
+// start a doomed iteration with a fraction of the time it needs.
+//
+// So there are two:
+//
+//   soft_time  the budget for this move. It is checked only BETWEEN
+//              iterations, where stopping is free: the previous iteration is
+//              complete and its move is ready to play. It also decides
+//              whether to start the next iteration at all.
+//
+//   hard_time  the point of no return, and the only one the search polls
+//              while it is running. Crossing it abandons the current
+//              iteration wherever it happens to be. Reaching it should be
+//              rare—it exists for the iteration that surprises us, not for
+//              routine stopping.
+//
+// Because the soft limit is allowed to be generous about the current
+// iteration and the hard limit is not, `hard >= soft` always; a caller that
+// asks for less has its soft limit pulled down to the hard one.
+// ---------------------------------------------------------------------------
+
 struct Limits {
   std::optional<std::uint8_t> depth{};
   std::optional<std::uint64_t> nodes{};
+
+  // "One budget, meaning both." Convenient for tests and for `go movetime`,
+  // where the GUI really has named a single number. soft_time / hard_time
+  // below override it individually when set.
   std::optional<std::chrono::milliseconds> time{};
+
+  std::optional<std::chrono::milliseconds> soft_time{};
+  std::optional<std::chrono::milliseconds> hard_time{};
+
+  [[nodiscard]] std::optional<std::chrono::milliseconds> soft_limit() const;
+  [[nodiscard]] std::optional<std::chrono::milliseconds> hard_limit() const;
 };
 
 class Stopper {
@@ -382,8 +419,27 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 SearchResult search(Position& pos, std::uint8_t depth);
 
+// How much bigger the next iteration is assumed to be than the one just
+// finished. Each extra ply multiplies the tree by the effective branching
+// factor, which good move ordering keeps near two for this engine—so if we
+// cannot afford twice the last iteration, we cannot afford the next one.
+//
+// The factor is deliberately conservative. Guessing too high wastes the tail
+// of the budget by refusing an iteration that would have fitted; guessing too
+// low starts an iteration the hard limit then kills, which is the outcome the
+// soft limit exists to avoid.
+inline constexpr int ITERATION_GROWTH_FACTOR = 2;
+
 // Exposed for tests
 namespace detail {
+
+// Would the next iteration finish before the hard limit? Answered from how
+// long the LAST one took, which is the only evidence available: an iteration's
+// cost is not knowable until it has been paid.
+[[nodiscard]] bool can_finish_next_iteration(std::chrono::steady_clock::duration elapsed,
+                                             std::chrono::steady_clock::duration last_iteration,
+                                             std::optional<std::chrono::milliseconds> hard_time);
+
 void order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
                  const std::optional<Move>& hash_move = std::nullopt);
 void order_quiescence_moves(MoveList& moves);
