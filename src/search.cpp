@@ -533,9 +533,23 @@ void detail::order_quiescence_moves(MoveList& moves) {
 // Stand-pat: The current static evaluation serves as a baseline. The side to
 // move can always "stand pat" (decline to capture) if no capture improves the
 // position. This prevents quiescence from searching forever.
+//
+// QUIESCENCE MUST ASK THE STOPPER TOO
+// "Until the position is quiet" is not a bound anybody set. A middlegame with
+// both sides' pieces contesting the same squares can spend thousands of nodes
+// resolving one exchange, and while it does so the search is not looking at
+// the clock at all. Skipping the check here therefore made every limit
+// approximate: `go nodes` overshot, and a move played on the last second of
+// the clock could be handed in late. So quiescence polls like alphabeta does,
+// and returns the same placeholder score when it is told to stop—the latching
+// Stopper makes sure that score is discarded rather than stored.
 // ---------------------------------------------------------------------------
 
-int quiescence(Position& pos, int alpha, int beta, Report& report) {
+int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper& stopper) {
+  if (stopper.should_stop(report)) {
+    return 0;
+  }
+
   report.nodes += 1;
 
   // Stand-pat: static evaluation as the fallback
@@ -565,7 +579,7 @@ int quiescence(Position& pos, int alpha, int beta, Report& report) {
     }
 
     // Negamax: negate score and swap alpha/beta
-    const int score = -quiescence(pos, -beta, -alpha, report);
+    const int score = -quiescence(pos, -beta, -alpha, report, stopper);
 
     pos.unmake_move(mv);
 
@@ -604,19 +618,35 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     return 0;
   }
 
+  // NODE ACCOUNTING
+  // A "node" is a position the search entered and decided, so it is counted
+  // here—above the draw tests and the transposition probe—rather than after
+  // them. Counting further down made the two cheapest outcomes free: a drawn
+  // terminal and a transposition cutoff each returned an answer without ever
+  // reaching the increment. That understated nps by exactly what the table
+  // was saving us, and it let `go nodes N` run well past N, because the nodes
+  // the limit is meant to count were the ones it could not see.
+  //
+  // The one node NOT counted here is a leaf that drops into quiescence:
+  // quiescence counts that position itself, and counting it twice would make
+  // every leaf worth two.
+
   // Draw detection: 50-move rule or threefold repetition
   if (pos.is_fifty_move_draw() || pos.is_repetition_draw(report.ply)) {
+    report.nodes += 1;
     return CENTIPAWN_DRAW;
   }
 
   // Leaf node: drop into quiescence search
   if (depth == 0) {
     if (!is_in_check(pos.colour_to_move, pos.board)) {
-      return quiescence(pos, alpha, beta, report);
+      return quiescence(pos, alpha, beta, report, stopper);
     }
     // CHECK EXTENSION: Don't stop search while in check (tactical danger)
     depth = 1;
   }
+
+  report.nodes += 1;
 
   // PV NODES vs NON-PV NODES
   // A node searched with a full window (beta > alpha + 1) is a "PV node": it
@@ -661,8 +691,6 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // move is worth having: it is the best move a previous search found here.
     hash_move_packed = entry->packed_move;
   }
-
-  report.nodes += 1;
 
   const Colour colour_to_move = pos.colour_to_move;
   const bool in_check = is_in_check(colour_to_move, pos.board);
@@ -859,7 +887,6 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal) {
   Stopper stopper(std::move(stop_signal));
-  stopper.at_depth(limits.depth);
   stopper.at_nodes(limits.nodes);
   stopper.at_elapsed(limits.time);
 

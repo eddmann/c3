@@ -451,7 +451,9 @@ TEST(TranspositionTable, NonPvNodesTakeCutoffsFromEveryBoundType) {
     const int eval = search::detail::alphabeta(pos, 3, 0, 1, pv, tt, killers, report, stopper);
 
     EXPECT_EQ(eval, scenario.expected) << scenario.name;
-    EXPECT_EQ(report.nodes, 0U) << scenario.name << ": cutoff should search nothing";
+    // One node: the cutoff node itself, which we did enter and did decide.
+    // Nothing BELOW it was searched, which is the saving the table exists for.
+    EXPECT_EQ(report.nodes, 1U) << scenario.name << ": cutoff should search no children";
   }
 }
 
@@ -667,6 +669,26 @@ TEST(SearchLimits, RespectsNodeLimit) {
   EXPECT_LE(result.nodes, 600);
 }
 
+TEST(SearchLimits, NodeLimitHoldsInACaptureHeavyPosition) {
+  // Quiescence used to run without ever asking the stopper, so once the search
+  // dropped into a thicket of captures the node limit stopped applying: the
+  // capture tree ran to its natural end however many nodes that took. This
+  // position is nothing but captures—two full sets of pieces contesting the
+  // same central squares—so a quiescence search that does not poll overshoots
+  // by orders of magnitude.
+  Position pos = parse("r2q1rk1/pp2ppbp/2np1np1/2pP4/2P1PB2/2N2N2/PP2BPPP/R2Q1RK1 b - - 0 1");
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.nodes = 2000;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  // The stopper is only consulted every 256 nodes and the tree still has to
+  // unwind, so a small overshoot is expected and a large one is the bug.
+  EXPECT_LE(result.nodes, limits.nodes.value() + 256 + 64);
+}
+
 TEST(SearchLimits, StopSignalHalts) {
   Position pos = Position::startpos();
 
@@ -765,6 +787,49 @@ TEST(SearchNodes, SearchesTheHashMoveExactlyOnce) {
   EXPECT_LT(report.nodes, 5U) << "the hash move was searched twice";
   ASSERT_FALSE(pv.empty());
   EXPECT_EQ(to_uci(pv[0]), "a6a7");
+}
+
+TEST(SearchNodes, CountsANodeAnsweredByTheTable) {
+  // A node whose score comes straight out of the table is still a node: we
+  // reached the position, probed for it, and returned an answer. Counting
+  // below the probe instead made every transposition cutoff invisible, so
+  // `go nodes N` sailed past N and the reported nps understated the search by
+  // exactly the amount the table was saving.
+  Position pos = parse("8/8/P7/8/8/8/5k2/7K w - - 0 1");
+
+  search::TranspositionTable tt;
+  search::KillerMoves killers;
+  search::Report report;
+  search::Stopper stopper;
+
+  // A deep exact score for this very position, so the probe answers at once.
+  // The zero window makes this a non-PV node, the only kind allowed to take
+  // a cutoff.
+  tt.store(pos.key, 10, 42, search::Bound::Exact, search::TT_NO_MOVE);
+
+  MoveList pv;
+  const int eval = search::detail::alphabeta(pos, 4, 0, 1, pv, tt, killers, report, stopper);
+
+  ASSERT_EQ(eval, 42) << "no cutoff happened, so this test measures nothing";
+  EXPECT_EQ(report.nodes, 1U) << "a transposition cutoff was counted as zero nodes";
+}
+
+TEST(SearchNodes, CountsADrawTerminal) {
+  // Same argument for a position the rules have already decided: no moves are
+  // searched, but we still visited it and still spent the draw tests on it.
+  Position pos = parse("8/8/8/8/8/3k4/8/R3K3 w - - 100 50");
+
+  search::TranspositionTable tt;
+  search::KillerMoves killers;
+  search::Report report;
+  search::Stopper stopper;
+
+  MoveList pv;
+  const int eval = search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers,
+                                             report, stopper);
+
+  ASSERT_EQ(eval, CENTIPAWN_DRAW);
+  EXPECT_EQ(report.nodes, 1U) << "a drawn terminal was counted as zero nodes";
 }
 
 TEST(SearchNodes, SkipsAHashMoveThatLeavesTheKingInCheck) {

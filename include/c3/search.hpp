@@ -119,7 +119,9 @@ public:
   explicit Stopper(std::shared_ptr<std::atomic_bool> stop_signal = nullptr)
       : stop_signal_(std::move(stop_signal)) {}
 
-  void at_depth(std::optional<std::uint8_t> depth) { depth_ = depth; }
+  // No at_depth(): depth is not a stop condition. Iterative deepening is a
+  // loop, and its bound is where the loop ends—asking the stopper about depth
+  // as well would be a second, silent copy of the same rule.
   void at_elapsed(std::optional<std::chrono::milliseconds> elapsed);
   void at_nodes(std::optional<std::uint64_t> nodes) { nodes_ = nodes; }
 
@@ -135,7 +137,6 @@ public:
 
 private:
   std::shared_ptr<std::atomic_bool> stop_signal_{};
-  std::optional<std::uint8_t> depth_{};
   std::optional<std::chrono::milliseconds> elapsed_{};
   std::optional<std::uint64_t> nodes_{};
   // Written from the single searching thread; `mutable` so the latch can be
