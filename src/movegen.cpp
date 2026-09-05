@@ -18,8 +18,9 @@
 //
 // 3. PSEUDO-LEGAL THEN FILTER
 //    We generate "pseudo-legal" moves (moves that follow piece movement rules)
-//    then filter out moves that leave our king in check. This is often faster
-//    than generating only legal moves directly, especially with bitboards.
+//    then filter out the ones that leave our king in check, by playing each
+//    move and taking it back. Generating only legal moves directly is faster
+//    but far more intricate; see legal_moves below for the full trade-off.
 //
 // =============================================================================
 
@@ -370,9 +371,9 @@ Bitboard get_attackers(Square square, Colour colour, const Board& board) {
 // The order of the tests is deliberate. Knights, kings and pawns are answered
 // by a single array lookup and an AND. The sliding pieces cost a masked
 // multiply plus a lookup into an 841 KiB table that will not sit in L1, so they
-// are asked last and only when the cheap tests came up empty. Checks are given
-// by sliders more often than not, but when a leaper is giving check we are done
-// after a handful of instructions.
+// are asked last and only when the cheap tests came up empty. A square nothing
+// attacks still costs the full set of tests; the saving is on the "yes"
+// answers, which are exactly the moves the legality filter has to throw away.
 bool is_attacked(Square square, Colour colour, const Board& board) {
   if ((board.pieces(knight(colour)) & KNIGHT_ATTACKS[square.index()]) != 0) {
     return true;
