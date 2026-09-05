@@ -96,9 +96,32 @@ inline constexpr std::size_t TT_DEFAULT_SIZE_MB = 64;
 // Reporting and limits
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// THE PLY CEILING
+// ---------------------------------------------------------------------------
+// MAX_DEPTH is not only the deepest iteration the engine will start; it is the
+// deepest PLY any node may sit at, and that is the stricter of the two claims.
+// Killer slots, and the per-ply scratch rows a SearchContext hands out, are
+// arrays with exactly MAX_DEPTH + 1 rows, and Report::ply is a single byte. A
+// search that recursed past the ceiling would not run out of room, it would
+// WRAP: the child of ply 255 is ply 0, and a line that long would start
+// overwriting the root's own tables from underneath it. Each of those frames
+// also costs real stack, which is the other reason the ceiling has to hold.
+//
+// Depth alone does not enforce it. Every recursion normally spends a ply of
+// depth, so ply <= root depth <= MAX_DEPTH falls out for free—except at the
+// check extension, which resets depth to 1 and can therefore go on for as long
+// as the checks do. So the ceiling is checked explicitly, in alphabeta(), and
+// a node that has reached it answers with quiescence instead of recursing.
+// ---------------------------------------------------------------------------
+
 struct Report {
   std::uint8_t depth{0};
   std::uint8_t ply{0};
+  // The deepest ply the main search reached, which is what a UCI `seldepth`
+  // would report and what the ply ceiling is asserted against. It only ever
+  // grows, so it survives the recursion unwinding back to the root.
+  std::uint8_t max_ply{0};
   std::uint64_t nodes{0};
   std::optional<std::pair<MoveList, int>> pv{};
   std::pair<std::size_t, std::size_t> tt_stats{0, 0};

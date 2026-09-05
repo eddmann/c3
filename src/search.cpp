@@ -1004,10 +1004,22 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // counted here and quiescence does not count itself, so every position costs
   // exactly one node no matter which of the two searches resolves it.
   report.nodes += 1;
+  report.max_ply = std::max(report.max_ply, report.ply);
 
   // Draw detection: 50-move rule or threefold repetition
   if (pos.is_fifty_move_draw() || pos.is_repetition_draw(report.ply)) {
     return CENTIPAWN_DRAW;
+  }
+
+  // THE PLY CEILING
+  // Everything indexed by ply—killers, and this context's per-ply scratch
+  // rows—has exactly MAX_DEPTH + 1 rows, and report.ply is a single byte, so
+  // recursing from here would wrap round to ply 0 and start overwriting the
+  // root's own tables. Quiescence still resolves the captures, so the answer
+  // is a real one; it simply stops growing the tree in a direction that has
+  // nowhere left to go. See THE PLY CEILING in search.hpp.
+  if (report.ply >= MAX_DEPTH) {
+    return quiescence(pos, alpha, beta, report, stopper);
   }
 
   // Leaf node: drop into quiescence search
@@ -1015,7 +1027,11 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     if (!is_in_check(pos.colour_to_move, pos.board)) {
       return quiescence(pos, alpha, beta, report, stopper);
     }
-    // CHECK EXTENSION: Don't stop search while in check (tactical danger)
+    // CHECK EXTENSION: Don't stop search while in check (tactical danger).
+    // This is the one place the recursion does not spend a ply of depth, so it
+    // is also the only way ply can grow without bound. The ceiling above is
+    // what stops it: we can only get here with report.ply < MAX_DEPTH, so the
+    // child this extension creates still sits inside every per-ply table.
     depth = 1;
   }
 

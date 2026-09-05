@@ -429,6 +429,61 @@ TEST(SearchCounterMoves, ASearchFillsTheTable) {
   EXPECT_GT(recorded, 0) << "quiet cutoffs should leave counter-moves behind";
 }
 
+// Ply and stack safety ---------------------------------------------------------
+
+TEST(SearchPlySafety, ResolvesStaticallyAtThePlyCeiling) {
+  // Killers and the search's own per-ply scratch rows are indexed by ply, and
+  // Report::ply is a single byte. A search that keeps recursing past MAX_DEPTH
+  // therefore does not run out of room, it WRAPS: ply 255's child is ply 0, and
+  // a line 255 plies deep starts overwriting the root's tables from underneath
+  // it. The check extension is the one place ply can grow without bound—it
+  // resets depth to 1, so a long enough forcing sequence never has to end—and
+  // every one of those frames also costs a stack frame.
+  //
+  // So a node that is already at the ceiling must answer without recursing.
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  const auto search_from_ply = [&pos](std::uint8_t ply) {
+    search::SearchContext ctx;
+    search::TranspositionTable tt(1);
+    search::Report report;
+    report.ply = ply;
+    search::Stopper stopper;
+    MoveList pv;
+    search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+    return report;
+  };
+
+  const auto at_ceiling = search_from_ply(search::MAX_DEPTH);
+  const auto at_root = search_from_ply(0);
+
+  EXPECT_LT(at_ceiling.nodes, at_root.nodes)
+      << "a node at the ply ceiling must resolve statically instead of recursing";
+
+  // ...and it stopped there rather than carrying on from a wrapped ply 0.
+  EXPECT_EQ(at_ceiling.max_ply, search::MAX_DEPTH);
+}
+
+TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
+  // The other half of the same story: the extension really does push ply past
+  // the depth it was given—that is the whole point of it, and the reason the
+  // ceiling above has to exist. A position with checks available at the horizon
+  // therefore reaches plies the depth limit alone would never reach.
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  constexpr std::uint8_t DEPTH = 5;
+  search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  EXPECT_GT(report.max_ply, DEPTH) << "a check at the horizon should have been extended";
+  EXPECT_LE(report.max_ply, search::MAX_DEPTH);
+}
+
 // Transposition table layout, move packing and replacement ---------------------
 
 TEST(TranspositionTable, PacksEntriesIntoSixteenBytes) {
