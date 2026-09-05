@@ -848,11 +848,20 @@ TEST(SearchDraw, ReportsADrawnPvAsADrawAndTruncatesIt) {
   }
 }
 
-TEST(SearchDraw, DISABLED_AvoidsStalemateWhenWinning) {
-  // Q+K vs K - white is winning but can stalemate
-  // Position: white king g6, white queen f7, black king h8
-  // Qf8 would be stalemate!
-  Position pos = parse("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1");
+TEST(SearchDraw, AvoidsStalemateWhenWinning) {
+  // THE OLD POSITION WAS MISLABELLED, WHICH IS WHY THIS TEST WAS DISABLED.
+  // It used "7k/5Q2/6K1/8/8/8/8/8 w" and demanded the engine not play Qf8,
+  // "because Qf8 would be stalemate". Qf8 is CHECKMATE there: it checks along
+  // the eighth rank while the white king on g6 covers g7 and h7. The test was
+  // asking the engine to avoid the best move on the board, and it failed for
+  // that reason and not because of anything in the search.
+  //
+  // This is the trap it meant to set. Black's king on h8 has one square, g8;
+  // White's king on g6 already covers g7 and h7. Any queen move that covers g8
+  // WITHOUT giving check—Qc4 along the long diagonal, say—leaves Black with no
+  // legal move and no check, which is stalemate and half a point thrown away.
+  // Qc8 covers g8 the same way but does it with check, and mates.
+  Position pos = parse("7k/8/6K1/8/8/8/8/2Q5 w - - 0 1");
 
   search::NullReporter reporter;
   search::Limits limits;
@@ -860,13 +869,27 @@ TEST(SearchDraw, DISABLED_AvoidsStalemateWhenWinning) {
 
   const auto result = search::search(pos, limits, reporter);
 
-  // Should NOT play Qf8 (stalemate)
   ASSERT_FALSE(result.pv.empty());
   const auto best_uci = to_uci(result.pv[0]);
-  EXPECT_NE(best_uci, "f7f8") << "Should avoid stalemate";
+  EXPECT_NE(best_uci, "c1c4") << "Qc4 is stalemate, not a win";
+  EXPECT_EQ(best_uci, "c1c8") << "Qc8 is mate";
+  EXPECT_GT(result.eval, CENTIPAWN_MATE_THRESHOLD) << "the engine should see the mate";
+}
 
-  // Should be winning, not drawing
-  EXPECT_GT(result.eval, 500);
+TEST(SearchDraw, ScoresStalemateAsADrawHoweverMuchMaterialIsLeft) {
+  // The position the blunder above would reach: Black is not in check and has
+  // no legal move. A queen up counts for nothing—the game is drawn—and this is
+  // what makes the search prefer Qc8 in the first place.
+  Position pos = parse("7k/8/6K1/8/2Q5/8/8/8 b - - 1 1");
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 4;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  EXPECT_EQ(result.eval, CENTIPAWN_DRAW);
+  EXPECT_TRUE(result.pv.empty()) << "a stalemated side has no move to report";
 }
 
 // -----------------------------------------------------------------------------
