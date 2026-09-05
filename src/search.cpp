@@ -17,13 +17,14 @@
 #include "c3/search.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 #include "c3/eval.hpp"
 #include "c3/movegen.hpp"
@@ -74,6 +75,34 @@ constexpr std::size_t MIN_SIZE_MB = TT_MIN_SIZE_MB;
 constexpr std::size_t MAX_SIZE_MB = TT_MAX_SIZE_MB;
 constexpr std::size_t DEFAULT_SIZE_MB = TT_DEFAULT_SIZE_MB;
 
+// A move is "quiet" when it neither captures nor promotes—nothing on the board
+// changes hands. Quiet moves are the ones killers, history, counter-moves,
+// futility pruning and late move reductions all talk about, because they are
+// the ones that look alike and the ones that are usually pointless.
+bool is_quiet(const Move& mv) {
+  return !mv.captured_piece.has_value() && !mv.promotion_piece.has_value();
+}
+
+// HOW MUCH A CUTOFF IS WORTH
+// A cutoff at depth 8 was expensive to find and speaks about a large subtree; a
+// cutoff at depth 1 is cheap and local. Scaling with depth squared says so, and
+// is the shape every engine settles on. The cap keeps a single very deep cutoff
+// from saturating an entry on its own, which would freeze that move at the
+// front of the quiet moves no matter what happened afterwards.
+constexpr int HISTORY_BONUS_SCALE = 16;
+constexpr int HISTORY_BONUS_CAP = 1'200;
+
+int history_bonus(std::uint8_t depth) {
+  const int d = depth;
+  return std::min(HISTORY_BONUS_SCALE * d * d, HISTORY_BONUS_CAP);
+}
+
+// How many quiet moves a node remembers for the history malus. A node that has
+// searched more than this before finding a cutoff has bigger problems than the
+// exactness of its bookkeeping, and the array keeps the recursion's stack
+// frames small.
+constexpr std::size_t MAX_PENALISED_QUIETS = 32;
+
 // Check if a side has any pieces besides pawns.
 // Used in null-move pruning: don't prune in pawn-only endgames (zugzwang risk).
 bool has_non_pawn_material(const Board& board, Colour colour) {
@@ -103,43 +132,89 @@ bool has_non_pawn_material(const Board& board, Colour colour) {
 // Margins increase with depth: deeper searches need larger margins because
 // there's more potential for the position to improve over multiple plies.
 // =============================================================================
-constexpr int FUTILITY_MARGIN[] = {0, 100, 300}; // margins for depth 0, 1, 2
+constexpr std::array<int, 3> FUTILITY_MARGIN = {0, 100, 300}; // margins for depth 0, 1, 2
 constexpr int FUTILITY_DEPTH = 2;
 
 // =============================================================================
-// MVV-LVA: Most Valuable Victim - Least Valuable Attacker
+// LATE MOVE REDUCTIONS (LMR)
 // =============================================================================
-// The best captures tend to be: high-value pieces captured by low-value pieces.
-// PxQ (pawn takes queen) is almost always good; QxP might lose the queen.
+// Move ordering is a claim: the moves at the front of the list are the ones
+// worth looking at. Alpha-beta only exploits half of that claim—it searches the
+// promising moves first and hopes for a cutoff. LMR exploits the other half: if
+// we really believe a quiet move ranked twentieth is unlikely to be best, we
+// should not spend the same depth on it as on the first move.
 //
-// Score = (victim_value * 100) - attacker_value
-// Higher scores = better captures = searched first
+// So a late quiet move is searched SHALLOWER, with a zero window. Almost always
+// it fails low, which is what ordering predicted, and the node has bought a
+// whole subtree at a fraction of the price. When it does not—when the reduced
+// search beats alpha—the move is searched again at full depth, and if it is
+// still inside the window, once more with the full window to get its true score
+// and its line. Being wrong therefore costs a re-search, not a wrong answer,
+// which is why reductions can be aggressive in a way that pruning cannot.
 //
-// Multiplying the victim by 100 makes the victim dominate: every capture of a
-// queen sorts above every capture of a rook, whatever did the capturing. The
-// attacker's value then breaks ties within a victim class, cheapest first—if
-// two pieces can take the queen, try the one we mind losing least. So PxQ
-// beats NxQ beats QxQ, and all of them beat QxP.
+// THE SHAPE OF THE TABLE
+//   reduction = floor(0.75 + ln(depth) * ln(move number) / 2.25)
+// Both logs matter. Deeper searches can afford to give up more plies, because
+// what is left is still a real search; and confidence that a move is bad grows
+// with how far down the list ordering put it, but only slowly—the fiftieth move
+// is not ten times more hopeless than the fifth. The constants are the ones the
+// engines that measured them settled on.
 //
-// The values themselves live in PIECE_VALUES (eval.hpp); this ordering only
-// depends on their relative sizes, not on the exact numbers.
+// WHO IS EXEMPT, AND WHY
+//   - The first few moves. The whole point is that they are the likely best.
+//   - Captures and promotions. Material swings are exactly what a shallow
+//     search mishandles.
+//   - Moves made or given in check. A forcing line is short and must be seen
+//     to its end; reducing it is how an engine walks into a mate it had time
+//     to see.
+//   - Killers and counter-moves. These are quiet moves the search has specific
+//     evidence for, and evidence is what reductions are supposed to respect.
+//   - PV nodes reduce one ply less. A PV node's job is to produce the true
+//     score and the line behind it, and it is the node whose mistakes are most
+//     expensive: an error there changes the move we play, while an error in a
+//     zero-window node usually only costs a re-search.
 //
-// Returns negative so that std::sort orders best captures first (ascending).
+// FAILURE MODE: TACTICAL BLINDNESS. A quiet move can be a quiet SACRIFICE
+// setup, a mating net, a zugzwang move—brilliant precisely because it looks
+// like nothing. Reduced by three plies, its refutation-or-vindication may lie
+// past the horizon, the reduced search fails low, and nothing triggers the
+// re-search that would have found it. The exemptions above are the cheap
+// insurance against the common cases; the rest is a bet that the moves ordering
+// ranks last are usually as bad as they look, and it is a bet that pays.
 // =============================================================================
 
-int capture_priority_score(const Move& mv) {
-  if (mv.captured_piece.has_value()) {
-    const auto victim_value = PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)];
-    const auto attacker_value = PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
-    return -((victim_value * 100) - attacker_value);
-  }
+constexpr std::uint8_t LMR_MIN_DEPTH = 3;
 
-  if (mv.promotion_piece.has_value()) {
-    return 1;
-  }
+// The first three moves searched at a node are never reduced.
+constexpr std::size_t LMR_MIN_MOVE_NUMBER = 3;
 
-  return 0;
-}
+constexpr double LMR_BASE = 0.75;
+constexpr double LMR_DIVISOR = 2.25;
+
+// The table is consulted with clamped indices, so these bound the arithmetic,
+// not the search: beyond them the reduction simply stops growing.
+constexpr std::size_t LMR_TABLE_DEPTHS = 64;
+constexpr std::size_t LMR_TABLE_MOVES = 64;
+
+// Logarithms are not constexpr in this standard, so the table is filled once at
+// start-up rather than at compile time. It is read-only from then on.
+struct LmrTable {
+  std::array<std::array<std::uint8_t, LMR_TABLE_MOVES>, LMR_TABLE_DEPTHS> reductions{};
+
+  LmrTable() {
+    for (std::size_t depth = 1; depth < LMR_TABLE_DEPTHS; ++depth) {
+      for (std::size_t move_number = 1; move_number < LMR_TABLE_MOVES; ++move_number) {
+        const double reduction =
+            LMR_BASE + (std::log(static_cast<double>(depth)) *
+                        std::log(static_cast<double>(move_number)) / LMR_DIVISOR);
+        reductions[depth][move_number] =
+            static_cast<std::uint8_t>(std::max(0.0, std::floor(reduction)));
+      }
+    }
+  }
+};
+
+const LmrTable LMR_TABLE;
 
 } // namespace
 
@@ -501,6 +576,53 @@ void KillerMoves::store(std::uint8_t ply, const Move& mv) {
 }
 
 // ---------------------------------------------------------------------------
+// History heuristic
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::size_t history_colour_index(const Move& mv) {
+  return static_cast<std::size_t>(colour(mv.piece));
+}
+
+} // namespace
+
+int HistoryTable::probe(const Move& mv) const {
+  return scores_[history_colour_index(mv)][mv.from.index()][mv.to.index()];
+}
+
+void HistoryTable::update(const Move& mv, int bonus) {
+  // A bonus larger than the ceiling would make the gravity term overshoot and
+  // push the score the wrong way, so it is clamped before anything else.
+  const int clamped = std::clamp(bonus, -HISTORY_MAX, HISTORY_MAX);
+  int& score = scores_[history_colour_index(mv)][mv.from.index()][mv.to.index()];
+
+  // The gravity term: nothing while the score is small, exactly -bonus once the
+  // score reaches HISTORY_MAX. See the header for why this shape is wanted.
+  score += clamped - ((score * std::abs(clamped)) / HISTORY_MAX);
+}
+
+void HistoryTable::clear() {
+  for (auto& by_colour : scores_) {
+    for (auto& by_from : by_colour) {
+      by_from.fill(0);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Counter moves
+// ---------------------------------------------------------------------------
+
+std::optional<Move> CounterMoves::probe(const Move& previous) const {
+  return moves_[static_cast<std::size_t>(previous.piece)][previous.to.index()];
+}
+
+void CounterMoves::store(const Move& previous, const Move& refutation) {
+  moves_[static_cast<std::size_t>(previous.piece)][previous.to.index()] = refutation;
+}
+
+// ---------------------------------------------------------------------------
 // Mate score normalisation
 // ---------------------------------------------------------------------------
 
@@ -532,55 +654,233 @@ int eval_out(int eval, std::uint8_t ply) {
 // of O(b^d). That's the difference between depth 16 and depth 8!
 //
 // Our ordering priority:
-//   1. TT move (proven best from previous search)
-//   2. Captures by MVV-LVA (likely to be good)
-//   3. Promotions (creating a queen is usually good)
-//   4. Killer moves (caused cutoffs at this ply before)
-//   5. Quiet moves (lowest priority)
+//   1. Hash move          the move a previous, usually deeper, search found
+//                         best in this very position
+//   2. Captures and promotions, ranked by MVV-LVA
+//   3. Killer 1           the quiet move that most recently caused a cutoff
+//                         at this ply
+//   4. Killer 2           the one before it
+//   5. Counter-move       the quiet move that last refuted the move the
+//                         opponent has just played
+//   6. Everything else    quiet moves, ranked by their history score
+//
+// MVV-LVA: MOST VALUABLE VICTIM, LEAST VALUABLE ATTACKER
+// The best captures tend to be high-value pieces taken by low-value ones. PxQ
+// (pawn takes queen) is almost always good; QxP might lose the queen.
+// Multiplying the victim by MVV_VICTIM_WEIGHT makes the victim dominate: every
+// capture of a queen ranks above every capture of a rook, whatever did the
+// capturing. Subtracting the attacker then breaks ties within a victim class,
+// cheapest attacker first—if two pieces can take the queen, try the one we
+// mind losing least. So PxQ beats NxQ beats QxQ, and all of them beat QxP.
+// The values live in PIECE_VALUES (eval.hpp); the ordering depends only on
+// their relative sizes, not on the exact numbers.
+//
+// SCORE ONCE, THEN PICK LAZILY
+// The obvious implementation is a full sort with a comparator that scores both
+// moves it is handed. That gets two things wrong.
+//
+// First, such a comparator re-scores the same move on every comparison it takes
+// part in: sorting n moves costs O(n log n) comparisons and therefore twice
+// that many scorings, where n would do. Scoring is not free—it reads piece
+// values, compares against the hash move and both killers, and (once history
+// arrives) probes a table—so that repetition is most of the cost of ordering.
+//
+// Second, and worse, a full sort puts the whole list in order when the search
+// will usually look at the first move or two and leave. With decent ordering a
+// node that fails high does so on its FIRST move around nine times in ten;
+// every comparison spent arranging the rest of the list bought nothing.
+//
+// So each move is scored exactly once into a parallel array, and the loop then
+// asks for one move at a time: scan the moves not yet searched, swap the
+// highest-scoring one into place, hand it over. That is a selection sort
+// abandoned as soon as the caller stops asking. Picking k moves out of n costs
+// O(k*n), which for the k = 1 a cutoff usually needs is a single pass instead
+// of a whole sort. In the worst case—every move searched—it is the O(n^2) that
+// selection sort always is, but on at most a couple of hundred 8-byte moves
+// that stay in cache, and by then the node has paid far more for the searches
+// themselves than for any ordering.
 // ---------------------------------------------------------------------------
 
-void detail::order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
-                         const std::optional<Move>& hash_move) {
-  const auto killer1 = killers.probe(ply, 0);
-  const auto killer2 = killers.probe(ply, 1);
+namespace {
 
-  std::ranges::sort(moves, [&](const Move& a, const Move& b) {
-    const auto score = [&](const Move& mv) {
-      // The hash move is the best move a previous (usually deeper) search
-      // found here, so nothing outranks it—not even a queen capture.
-      if (hash_move.has_value() && mv == *hash_move) {
-        return std::numeric_limits<int>::min();
-      }
-      if (mv.captured_piece.has_value()) {
-        return capture_priority_score(mv);
-      }
-      if (mv.promotion_piece.has_value()) {
-        return 1;
-      }
-      if (killer1.has_value() && mv == *killer1) {
-        return 2;
-      }
-      if (killer2.has_value() && mv == *killer2) {
-        return 3;
-      }
-      return 4;
-    };
+constexpr int MVV_VICTIM_WEIGHT = 100;
 
-    return score(a) < score(b);
-  });
+// PROMOTIONS ARE NOT CAPTURES BY THE PROMOTED PIECE
+// Feeding the promoted piece to MVV-LVA as the ATTACKER inverts the ranking a
+// promotion deserves: the more valuable the piece the pawn becomes, the worse
+// its "least valuable attacker" score, so =N ranked ahead of =Q and every node
+// with a promotion spent its first move on the one promotion nobody wants.
+//
+// What a promotion actually does is trade a pawn for the piece it becomes, so
+// it is scored like a capture whose victim is the new piece and whose attacker
+// is the pawn. A move that both captures and promotes earns both halves, which
+// is right: it is two gains in one move.
+int noisy_move_score(const Move& mv) {
+  int score = 0;
+
+  if (mv.captured_piece.has_value()) {
+    score += (PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)] * MVV_VICTIM_WEIGHT) -
+             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  }
+
+  if (mv.promotion_piece.has_value()) {
+    score += (PIECE_VALUES[static_cast<std::size_t>(*mv.promotion_piece)] * MVV_VICTIM_WEIGHT) -
+             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  }
+
+  return score;
+}
+
+// Ordering bands. The gaps are wide enough that nothing can score its way out
+// of its band: the richest move imaginable—a promotion to queen that also
+// captures a queen—is worth about 180,000 above ORDER_NOISY, which still
+// leaves it far below the hash move.
+constexpr int ORDER_HASH_MOVE = 100'000'000;
+constexpr int ORDER_NOISY = 1'000'000;
+constexpr int ORDER_KILLER_1 = 900'000;
+constexpr int ORDER_KILLER_2 = 800'000;
+constexpr int ORDER_COUNTER_MOVE = 700'000;
+
+// Quiet moves are ranked by history alone, which saturates at ±HISTORY_MAX and
+// so can never climb into the counter-move band above.
+static_assert(HISTORY_MAX < ORDER_COUNTER_MOVE, "history must not outrank a counter-move");
+
+// The busiest legal position anyone has constructed offers 218 moves, and 256
+// is the round number engines conventionally allow for. Nothing is written past
+// it: a position that somehow offered more would simply have its surplus moves
+// searched in generation order (see select()), never scored out of bounds.
+constexpr std::size_t MAX_SCORED_MOVES = MOVE_LIST_RESERVE;
+
+class OrderedMoves {
+public:
+  // Main search: the full priority list above.
+  OrderedMoves(MoveList& moves, const SearchContext& ctx, std::uint8_t ply,
+               const std::optional<Move>& hash_move, const std::optional<Move>& previous_move)
+      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)),
+        killer1_(ctx.killers.probe(ply, 0)), killer2_(ctx.killers.probe(ply, 1)),
+        counter_(previous_move.has_value() ? ctx.counters.probe(*previous_move) : std::nullopt) {
+    for (std::size_t i = 0; i < scored_; ++i) {
+      scores_[i] = score(moves_[i], ctx.history, hash_move);
+    }
+  }
+
+  // Quiescence: every move there is a capture or a promotion, so MVV-LVA is
+  // the whole ordering—there are no killers or quiet moves to rank.
+  explicit OrderedMoves(MoveList& moves)
+      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)) {
+    for (std::size_t i = 0; i < scored_; ++i) {
+      scores_[i] = noisy_move_score(moves_[i]);
+    }
+  }
+
+  // The quiet moves this node has specific reason to believe in. Reductions
+  // leave them alone: they are the moves most likely to be the exception that
+  // a reduced search would miss.
+  [[nodiscard]] bool is_refutation(const Move& mv) const {
+    return (killer1_.has_value() && mv == *killer1_) || (killer2_.has_value() && mv == *killer2_) ||
+           (counter_.has_value() && mv == *counter_);
+  }
+
+  // Hand over the best move not yet searched, swapping it into `index` so that
+  // `moves` ends up in searched order and the tail stays untouched. Ties keep
+  // generation order, which is what makes a search reproducible.
+  const Move& select(std::size_t index) {
+    if (index >= scored_) {
+      return moves_[index];
+    }
+
+    std::size_t best = index;
+    for (std::size_t i = index + 1; i < scored_; ++i) {
+      if (scores_[i] > scores_[best]) {
+        best = i;
+      }
+    }
+
+    if (best != index) {
+      std::swap(moves_[index], moves_[best]);
+      std::swap(scores_[index], scores_[best]);
+    }
+
+    return moves_[index];
+  }
+
+private:
+  int score(const Move& mv, const HistoryTable& history,
+            const std::optional<Move>& hash_move) const {
+    // The hash move is the best move a previous (usually deeper) search found
+    // here, so nothing outranks it—not even a queen capture.
+    if (hash_move.has_value() && mv == *hash_move) {
+      return ORDER_HASH_MOVE;
+    }
+
+    if (!is_quiet(mv)) {
+      return ORDER_NOISY + noisy_move_score(mv);
+    }
+
+    if (killer1_.has_value() && mv == *killer1_) {
+      return ORDER_KILLER_1;
+    }
+
+    if (killer2_.has_value() && mv == *killer2_) {
+      return ORDER_KILLER_2;
+    }
+
+    if (counter_.has_value() && mv == *counter_) {
+      return ORDER_COUNTER_MOVE;
+    }
+
+    // Everything left is a quiet move with nothing special about it, and
+    // history is the only thing that distinguishes one from another. A move
+    // that has been failing is ranked BELOW an untried one, which is the whole
+    // point of the malus.
+    return history.probe(mv);
+  }
+
+  MoveList& moves_;
+  std::size_t scored_;
+  std::optional<Move> killer1_;
+  std::optional<Move> killer2_;
+  std::optional<Move> counter_;
+  // Deliberately left uninitialised: entries [0, scored_) are written by the
+  // constructor before anything reads them, and zeroing a kilobyte at every
+  // node would cost more than the ordering it serves.
+  std::array<int, MAX_SCORED_MOVES> scores_; // NOLINT(*-member-init)
+};
+
+} // namespace
+
+void detail::order_moves(MoveList& moves, const SearchContext& ctx, std::uint8_t ply,
+                         const std::optional<Move>& hash_move,
+                         const std::optional<Move>& previous_move) {
+  // The eager form: run the lazy selection all the way to the end. The search
+  // itself never calls this—it asks for one move at a time and usually stops
+  // after the first—but "the whole list, in order" is what a test can read.
+  OrderedMoves ordering(moves, ctx, ply, hash_move, previous_move);
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    ordering.select(i);
+  }
 }
 
 void detail::order_quiescence_moves(MoveList& moves) {
-  std::ranges::sort(moves, [](const Move& a, const Move& b) {
-    const auto score = [](const Move& mv) {
-      const auto victim = mv.captured_piece.value_or(pawn(colour(mv.piece)));
-      const auto lva = mv.promotion_piece.value_or(mv.piece);
-      const auto victim_score = PIECE_VALUES[static_cast<std::size_t>(victim)];
-      const auto lva_score = PIECE_VALUES[static_cast<std::size_t>(lva)];
-      return -((victim_score * 100) - lva_score);
-    };
-    return score(a) < score(b);
-  });
+  OrderedMoves ordering(moves);
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    ordering.select(i);
+  }
+}
+
+std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, bool is_pv_node) {
+  const auto depth_index = std::min<std::size_t>(depth, LMR_TABLE_DEPTHS - 1);
+  const auto move_index = std::min<std::size_t>(move_number, LMR_TABLE_MOVES - 1);
+
+  const std::uint8_t reduction = LMR_TABLE.reductions[depth_index][move_index];
+
+  // A PV node is the one whose mistakes change the move we play, so it gives up
+  // one ply less than the zero-window nodes around it.
+  if (is_pv_node && reduction > 0) {
+    return static_cast<std::uint8_t>(reduction - 1);
+  }
+
+  return reduction;
 }
 
 // ---------------------------------------------------------------------------
@@ -633,9 +933,11 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
 
   // Only search noisy moves (captures and promotions)
   MoveList moves = pseudo_legal_noisy_moves(pos);
-  detail::order_quiescence_moves(moves);
+  OrderedMoves ordering(moves);
 
-  for (const auto& mv : moves) {
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    const Move mv = ordering.select(i);
+
     pos.make_move(mv);
 
     // Skip illegal moves (leave king in check)
@@ -681,8 +983,8 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
-                      TranspositionTable& tt, KillerMoves& killers, Report& report,
-                      const Stopper& stopper) {
+                      TranspositionTable& tt, SearchContext& ctx, Report& report,
+                      const Stopper& stopper, const std::optional<Move>& previous_move) {
   // Check if we should stop searching (time limit, node limit, external signal)
   if (stopper.should_stop(report)) {
     return 0;
@@ -782,8 +1084,10 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     const int r = depth > 6 ? 3 : 2; // Deeper positions allow more reduction
     MoveList scratch;
     // Zero-window search: just checking if score >= beta
+    // No previous move to answer: we did not make one. A counter-move keyed by
+    // the opponent's last real move would be answering the wrong question.
     const int null_eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - r - 1), -beta,
-                                     -beta + 1, scratch, tt, killers, report, stopper);
+                                     -beta + 1, scratch, tt, ctx, report, stopper, std::nullopt);
 
     report.ply -= 1;
     pos.unmake_null_move();
@@ -824,18 +1128,30 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // search is finding would make us search the same move twice.
   const std::optional<Move> hash_move = decode_tt_move(hash_move_packed, moves);
 
-  detail::order_moves(moves, killers, report.ply, hash_move);
+  OrderedMoves ordering(moves, ctx, report.ply, hash_move, previous_move);
 
-  bool has_searched_one = false;
+  // How many legal moves this node has actually searched, so the move about to
+  // be searched is number `moves_searched + 1`. Late move reductions are a
+  // statement about that number, and futility pruning has always needed to know
+  // whether anything had been searched at all.
+  std::size_t moves_searched = 0;
   Bound tt_bound = Bound::Upper;
 
   // The best move THIS search finds, kept apart from `hash_move` above.
   std::optional<Move> best_move = std::nullopt;
 
-  // The hash move is simply the first entry of `moves` now, so it goes through
-  // the same loop as everything else: same legality check, same PVS treatment,
-  // and—crucially—exactly once.
-  for (const auto& mv : moves) {
+  // The quiet moves searched here so far. If one of the moves after them causes
+  // a cutoff, these are the ones that were tried first and did not work, and
+  // history wants to hear about it.
+  std::array<Move, MAX_PENALISED_QUIETS> searched_quiets{};
+  std::size_t searched_quiet_count = 0;
+
+  // The hash move is simply the first move the ordering hands over, so it goes
+  // through the same loop as everything else: same legality check, same PVS
+  // treatment, and—crucially—exactly once.
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    const Move mv = ordering.select(i);
+
     pos.make_move(mv);
 
     if (is_in_check(colour_to_move, pos.board)) {
@@ -847,40 +1163,62 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // At shallow depths, skip quiet moves that can't possibly raise alpha.
     // Don't prune captures, promotions, or when in check.
     // Only prune after first move to avoid falsely returning stalemate.
-    if (has_searched_one && depth <= FUTILITY_DEPTH && !in_check &&
-        !mv.captured_piece.has_value() && !mv.promotion_piece.has_value() &&
-        static_eval + FUTILITY_MARGIN[depth] <= alpha) {
+    if (moves_searched > 0 && depth <= FUTILITY_DEPTH && !in_check && is_quiet(mv) &&
+        static_eval + FUTILITY_MARGIN[static_cast<std::size_t>(depth)] <= alpha) {
       pos.unmake_move(mv);
       continue;
     }
 
+    ++moves_searched;
     report.ply += 1;
 
     MoveList child_pv;
     int eval;
 
-    // PRINCIPAL VARIATION SEARCH (PVS)
-    // After searching the first move (assumed best due to move ordering),
-    // search remaining moves with a "zero window" (alpha, alpha+1). This is
-    // faster but only proves "this move is worse than alpha" or "better".
-    //
-    // If a move beats alpha in the zero-window search, it might be a new best
-    // move—re-search with the full window to get the true score.
-    if (has_searched_one) {
-      MoveList zero_window_pv;
-      // Zero-window: just checking if move can beat alpha
-      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
-                        zero_window_pv, tt, killers, report, stopper);
+    if (moves_searched == 1) {
+      // First move: search with full window. Ordering says this is the likely
+      // best move, and the score the rest are measured against has to come
+      // from somewhere.
+      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt, ctx,
+                        report, stopper, mv);
+    } else {
+      // LATE MOVE REDUCTIONS
+      // A quiet move ordering ranked near the back is searched shallower. The
+      // check for whether the move GIVES check is last because it costs a scan
+      // of the board and the cheap conditions usually decide the question.
+      std::uint8_t reduction = 0;
+      if (depth >= LMR_MIN_DEPTH && moves_searched > LMR_MIN_MOVE_NUMBER && is_quiet(mv) &&
+          !in_check && !ordering.is_refutation(mv) && !is_in_check(pos.colour_to_move, pos.board)) {
+        reduction = lmr_reduction(depth, moves_searched, is_pv_node);
 
-      // Re-search with full window if zero-window found a potential improvement
+        // Never reduce into quiescence: a move searched at depth 0 is a move
+        // nobody looked at, which is pruning, not reducing. depth is at least
+        // LMR_MIN_DEPTH here, so there is always at least one ply to keep.
+        reduction = std::min(reduction, static_cast<std::uint8_t>(depth - 2));
+      }
+
+      // PRINCIPAL VARIATION SEARCH (PVS)
+      // After the first move, search the rest with a "zero window"
+      // (alpha, alpha+1). That only proves "worse than alpha" or "better", but
+      // it proves it far more cheaply than a real search.
+      MoveList zero_window_pv;
+      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1 - reduction), -alpha - 1, -alpha,
+                        zero_window_pv, tt, ctx, report, stopper, mv);
+
+      // The reduced search says the move is better than alpha, and a reduced
+      // search is not entitled to that opinion: verify it at full depth, still
+      // with the zero window.
+      if (reduction > 0 && eval > alpha) {
+        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
+                          zero_window_pv, tt, ctx, report, stopper, mv);
+      }
+
+      // Still looking like a new best move, so pay for the real thing: the full
+      // window is what produces a true score and the line behind it.
       if (eval > alpha && eval < beta) {
         eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
-                          killers, report, stopper);
+                          ctx, report, stopper, mv);
       }
-    } else {
-      // First move: search with full window
-      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
-                        killers, report, stopper);
     }
 
     report.ply -= 1;
@@ -888,9 +1226,26 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
     // BETA CUTOFF: This move is too good—opponent won't allow this position
     if (eval >= beta) {
-      // Store quiet moves that cause cutoffs as "killer moves"
-      if (!mv.captured_piece.has_value() && !mv.promotion_piece.has_value()) {
-        killers.store(report.ply, mv);
+      // A quiet move that causes a cutoff is the only kind worth remembering.
+      // Captures need no help: MVV-LVA already ranks them, and recording them
+      // here would crowd out the quiet moves these tables exist to rescue from
+      // the back of the list.
+      if (is_quiet(mv)) {
+        ctx.killers.store(report.ply, mv);
+
+        const int bonus = history_bonus(depth);
+        ctx.history.update(mv, bonus);
+
+        // ...and the quiet moves that were searched before it are evidence
+        // against themselves: they were ranked ahead of the move that actually
+        // worked, and the malus is what moves them back.
+        for (std::size_t q = 0; q < searched_quiet_count; ++q) {
+          ctx.history.update(searched_quiets[q], -bonus);
+        }
+
+        if (previous_move.has_value()) {
+          ctx.counters.store(*previous_move, mv);
+        }
       }
 
       // Store in TT as a lower bound (actual score might be even higher)
@@ -910,11 +1265,14 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       pv.insert(pv.end(), child_pv.begin(), child_pv.end());
     }
 
-    has_searched_one = true;
+    if (is_quiet(mv) && searched_quiet_count < searched_quiets.size()) {
+      searched_quiets[searched_quiet_count] = mv;
+      ++searched_quiet_count;
+    }
   }
 
   // No legal moves: either checkmate or stalemate
-  if (!has_searched_one) {
+  if (moves_searched == 0) {
     // Checkmate: return negative mate score (we're getting mated)
     // Stalemate: draw
     return in_check ? -CENTIPAWN_MATE + report.ply : CENTIPAWN_DRAW;
@@ -931,6 +1289,18 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   }
 
   return alpha;
+}
+
+int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
+                      TranspositionTable& tt, KillerMoves& killers, Report& report,
+                      const Stopper& stopper) {
+  SearchContext ctx;
+  ctx.killers = killers;
+
+  const int eval = alphabeta(pos, depth, alpha, beta, pv, tt, ctx, report, stopper);
+
+  killers = ctx.killers;
+  return eval;
 }
 
 // ---------------------------------------------------------------------------
@@ -969,7 +1339,10 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
   // candidates for replacement as this search fills the table.
   tt.new_search();
 
-  KillerMoves killers;
+  // Everything this search learns about move ordering, built here and thrown
+  // away on return. See SearchContext in the header for why it does not outlive
+  // one search the way the transposition table does.
+  SearchContext ctx;
   Report report;
 
   const std::uint8_t max_depth = limits.depth.has_value() ? *limits.depth : MAX_DEPTH;
@@ -1024,7 +1397,7 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
       // could report a mixture of two different searches.
       pv.clear();
 
-      const int eval = detail::alphabeta(pos, depth, alpha, beta, pv, tt, killers, report, stopper);
+      const int eval = detail::alphabeta(pos, depth, alpha, beta, pv, tt, ctx, report, stopper);
 
       // Accept result if: within bounds, stopped, or already using full window
       // (full window means we can't widen further, so accept whatever we get)

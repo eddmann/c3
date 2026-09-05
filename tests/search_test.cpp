@@ -89,12 +89,12 @@ TEST(SearchOrdering, OrdersMvvLvaAndKillers) {
                     knight_cap_rook,
                     knight_cap_knight};
 
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   const std::uint8_t ply = 0;
-  killers.store(ply, killer2);
-  killers.store(ply, killer1);
+  ctx.killers.store(ply, killer2);
+  ctx.killers.store(ply, killer1);
 
-  search::detail::order_moves(moves, killers, ply);
+  search::detail::order_moves(moves, ctx, ply);
 
   const MoveList expected = {pawn_cap_queen,    knight_cap_queen,  knight_cap_rook,
                              knight_cap_bishop, knight_cap_knight, pawn_cap_pawn,
@@ -113,12 +113,12 @@ TEST(SearchOrdering, PutsTheHashMoveAheadOfEverything) {
 
   MoveList moves = {quiet, killer, pawn_cap_queen};
 
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   const std::uint8_t ply = 0;
-  killers.store(ply, killer);
+  ctx.killers.store(ply, killer);
 
   // A previous search already proved a move best here; it outranks even PxQ.
-  search::detail::order_moves(moves, killers, ply, quiet);
+  search::detail::order_moves(moves, ctx, ply, quiet);
 
   ASSERT_EQ(moves.size(), 3U);
   EXPECT_EQ(moves[0], quiet);
@@ -146,6 +146,284 @@ TEST(SearchOrdering, QuiescenceOrdersMvvLva) {
   for (std::size_t i = 0; i < moves.size(); ++i) {
     EXPECT_EQ(moves[i], expected[i]) << "index " << i;
   }
+}
+
+TEST(SearchOrdering, QuiescencePrefersQueenPromotions) {
+  // A pawn reaching the last rank almost always wants to be a queen. An
+  // underpromotion is a curiosity that decides perhaps one game in ten
+  // thousand, so searching =N before =Q wastes the first—and often only—move
+  // the node gets to look at.
+  const auto promote_knight = make_move(Piece::WP, "b7", "b8", std::nullopt, Piece::WN);
+  const auto promote_rook = make_move(Piece::WP, "b7", "b8", std::nullopt, Piece::WR);
+  const auto promote_queen = make_move(Piece::WP, "b7", "b8", std::nullopt, Piece::WQ);
+  const auto capture_promote_knight = make_move(Piece::WP, "b7", "c8", Piece::BR, Piece::WN);
+  const auto capture_promote_queen = make_move(Piece::WP, "b7", "c8", Piece::BR, Piece::WQ);
+
+  MoveList moves = {promote_knight, promote_rook, promote_queen, capture_promote_knight,
+                    capture_promote_queen};
+
+  search::detail::order_quiescence_moves(moves);
+
+  const auto position_of = [&moves](const Move& mv) {
+    return std::ranges::find(moves, mv) - moves.begin();
+  };
+
+  EXPECT_EQ(moves[0], capture_promote_queen);
+  EXPECT_EQ(moves[1], promote_queen);
+  EXPECT_LT(position_of(capture_promote_queen), position_of(capture_promote_knight));
+  EXPECT_LT(position_of(promote_queen), position_of(promote_rook));
+  EXPECT_LT(position_of(promote_rook), position_of(promote_knight));
+}
+
+TEST(SearchOrdering, TriesTheCounterMoveAfterTheKillers) {
+  const auto previous = make_move(Piece::BN, "g8", "f6");
+  const auto counter = make_move(Piece::WP, "e4", "e5");
+  const auto killer1 = make_move(Piece::WP, "a2", "a3");
+  const auto killer2 = make_move(Piece::WP, "b2", "b3");
+  const auto quiet = make_move(Piece::WP, "c2", "c3");
+  const auto capture = make_move(Piece::WN, "f4", "d5", Piece::BQ);
+
+  MoveList moves = {quiet, counter, killer2, killer1, capture};
+
+  search::SearchContext ctx;
+  const std::uint8_t ply = 0;
+  ctx.killers.store(ply, killer2);
+  ctx.killers.store(ply, killer1);
+  ctx.counters.store(previous, counter);
+
+  search::detail::order_moves(moves, ctx, ply, std::nullopt, previous);
+
+  const MoveList expected = {capture, killer1, killer2, counter, quiet};
+  ASSERT_EQ(moves.size(), expected.size());
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    EXPECT_EQ(moves[i], expected[i]) << "index " << i;
+  }
+}
+
+TEST(SearchOrdering, RanksQuietMovesByHistory) {
+  const auto proven = make_move(Piece::WR, "d1", "d2");
+  const auto untried = make_move(Piece::WR, "d1", "d3");
+  const auto discredited = make_move(Piece::WR, "d1", "d4");
+
+  MoveList moves = {discredited, untried, proven};
+
+  search::SearchContext ctx;
+  ctx.history.update(proven, 800);
+  ctx.history.update(discredited, -800);
+
+  search::detail::order_moves(moves, ctx, 0);
+
+  const MoveList expected = {proven, untried, discredited};
+  ASSERT_EQ(moves.size(), expected.size());
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    EXPECT_EQ(moves[i], expected[i]) << "index " << i;
+  }
+}
+
+// History heuristic and counter-moves -------------------------------------------
+
+TEST(SearchHistory, GravityMakesScoresSaturateInsteadOfRunningAway) {
+  search::HistoryTable history;
+  const auto mv = make_move(Piece::WN, "g1", "f3");
+
+  int previous = 0;
+  for (int i = 0; i < 1'000; ++i) {
+    history.update(mv, 1'200);
+    const int score = history.probe(mv);
+    EXPECT_GE(score, previous) << "a bonus must never lower a score";
+    EXPECT_LE(score, search::HISTORY_MAX) << "gravity must cap the score";
+    previous = score;
+  }
+
+  EXPECT_GT(previous, search::HISTORY_MAX / 2) << "repeated cutoffs should still add up";
+
+  // A malus is the same update with the sign flipped, so it pulls back down.
+  history.update(mv, -1'200);
+  EXPECT_LT(history.probe(mv), previous);
+
+  // e2-e4 is a white move; the same square pair for Black is a different entry.
+  const auto same_squares_for_black = make_move(Piece::BN, "g1", "f3");
+  EXPECT_EQ(history.probe(same_squares_for_black), 0);
+
+  history.clear();
+  EXPECT_EQ(history.probe(mv), 0);
+}
+
+TEST(SearchHistory, RewardsTheQuietMoveThatCausedACutoff) {
+  // Nothing to capture and nothing to promote, so whichever move causes the
+  // cutoff is certain to be a quiet one.
+  Position pos = parse("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1");
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  // The move the search will try first, ordered by the same empty context the
+  // search itself starts from.
+  MoveList moves = pseudo_legal_moves(pos);
+  search::detail::order_moves(moves, ctx, 0);
+  ASSERT_FALSE(moves.empty());
+  const Move first_searched = moves[0];
+  ASSERT_EQ(ctx.history.probe(first_searched), 0);
+
+  // A beta at the very bottom of the scale means the first move searched fails
+  // high immediately, so the move that causes the cutoff is one we can name.
+  search::detail::alphabeta(pos, 2, CENTIPAWN_MIN, CENTIPAWN_MIN + 1, pv, tt, ctx, report, stopper);
+
+  EXPECT_GT(ctx.history.probe(first_searched), 0);
+}
+
+TEST(SearchHistory, PenalisesQuietMovesTriedBeforeTheCutoff) {
+  // Deep enough that quiet moves are doing the refuting: a shallow search of a
+  // sharp position cuts off almost entirely on captures, which history ignores.
+  Position pos = Position::startpos();
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  // Every quiet cutoff rewards one move and penalises the quiet moves that were
+  // tried before it, so a search of any size leaves both signs in the table.
+  // The exact numbers belong to the shape of the search and are not worth
+  // pinning; that negatives appear at all is what says the malus is applied.
+  int rewarded = 0;
+  int penalised = 0;
+  for (const auto piece : {Piece::WP, Piece::BP}) {
+    for (std::uint8_t from = 0; from < 64; ++from) {
+      for (std::uint8_t to = 0; to < 64; ++to) {
+        const Move probe{
+            .piece = piece,
+            .from = Square::from_index(from),
+            .to = Square::from_index(to),
+        };
+        const int score = ctx.history.probe(probe);
+        if (score > 0) {
+          ++rewarded;
+        } else if (score < 0) {
+          ++penalised;
+        }
+      }
+    }
+  }
+
+  EXPECT_GT(rewarded, 0) << "a quiet cutoff must reward the move that caused it";
+  EXPECT_GT(penalised, 0) << "the quiet moves tried before it must be penalised";
+}
+
+// Late move reductions ---------------------------------------------------------
+
+TEST(SearchReductions, GrowWithDepthAndMoveNumber) {
+  const auto reduction = [](std::uint8_t depth, std::size_t move_number, bool is_pv_node) {
+    return static_cast<int>(search::detail::lmr_reduction(depth, move_number, is_pv_node));
+  };
+
+  // floor(0.75 + ln(depth) * ln(move number) / 2.25), the shape the table is
+  // built from. Spot values rather than a reimplementation of the formula:
+  // a test that recomputes what it is testing proves nothing.
+  EXPECT_EQ(reduction(3, 4, false), 1);
+  EXPECT_EQ(reduction(8, 8, false), 2);
+  EXPECT_EQ(reduction(16, 16, false), 4);
+
+  // A PV node gives up one ply less than the zero-window nodes around it.
+  EXPECT_EQ(reduction(16, 16, true), 3);
+  EXPECT_EQ(reduction(8, 8, true), 1);
+
+  // ln(1) = 0, so depth 1 reduces nothing however late the move; and a
+  // reduction is never negative.
+  EXPECT_EQ(reduction(1, 60, false), 0);
+  EXPECT_EQ(reduction(3, 4, true), 0);
+
+  // Monotone in both arguments: deeper searches can spare more, and the further
+  // down the list ordering put a move the less it is believed.
+  for (std::uint8_t depth = 3; depth < 32; ++depth) {
+    for (std::size_t move_number = 4; move_number < 32; ++move_number) {
+      EXPECT_GE(reduction(depth, move_number, false), reduction(depth - 1, move_number, false));
+      EXPECT_GE(reduction(depth, move_number, false), reduction(depth, move_number - 1, false));
+    }
+  }
+
+  // Out-of-range arguments are clamped, not wrapped: the reduction stops
+  // growing rather than folding back to zero.
+  EXPECT_EQ(reduction(255, 250, false), reduction(63, 63, false));
+}
+
+TEST(SearchReductions, SearchLateQuietMovesShallower) {
+  // Reductions have no output of their own; the only thing they change is how
+  // much work a search does. Measured in this Debug build, the starting
+  // position at depth 6 costs about 26,000 nodes when every move is searched at
+  // full depth and about 11,500 once late quiet moves are reduced. The ceiling
+  // sits between the two and far enough from both that retuning the evaluation
+  // can move the number around without making the test lie.
+  Position pos = Position::startpos();
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(8);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  EXPECT_LT(report.nodes, 18'000U) << "late quiet moves should not be costing full depth";
+
+  // ...and the shallower search still comes back with a real line, not with
+  // whatever a reduced search happened to leave behind.
+  ASSERT_FALSE(pv.empty());
+  EXPECT_GE(pv.size(), 2U);
+}
+
+TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
+  search::CounterMoves counters;
+  const auto previous = make_move(Piece::BP, "d7", "d5");
+  const auto refutation = make_move(Piece::WP, "e4", "e5");
+
+  EXPECT_FALSE(counters.probe(previous).has_value());
+
+  counters.store(previous, refutation);
+  EXPECT_EQ(counters.probe(previous), refutation);
+
+  // Only the moved piece and where it landed are the key: the same pawn
+  // arriving on d5 from d6 asks the same question.
+  const auto same_arrival = make_move(Piece::BP, "d6", "d5");
+  EXPECT_EQ(counters.probe(same_arrival), refutation);
+
+  // A different piece landing there does not.
+  const auto other_piece = make_move(Piece::BN, "f6", "d5");
+  EXPECT_FALSE(counters.probe(other_piece).has_value());
+}
+
+TEST(SearchCounterMoves, ASearchFillsTheTable) {
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  int recorded = 0;
+  for (const auto piece : all_pieces()) {
+    for (std::uint8_t to = 0; to < 64; ++to) {
+      const Move probe{
+          .piece = piece,
+          .from = Square::from_index(0),
+          .to = Square::from_index(to),
+      };
+      if (ctx.counters.probe(probe).has_value()) {
+        ++recorded;
+      }
+    }
+  }
+
+  EXPECT_GT(recorded, 0) << "quiet cutoffs should leave counter-moves behind";
 }
 
 // Transposition table layout, move packing and replacement ---------------------
@@ -352,7 +630,7 @@ TEST(NullMove, StoresLowerBoundOnFailHigh) {
   Position pos = parse("6k1/8/8/8/8/8/4Q3/4K3 w - - 0 1");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
@@ -360,7 +638,7 @@ TEST(NullMove, StoresLowerBoundOnFailHigh) {
   const int beta = 50;
   const int alpha = -CENTIPAWN_MAX;
 
-  const int eval = search::detail::alphabeta(pos, 4, alpha, beta, pv, tt, killers, report, stopper);
+  const int eval = search::detail::alphabeta(pos, 4, alpha, beta, pv, tt, ctx, report, stopper);
 
   const auto* const entry = tt.probe(pos.key);
   ASSERT_NE(entry, nullptr);
@@ -379,12 +657,12 @@ TEST(NullMove, DoesNotEraseAnExistingBestMove) {
   const auto known_best = make_move(Piece::WQ, "e2", "e7");
   tt.store(pos.key, 2, 100, search::Bound::Exact, search::encode_tt_move(known_best));
 
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
   MoveList pv;
-  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, 50, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, 50, pv, tt, ctx, report, stopper);
 
   const auto* const entry = tt.probe(pos.key);
   ASSERT_NE(entry, nullptr);
@@ -404,13 +682,13 @@ TEST(NullMove, NeverStoresAMateScoreFromPassing) {
   Position pos = parse("R6k/8/6K1/8/8/8/8/8 w - - 0 1");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
   MoveList pv;
   const int beta = 50;
-  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, beta, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, beta, pv, tt, ctx, report, stopper);
 
   const auto* const entry = tt.probe(pos.key);
   if (entry != nullptr) {
@@ -441,14 +719,14 @@ TEST(TranspositionTable, NonPvNodesTakeCutoffsFromEveryBoundType) {
 
   for (const auto& scenario : cases) {
     search::TranspositionTable tt;
-    search::KillerMoves killers;
+    search::SearchContext ctx;
     search::Report report;
     search::Stopper stopper;
 
     tt.store(pos.key, 5, scenario.score, scenario.bound, search::TT_NO_MOVE);
 
     MoveList pv;
-    const int eval = search::detail::alphabeta(pos, 3, 0, 1, pv, tt, killers, report, stopper);
+    const int eval = search::detail::alphabeta(pos, 3, 0, 1, pv, tt, ctx, report, stopper);
 
     EXPECT_EQ(eval, scenario.expected) << scenario.name;
     // One node: the cutoff node itself, which we did enter and did decide.
@@ -461,14 +739,14 @@ TEST(TranspositionTable, PvNodesRefuseTheCutoffAndSearchAnyway) {
   Position pos = Position::startpos();
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
   tt.store(pos.key, 5, 123, search::Bound::Exact, search::TT_NO_MOVE);
 
   MoveList pv;
-  search::detail::alphabeta(pos, 3, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 3, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   EXPECT_GT(report.nodes, 0U) << "a PV node must search so that it has a line to report";
   EXPECT_FALSE(pv.empty());
@@ -489,11 +767,17 @@ TEST(SearchCorrectness, MatchesStartposDepth2) {
   // the tempo bonus the side to move collects at the leaf.
   EXPECT_EQ(result.eval, TEMPO_BONUS);
 
+  // Nb1c3 and Ng1f3 are mirror images of one another in the starting position and
+  // score EXACTLY the same, as do Nb8c6 and Ng8f6 in reply. Which one comes back
+  // is a tie broken by move ordering, not a preference the search has, so the
+  // test asks for a developing knight move rather than pinning the coin flip.
+  // (It used to pin "g1f3": the order an unstable std::sort happened to leave
+  // equal-scoring moves in before ordering became a deterministic selection.)
   const auto pv = pv_to_uci(result.pv);
   ASSERT_GE(pv.size(), 1U);
-  EXPECT_EQ(pv[0], "g1f3");
+  EXPECT_TRUE(pv[0] == "b1c3" || pv[0] == "g1f3") << "unexpected first move " << pv[0];
   if (pv.size() > 1) {
-    EXPECT_EQ(pv[1], "g8f6");
+    EXPECT_TRUE(pv[1] == "b8c6" || pv[1] == "g8f6") << "unexpected reply " << pv[1];
   }
 }
 
@@ -566,11 +850,20 @@ TEST(SearchDraw, ReportsADrawnPvAsADrawAndTruncatesIt) {
   }
 }
 
-TEST(SearchDraw, DISABLED_AvoidsStalemateWhenWinning) {
-  // Q+K vs K - white is winning but can stalemate
-  // Position: white king g6, white queen f7, black king h8
-  // Qf8 would be stalemate!
-  Position pos = parse("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1");
+TEST(SearchDraw, AvoidsStalemateWhenWinning) {
+  // THE OLD POSITION WAS MISLABELLED, WHICH IS WHY THIS TEST WAS DISABLED.
+  // It used "7k/5Q2/6K1/8/8/8/8/8 w" and demanded the engine not play Qf8,
+  // "because Qf8 would be stalemate". Qf8 is CHECKMATE there: it checks along
+  // the eighth rank while the white king on g6 covers g7 and h7. The test was
+  // asking the engine to avoid the best move on the board, and it failed for
+  // that reason and not because of anything in the search.
+  //
+  // This is the trap it meant to set. Black's king on h8 has one square, g8;
+  // White's king on g6 already covers g7 and h7. Any queen move that covers g8
+  // WITHOUT giving check—Qc4 along the long diagonal, say—leaves Black with no
+  // legal move and no check, which is stalemate and half a point thrown away.
+  // Qc8 covers g8 the same way but does it with check, and mates.
+  Position pos = parse("7k/8/6K1/8/8/8/8/2Q5 w - - 0 1");
 
   search::NullReporter reporter;
   search::Limits limits;
@@ -578,13 +871,27 @@ TEST(SearchDraw, DISABLED_AvoidsStalemateWhenWinning) {
 
   const auto result = search::search(pos, limits, reporter);
 
-  // Should NOT play Qf8 (stalemate)
   ASSERT_FALSE(result.pv.empty());
   const auto best_uci = to_uci(result.pv[0]);
-  EXPECT_NE(best_uci, "f7f8") << "Should avoid stalemate";
+  EXPECT_NE(best_uci, "c1c4") << "Qc4 is stalemate, not a win";
+  EXPECT_EQ(best_uci, "c1c8") << "Qc8 is mate";
+  EXPECT_GT(result.eval, CENTIPAWN_MATE_THRESHOLD) << "the engine should see the mate";
+}
 
-  // Should be winning, not drawing
-  EXPECT_GT(result.eval, 500);
+TEST(SearchDraw, ScoresStalemateAsADrawHoweverMuchMaterialIsLeft) {
+  // The position the blunder above would reach: Black is not in check and has
+  // no legal move. A queen up counts for nothing—the game is drawn—and this is
+  // what makes the search prefer Qc8 in the first place.
+  Position pos = parse("7k/8/6K1/8/2Q5/8/8/8 b - - 1 1");
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 4;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  EXPECT_EQ(result.eval, CENTIPAWN_DRAW);
+  EXPECT_TRUE(result.pv.empty()) << "a stalemated side has no move to report";
 }
 
 // -----------------------------------------------------------------------------
@@ -670,6 +977,71 @@ TEST(SearchMate, ReportsMoveCountUntilMate) {
 
   // The eval should encode mate score
   EXPECT_GT(result.eval, CENTIPAWN_MATE - 10);
+}
+
+// -----------------------------------------------------------------------------
+// Tactical Sanity
+// -----------------------------------------------------------------------------
+// Reductions and history are bets: that a quiet move ordering ranked last is as
+// bad as it looks, and that a move which worked elsewhere will work here. Both
+// bets are usually right and both fail in the same direction—by not looking at
+// the move that mattered. Nothing else in this file would notice: node counts
+// would improve, the mate tests would still pass, and the engine would quietly
+// start missing tactics.
+//
+// So: a handful of positions with one right answer, each cheap enough to search
+// under the sanitisers. They are deliberately of different shapes—a mate found
+// by a check, a mate whose key move is quiet, a fork that wins material without
+// mating—because a reduction bug shows up in some shapes and not others.
+// -----------------------------------------------------------------------------
+
+TEST(SearchTactics, FindsTheOnlyMoveInKnownPositions) {
+  struct Tactic {
+    std::string_view name;
+    std::string_view fen;
+    std::uint8_t depth;
+    std::string_view best;
+    bool is_mate;
+  };
+
+  const std::vector<Tactic> tactics = {
+      {"back-rank mate", "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1", 4, "a1a8", true},
+      {"Scholar's mate", "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1", 4,
+       "f3f7", true},
+      {"smothered mate: the rook and pawns are the cage", "6rk/6pp/8/6N1/8/8/8/6K1 w - - 0 1", 4,
+       "g5f7", true},
+      {"the pawn takes the last flight square away", "1k6/1P6/1K6/8/8/8/8/7R w - - 0 1", 4, "h1h8",
+       true},
+      // The key move is a quiet king move, which is exactly the kind of move a
+      // reduction is happiest to throw away.
+      {"mate in two behind a quiet king move", "7k/8/5K2/8/8/8/8/R7 w - - 0 1", 6, "f6g6", true},
+      // No mate anywhere: the reward is material, several plies away, and the
+      // move that wins it is quiet in the sense that matters here—it captures
+      // nothing.
+      {"knight fork wins the queen", "4k3/8/q7/3N4/8/8/4P3/7K w - - 0 1", 6, "d5c7", false},
+  };
+
+  for (const auto& tactic : tactics) {
+    SCOPED_TRACE(std::string(tactic.name) + " — " + std::string(tactic.fen));
+
+    Position pos = parse(tactic.fen);
+    search::NullReporter reporter;
+    search::Limits limits;
+    limits.depth = tactic.depth;
+
+    const auto result = search::search(pos, limits, reporter);
+
+    ASSERT_FALSE(result.pv.empty());
+    EXPECT_EQ(to_uci(result.pv[0]), std::string(tactic.best));
+
+    if (tactic.is_mate) {
+      EXPECT_GT(result.eval, CENTIPAWN_MATE_THRESHOLD) << "should be scored as a forced mate";
+    } else {
+      // A queen for a knight, with the knight getting out afterwards. The exact
+      // number belongs to the evaluation; that it is a large advantage does not.
+      EXPECT_GT(result.eval, 200);
+    }
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -979,14 +1351,14 @@ TEST(SearchLimits, StoresNothingFromAnAbortedSearch) {
   Position pos = Position::startpos();
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
 
   search::Stopper stopper;
   stopper.at_nodes(200); // Far fewer nodes than a depth-6 search needs
 
   MoveList pv;
-  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   ASSERT_TRUE(stopper.has_stopped()) << "test needs a search that actually aborts";
   EXPECT_EQ(tt.probe(pos.key), nullptr) << "aborted search wrote a fabricated score for the root";
@@ -1011,7 +1383,7 @@ TEST(SearchNodes, SearchesTheHashMoveExactlyOnce) {
   Position pos = parse("8/8/P7/8/8/8/5k2/7K w - - 0 1");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
@@ -1021,7 +1393,7 @@ TEST(SearchNodes, SearchesTheHashMoveExactlyOnce) {
   tt.store(pos.key, 0, 0, search::Bound::Exact, search::encode_tt_move(hash_move));
 
   MoveList pv;
-  search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   EXPECT_LT(report.nodes, 5U) << "the hash move was searched twice";
   ASSERT_FALSE(pv.empty());
@@ -1037,7 +1409,7 @@ TEST(SearchNodes, CountsANodeAnsweredByTheTable) {
   Position pos = parse("8/8/P7/8/8/8/5k2/7K w - - 0 1");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
@@ -1047,7 +1419,7 @@ TEST(SearchNodes, CountsANodeAnsweredByTheTable) {
   tt.store(pos.key, 10, 42, search::Bound::Exact, search::TT_NO_MOVE);
 
   MoveList pv;
-  const int eval = search::detail::alphabeta(pos, 4, 0, 1, pv, tt, killers, report, stopper);
+  const int eval = search::detail::alphabeta(pos, 4, 0, 1, pv, tt, ctx, report, stopper);
 
   ASSERT_EQ(eval, 42) << "no cutoff happened, so this test measures nothing";
   EXPECT_EQ(report.nodes, 1U) << "a transposition cutoff was counted as zero nodes";
@@ -1059,13 +1431,13 @@ TEST(SearchNodes, CountsADrawTerminal) {
   Position pos = parse("8/8/8/8/8/3k4/8/R3K3 w - - 100 50");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
   MoveList pv;
-  const int eval = search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers,
-                                             report, stopper);
+  const int eval =
+      search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   ASSERT_EQ(eval, CENTIPAWN_DRAW);
   EXPECT_EQ(report.nodes, 1U) << "a drawn terminal was counted as zero nodes";
@@ -1085,7 +1457,7 @@ TEST(SearchNodes, SkipsAHashMoveThatLeavesTheKingInCheck) {
   const auto fen_before = pos.to_fen();
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
@@ -1093,7 +1465,7 @@ TEST(SearchNodes, SkipsAHashMoveThatLeavesTheKingInCheck) {
   tt.store(pos.key, 0, 0, search::Bound::Exact, search::encode_tt_move(into_check));
 
   MoveList pv;
-  search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   EXPECT_LE(report.nodes, 3U) << "an illegal hash move was searched anyway";
   EXPECT_EQ(pos.to_fen(), fen_before) << "an unvalidated hash move corrupted the board";
