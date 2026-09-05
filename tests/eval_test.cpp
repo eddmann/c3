@@ -518,18 +518,27 @@ int reference_eval(const Position& pos) {
   return pos.colour_to_move == Colour::White ? bounded : -bounded;
 }
 
+std::string_view name_of(Colour side) {
+  return side == Colour::White ? "white" : "black";
+}
+
+void expect_side_totals_match(const EvalAccumulator& live, const EvalAccumulator& rebuilt,
+                              Colour side, std::string_view context) {
+  EXPECT_EQ(live.middlegame(side), rebuilt.middlegame(side))
+      << context << " (middlegame, " << name_of(side) << ")";
+  EXPECT_EQ(live.endgame(side), rebuilt.endgame(side))
+      << context << " (endgame, " << name_of(side) << ")";
+}
+
 // Both halves of the invariant in one place: the accumulator matches a rebuild
 // from the pieces on the board, and the fast eval matches the slow one.
 void expect_accumulator_is_sound(const Position& pos, std::string_view context) {
   const auto& live = pos.board.accumulator();
   const auto rebuilt = pos.board.compute_accumulator();
 
-  for (const auto side : {Colour::White, Colour::Black}) {
-    EXPECT_EQ(live.middlegame(side), rebuilt.middlegame(side))
-        << context << " (middlegame, " << (side == Colour::White ? "white" : "black") << ")";
-    EXPECT_EQ(live.endgame(side), rebuilt.endgame(side))
-        << context << " (endgame, " << (side == Colour::White ? "white" : "black") << ")";
-  }
+  expect_side_totals_match(live, rebuilt, Colour::White, context);
+  expect_side_totals_match(live, rebuilt, Colour::Black, context);
+
   EXPECT_EQ(live.phase(), rebuilt.phase()) << context << " (phase)";
   EXPECT_EQ(eval(pos), reference_eval(pos)) << context << " (eval)";
 }
