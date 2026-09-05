@@ -26,6 +26,7 @@
 
 #include "c3/movegen.hpp"
 
+#include <algorithm>
 #include <array>
 
 #include "c3/bitboard.hpp"
@@ -408,7 +409,6 @@ bool is_in_check(Colour colour, const Board& board) {
 
 MoveList pseudo_legal_moves(const Position& pos) {
   MoveList moves;
-  moves.reserve(MOVE_LIST_RESERVE);
 
   const Colour colour_to_move = pos.colour_to_move;
 
@@ -477,7 +477,6 @@ MoveList pseudo_legal_moves(const Position& pos) {
 
 MoveList pseudo_legal_noisy_moves(const Position& pos) {
   MoveList moves;
-  moves.reserve(MOVE_LIST_RESERVE);
 
   const Colour colour_to_move = pos.colour_to_move;
   const Bitboard captures_mask = pos.board.pieces_by_colour(!colour_to_move);
@@ -573,13 +572,16 @@ namespace {
 MoveList filter_to_legal(Position& pos) {
   MoveList moves = pseudo_legal_moves(pos);
 
-  std::erase_if(moves, [&pos](const Move& mv) {
+  // Erase-remove: shuffle the illegal moves to the back, then drop the tail in
+  // one go, so each surviving move is copied at most once.
+  const auto illegal = std::ranges::remove_if(moves, [&pos](const Move& mv) {
     pos.make_move(mv);
     // make_move has flipped the side to move, so the mover is now the opponent.
     const bool leaves_own_king_attacked = is_in_check(pos.opponent_colour(), pos.board);
     pos.unmake_move(mv);
     return leaves_own_king_attacked;
   });
+  moves.erase(illegal.begin(), illegal.end());
 
   return moves;
 }
