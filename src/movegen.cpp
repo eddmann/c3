@@ -180,8 +180,10 @@ Bitboard king_attacks(Square square) {
 // occupancy bits and shifting produces a unique index for each blocker pattern.
 // This index looks up the precomputed attack bitboard.
 //
-// The trade-off: we need ~2MB of lookup tables, but attack generation becomes
-// a single multiply, shift, and array lookup—extremely fast.
+// The trade-off is memory: the two tables hold 107,648 attack bitboards between
+// them (102,400 for rooks, 5,248 for bishops), which is about 841 KiB. In
+// exchange, attack generation becomes a single multiply, shift, and array
+// lookup—extremely fast.
 //
 // See magic.hpp for the precomputed tables and magic numbers.
 // =============================================================================
