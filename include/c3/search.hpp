@@ -212,9 +212,11 @@ private:
 
 enum class Bound : std::uint8_t { Exact, Lower, Upper };
 
-// A packed move of all-zero bits means "this entry has no move". Every real
-// move sets a "present" flag bit, so a freshly zeroed slot can never be
+// Every real packed move sets this flag, so a freshly zeroed slot can never be
 // mistaken for the move a1-a1.
+inline constexpr std::uint16_t TT_MOVE_PRESENT_BIT = 0x8000;
+
+// A packed move of all-zero bits means "this entry has no move".
 inline constexpr std::uint16_t TT_NO_MOVE = 0;
 
 // Pack a move into 16 bits: from square (6 bits), to square (6 bits),
@@ -232,27 +234,46 @@ struct TTEntry {
   std::uint16_t packed_move{TT_NO_MOVE}; // Best move found, packed (for move ordering)
   std::uint8_t depth{0};                 // Search depth (deeper = more reliable)
   std::uint8_t bound_and_generation{0};  // Bound in bits 0-1, generation in bits 2-7
-  std::uint16_t reserved{0};             // Spare bits; keeps the 16-byte layout explicit
+  // Named rather than left implicit: the compiler would insert these two bytes
+  // of padding anyway to align the next entry's key, so we may as well say so
+  // and have somewhere to put the next field that needs a home.
+  std::uint16_t reserved{0};
 
   [[nodiscard]] Bound bound() const { return static_cast<Bound>(bound_and_generation & 0b11U); }
   [[nodiscard]] std::uint8_t generation() const {
     return static_cast<std::uint8_t>(bound_and_generation >> 2U);
   }
-  [[nodiscard]] bool has_move() const { return packed_move != TT_NO_MOVE; }
+  // Asks the same question decode_tt_move() asks, so the two can never disagree.
+  [[nodiscard]] bool has_move() const { return (packed_move & TT_MOVE_PRESENT_BIT) != 0; }
 };
 
-// The whole point of the packing exercise: two entries per 32 bytes.
 static_assert(sizeof(TTEntry) == 16, "TTEntry must stay packed into 16 bytes");
 
 // Generations are stored in 6 bits, so the counter wraps after 64 searches.
 // Wrapping is harmless: an entry 64 searches old looks "current" again, which
 // costs us one missed replacement, never a wrong score.
-inline constexpr std::uint8_t TT_GENERATION_LIMIT = 64;
+inline constexpr std::uint8_t TT_GENERATION_COUNT = 64;
+
+// How much shallower a new result may be and still evict a stored one from the
+// same search (see the replacement policy in search.cpp). Some slack is wanted:
+// a result from the iteration we are running now describes the part of the tree
+// we are actually walking, while the deep entry it displaces may be about a
+// line we have already refuted. Zero slack ossifies the table; too much throws
+// away the deep work the table exists to keep.
+inline constexpr std::uint8_t TT_REPLACEMENT_DEPTH_SLACK = 4;
 
 class TranspositionTable {
 public:
   TranspositionTable();
   explicit TranspositionTable(std::size_t size_mb);
+
+  // Copying would duplicate the whole table—up to 4 GB—somewhere the author
+  // almost certainly meant to pass a reference. Deleted so that mistake is a
+  // compile error rather than a mysterious pause. Moving is cheap and allowed.
+  TranspositionTable(const TranspositionTable&) = delete;
+  TranspositionTable& operator=(const TranspositionTable&) = delete;
+  TranspositionTable(TranspositionTable&&) noexcept = default;
+  TranspositionTable& operator=(TranspositionTable&&) noexcept = default;
 
   [[nodiscard]] const TTEntry* probe(std::uint64_t key) const;
   void store(std::uint64_t key, std::uint8_t depth, int eval, Bound bound,
@@ -265,6 +286,8 @@ public:
 
   // Change the table's size in megabytes. Reallocates and clears, so this is
   // the expensive operation the persistent table exists to avoid doing often.
+  // Must not be called while a search is running—the search holds references
+  // into the storage this throws away.
   void resize(std::size_t size_mb);
 
   // Called once per search: bumps the generation so every entry written from

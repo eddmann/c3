@@ -34,12 +34,18 @@ public:
   search::SearchResult search(const search::Limits& limits, search::Reporter& reporter,
                               std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 
-  // Resizing throws away the table's contents, so this is deliberately an
-  // explicit user action ("setoption name Hash") rather than something the
-  // search does per move.
+  // Resizing throws away the table's contents and its storage, so this is
+  // deliberately an explicit user action ("setoption name Hash") rather than
+  // something the search does per move.
+  //
+  // MUST NOT be called while a search is running: the search holds references
+  // into the memory this reallocates. A frontend has to stop the search first,
+  // which is what UCI does before acting on setoption.
   void set_hash_size_mb(std::size_t size_mb);
 
   // Exposed so callers (and tests) can inspect or reuse the persistent table.
+  // Same rule as above—the table is the running search's working memory, so
+  // do not mutate it (clear, resize, store) while a search is in flight.
   search::TranspositionTable& transposition_table() { return tt_; }
   const search::TranspositionTable& transposition_table() const { return tt_; }
 

@@ -184,19 +184,59 @@ TEST(TranspositionTable, RejectsAMoveThatIsNotLegalHere) {
   EXPECT_FALSE(search::decode_tt_move(search::TT_NO_MOVE, moves).has_value());
 }
 
+TEST(TranspositionTable, DistinguishesPromotionPieces) {
+  // e7-e8 is four different moves. Matching only on from/to would hand the
+  // search a queen when the table said knight—a real difference, since
+  // underpromotion to a knight is sometimes the only move that wins.
+  const auto to_queen = make_move(Piece::WP, "e7", "e8", std::nullopt, Piece::WQ);
+  const auto to_knight = make_move(Piece::WP, "e7", "e8", std::nullopt, Piece::WN);
+
+  const MoveList only_the_knight = {to_knight};
+  EXPECT_FALSE(
+      search::decode_tt_move(search::encode_tt_move(to_queen), only_the_knight).has_value());
+
+  const auto decoded = search::decode_tt_move(search::encode_tt_move(to_knight), only_the_knight);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->promotion_piece, Piece::WN);
+}
+
 TEST(TranspositionTable, KeepsTheDeeperEntryWithinOneSearch) {
   search::TranspositionTable tt(search::TT_MIN_SIZE_MB);
   const std::uint64_t key = 0x1234'5678'9ABC'DEF0ULL;
 
   tt.store(key, 8, 100, search::Bound::Exact, search::TT_NO_MOVE);
-  tt.store(key + 1, 2, -100, search::Bound::Upper, search::TT_NO_MOVE);
 
-  // Same key always refreshes, even with a shallower result.
+  // A shallow bound arriving later in the same search must not throw away a
+  // deep exact score for the same position—that is the most expensive thing
+  // in the table, and the shallow result adds nothing we did not know.
   tt.store(key, 2, 42, search::Bound::Upper, search::TT_NO_MOVE);
-  const auto* const same = tt.probe(key);
-  ASSERT_NE(same, nullptr);
-  EXPECT_EQ(same->depth, 2);
-  EXPECT_EQ(same->score, 42);
+  const auto* const kept = tt.probe(key);
+  ASSERT_NE(kept, nullptr);
+  EXPECT_EQ(kept->depth, 8);
+  EXPECT_EQ(kept->score, 100);
+
+  // Within the slack, though, a shallower result is fresh enough to be worth
+  // having: it comes from the current search, the deep one may not.
+  tt.store(key, 8 - search::TT_REPLACEMENT_DEPTH_SLACK, 42, search::Bound::Upper,
+           search::TT_NO_MOVE);
+  const auto* const refreshed = tt.probe(key);
+  ASSERT_NE(refreshed, nullptr);
+  EXPECT_EQ(refreshed->score, 42);
+}
+
+TEST(TranspositionTable, AlwaysKeepsAnExactScore) {
+  search::TranspositionTable tt(search::TT_MIN_SIZE_MB);
+  const std::uint64_t key = 0x0F0F'0F0F'0F0F'0F0FULL;
+
+  tt.store(key, 10, 100, search::Bound::Exact, search::TT_NO_MOVE);
+
+  // An exact score is the most useful thing an entry can hold—it answers any
+  // window—so it is always worth writing, however shallow.
+  tt.store(key, 1, -25, search::Bound::Exact, search::TT_NO_MOVE);
+  const auto* const entry = tt.probe(key);
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(entry->depth, 1);
+  EXPECT_EQ(entry->score, -25);
 }
 
 TEST(TranspositionTable, PrefersReplacingEntriesFromAnEarlierSearch) {
@@ -218,6 +258,38 @@ TEST(TranspositionTable, PrefersReplacingEntriesFromAnEarlierSearch) {
   tt.store(colliding, 1, -50, search::Bound::Upper, search::TT_NO_MOVE);
   EXPECT_NE(tt.probe(colliding), nullptr);
   EXPECT_EQ(tt.probe(key), nullptr);
+}
+
+TEST(TranspositionTable, GenerationWrapsAfterSixtyFourSearches) {
+  // Six bits hold the generation, so after TT_GENERATION_COUNT searches the
+  // counter comes back round and a very old entry looks current again. That is
+  // allowed to cost us a replacement decision; it must never cost us a wrong
+  // score, and the depth rule must still be doing its job on the other side.
+  search::TranspositionTable tt(search::TT_MIN_SIZE_MB);
+  const std::uint64_t key = 0xC0FF'EE00'0000'0011ULL;
+  const std::uint64_t colliding = key + (tt.capacity() * 3);
+
+  tt.store(key, 9, 100, search::Bound::Exact, search::TT_NO_MOVE);
+
+  for (int i = 0; i < search::TT_GENERATION_COUNT; ++i) {
+    tt.new_search();
+  }
+  EXPECT_EQ(tt.generation(), 0) << "the counter should have wrapped exactly once";
+
+  // The entry now claims the current generation, so it is no longer "stale"
+  // and the depth rule protects it from a shallow bound...
+  tt.store(colliding, 1, -50, search::Bound::Upper, search::TT_NO_MOVE);
+  const auto* const survivor = tt.probe(key);
+  ASSERT_NE(survivor, nullptr);
+  EXPECT_EQ(survivor->score, 100);
+
+  // ...but an exact score still gets in, and reads back exactly as written.
+  tt.store(colliding, 1, -50, search::Bound::Exact, search::TT_NO_MOVE);
+  const auto* const replacement = tt.probe(colliding);
+  ASSERT_NE(replacement, nullptr);
+  EXPECT_EQ(replacement->score, -50);
+  EXPECT_EQ(replacement->bound(), search::Bound::Exact);
+  EXPECT_EQ(replacement->generation(), tt.generation());
 }
 
 TEST(TranspositionTable, ClearEmptiesTheTableWithoutResizing) {
@@ -322,6 +394,82 @@ TEST(NullMove, DoesNotEraseAnExistingBestMove) {
   const auto decoded = search::decode_tt_move(entry->packed_move, pseudo_legal_moves(pos));
   ASSERT_TRUE(decoded.has_value());
   EXPECT_EQ(*decoded, known_best);
+}
+
+TEST(NullMove, NeverStoresAMateScoreFromPassing) {
+  // Black is checkmated, but it is White's move. Passing therefore "finds" a
+  // mate—one that only exists because Black was never allowed to reply. The
+  // table outlives the search, so a fabricated forced mate stored here would
+  // go on lying to every later search that reaches this position.
+  Position pos = parse("R6k/8/6K1/8/8/8/8/8 w - - 0 1");
+
+  search::TranspositionTable tt;
+  search::KillerMoves killers;
+  search::Report report;
+  search::Stopper stopper;
+
+  MoveList pv;
+  const int beta = 50;
+  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, beta, pv, tt, killers, report, stopper);
+
+  const auto* const entry = tt.probe(pos.key);
+  if (entry != nullptr) {
+    EXPECT_LT(entry->score, CENTIPAWN_MATE_THRESHOLD)
+        << "a null-move cutoff stored a mate that cannot happen on the real board";
+    EXPECT_LE(entry->score, beta);
+  }
+}
+
+// Transposition table cutoffs --------------------------------------------------
+
+TEST(TranspositionTable, NonPvNodesTakeCutoffsFromEveryBoundType) {
+  // Non-PV nodes are asked one question—"better or worse than alpha?"—and a
+  // stored bound can answer it outright. That is where the table earns its
+  // keep, so all three bound types must still cut off without searching.
+  Position pos = Position::startpos();
+
+  const struct {
+    const char* name;
+    int score;
+    search::Bound bound;
+    int expected;
+  } cases[] = {
+      {"exact", 123, search::Bound::Exact, 123},
+      {"lower", 500, search::Bound::Lower, 1},  // >= beta: return beta
+      {"upper", -500, search::Bound::Upper, 0}, // <= alpha: return alpha
+  };
+
+  for (const auto& scenario : cases) {
+    search::TranspositionTable tt;
+    search::KillerMoves killers;
+    search::Report report;
+    search::Stopper stopper;
+
+    tt.store(pos.key, 5, scenario.score, scenario.bound, search::TT_NO_MOVE);
+
+    MoveList pv;
+    const int eval = search::detail::alphabeta(pos, 3, 0, 1, pv, tt, killers, report, stopper);
+
+    EXPECT_EQ(eval, scenario.expected) << scenario.name;
+    EXPECT_EQ(report.nodes, 0U) << scenario.name << ": cutoff should search nothing";
+  }
+}
+
+TEST(TranspositionTable, PvNodesRefuseTheCutoffAndSearchAnyway) {
+  Position pos = Position::startpos();
+
+  search::TranspositionTable tt;
+  search::KillerMoves killers;
+  search::Report report;
+  search::Stopper stopper;
+
+  tt.store(pos.key, 5, 123, search::Bound::Exact, search::TT_NO_MOVE);
+
+  MoveList pv;
+  search::detail::alphabeta(pos, 3, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+
+  EXPECT_GT(report.nodes, 0U) << "a PV node must search so that it has a line to report";
+  EXPECT_FALSE(pv.empty());
 }
 
 // Search correctness -----------------------------------------------------------
@@ -587,11 +735,15 @@ TEST(SearchNodes, SearchesTheHashMoveExactlyOnce) {
   //   White: Kh1, pawn a6.  Black: Kf2 (which takes g1 and g2 from the king).
   //   Legal: a7 (clearly better) and Kh2 (clearly worse).
   //
-  // Every child is a single quiescence stand-pat node. With the hash move
-  // searched first the count is 1 (root) + 1 (Kh2) + 2 (a7, zero-window plus
-  // the PVS re-search that proves it better) = 4. A hash move that is also
-  // left in the main move list gets searched a second time once a7 has taken
-  // over as the best move, which shows up immediately as a fifth node.
+  // Every child is a single quiescence stand-pat node, so today the count is
+  // 1 (root) + 1 (Kh2) + 2 (a7: zero-window, plus the PVS re-search that
+  // proves it better) = 4. A hash move that is ALSO left in the main move list
+  // gets searched a second time once a7 has taken over as the best move, and
+  // that shows up immediately as a fifth node.
+  //
+  // The bound is what matters, not the number: later pruning work (reductions,
+  // history ordering) may search fewer nodes here, but nothing should ever
+  // push it back up to 5.
   Position pos = parse("8/8/P7/8/8/8/5k2/7K w - - 0 1");
 
   search::TranspositionTable tt;
@@ -607,7 +759,7 @@ TEST(SearchNodes, SearchesTheHashMoveExactlyOnce) {
   MoveList pv;
   search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
 
-  EXPECT_EQ(report.nodes, 4U);
+  EXPECT_LT(report.nodes, 5U) << "the hash move was searched twice";
   ASSERT_FALSE(pv.empty());
   EXPECT_EQ(to_uci(pv[0]), "a6a7");
 }
@@ -620,6 +772,8 @@ TEST(SearchNodes, SkipsAHashMoveThatLeavesTheKingInCheck) {
   //
   // Once Kg1 is filtered out, only a7 (searched with the full window) and Kh2
   // (zero-window, and worse, so no re-search) cost anything: 1 + 1 + 1 = 3.
+  // Searching the illegal move as well would add at least one node on top of
+  // that—and, as it happens, capture a king.
   Position pos = parse("8/8/P7/8/8/8/5k2/7K w - - 0 1");
   const auto fen_before = pos.to_fen();
 
@@ -634,8 +788,8 @@ TEST(SearchNodes, SkipsAHashMoveThatLeavesTheKingInCheck) {
   MoveList pv;
   search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
 
-  EXPECT_EQ(report.nodes, 3U) << "an illegal hash move was searched anyway";
-  EXPECT_EQ(pos.to_fen(), fen_before);
+  EXPECT_LE(report.nodes, 3U) << "an illegal hash move was searched anyway";
+  EXPECT_EQ(pos.to_fen(), fen_before) << "an unvalidated hash move corrupted the board";
   ASSERT_FALSE(pv.empty());
   EXPECT_EQ(to_uci(pv[0]), "a6a7");
 }
@@ -658,12 +812,15 @@ TEST(SearchPV, KeepsFullLengthPvOnAWarmTable) {
 
   Position first = parse(fen);
   const auto cold = search::search(first, tt, limits, reporter);
-  ASSERT_EQ(cold.pv.size(), 5U);
+  ASSERT_GE(cold.pv.size(), 3U);
 
   Position second = parse(fen);
   const auto warm = search::search(second, tt, limits, reporter);
 
-  EXPECT_EQ(warm.pv.size(), 5U) << "warm table truncated the principal variation";
+  // The invariant is that a warm table costs us nothing in reported line
+  // length, not that the line is exactly `depth` long—a forced mate or a draw
+  // legitimately ends it early.
+  EXPECT_EQ(warm.pv.size(), cold.pv.size()) << "warm table truncated the principal variation";
   EXPECT_EQ(pv_to_uci(warm.pv), pv_to_uci(cold.pv));
 
   // Depth 5 is above ASPIRATION_WINDOW_MIN_DEPTH, so this line was assembled

@@ -27,6 +27,21 @@ bool is_legal_move(const Position& pos, const Move& mv) {
   return std::find(moves.begin(), moves.end(), mv) != moves.end();
 }
 
+// Engine::set_hash_size_mb also moves the process-wide default size (see the
+// transitional note in engine.cpp), so any test that calls it has to put the
+// default back or it silently shrinks every table the later tests build.
+class DefaultHashSizeGuard {
+public:
+  DefaultHashSizeGuard() : original_(search::TranspositionTable::size_mb()) {}
+  ~DefaultHashSizeGuard() { search::TranspositionTable::set_size_mb(original_); }
+
+  DefaultHashSizeGuard(const DefaultHashSizeGuard&) = delete;
+  DefaultHashSizeGuard& operator=(const DefaultHashSizeGuard&) = delete;
+
+private:
+  std::size_t original_;
+};
+
 } // namespace
 
 // -----------------------------------------------------------------------------
@@ -221,6 +236,7 @@ TEST(Engine, SearchPositionUnchangedAfterSearch) {
 // -----------------------------------------------------------------------------
 
 TEST(Engine, SetHashSizeWorks) {
+  const DefaultHashSizeGuard guard;
   Engine engine;
 
   // Set to minimum allowed size
@@ -237,6 +253,7 @@ TEST(Engine, SetHashSizeWorks) {
 }
 
 TEST(Engine, SetHashSizeResizesTheTableImmediately) {
+  const DefaultHashSizeGuard guard;
   Engine engine;
 
   engine.set_hash_size_mb(search::TT_MIN_SIZE_MB);
@@ -246,6 +263,21 @@ TEST(Engine, SetHashSizeResizesTheTableImmediately) {
   EXPECT_EQ(engine.transposition_table().capacity(), small * 4);
 
   EXPECT_THROW(engine.set_hash_size_mb(0), std::invalid_argument);
+}
+
+TEST(Engine, SetHashSizeAlsoUpdatesTheDefaultForNewTables) {
+  // Transitional: the UCI `go` path still builds its own throwaway table, so
+  // "setoption name Hash" would be silently ignored there unless the default
+  // size moves too. Remove once UCI searches through the Engine's table.
+  const DefaultHashSizeGuard guard;
+  Engine engine;
+
+  engine.set_hash_size_mb(search::TT_MIN_SIZE_MB * 2);
+  EXPECT_EQ(search::TranspositionTable::size_mb(), search::TT_MIN_SIZE_MB * 2);
+
+  // A table built the old way now agrees with the Engine's own.
+  const search::TranspositionTable fresh;
+  EXPECT_EQ(fresh.capacity(), engine.transposition_table().capacity());
 }
 
 // -----------------------------------------------------------------------------

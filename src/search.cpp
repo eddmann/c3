@@ -123,10 +123,14 @@ constexpr int FUTILITY_DEPTH = 2;
 // Score = (victim_value * 100) - attacker_value
 // Higher scores = better captures = searched first
 //
-// Example scores:
-//   PxQ = 900*100 - 100 = 89,900 (excellent)
-//   NxQ = 900*100 - 300 = 89,700 (great)
-//   QxP = 100*100 - 900 =  9,100 (questionable)
+// Multiplying the victim by 100 makes the victim dominate: every capture of a
+// queen sorts above every capture of a rook, whatever did the capturing. The
+// attacker's value then breaks ties within a victim class, cheapest first—if
+// two pieces can take the queen, try the one we mind losing least. So PxQ
+// beats NxQ beats QxQ, and all of them beat QxP.
+//
+// The values themselves live in PIECE_VALUES (eval.hpp); this ordering only
+// depends on their relative sizes, not on the exact numbers.
 //
 // Returns negative so that std::sort orders best captures first (ascending).
 // =============================================================================
@@ -212,8 +216,8 @@ bool Stopper::should_stop(const Report& report) const {
 // ---------------------------------------------------------------------------
 // A move needs a from square (0-63, 6 bits), a to square (6 bits) and, for a
 // pawn reaching the last rank, which piece it becomes (4 choices, 3 bits with
-// zero meaning "no promotion"). That is 15 bits; the 16th flags "there is a
-// move here" so that an all-zero entry unambiguously means "no move".
+// zero meaning "no promotion"). That is 15 bits; the 16th is
+// TT_MOVE_PRESENT_BIT, so that an all-zero entry unambiguously means "no move".
 //
 // Everything else about a Move—the moving piece, what it captured, whether it
 // was en passant—is deliberately dropped. Those fields are all recoverable
@@ -226,7 +230,6 @@ constexpr unsigned TT_MOVE_TO_SHIFT = 6;
 constexpr unsigned TT_MOVE_PROMOTION_SHIFT = 12;
 constexpr std::uint16_t TT_MOVE_SQUARE_MASK = 0b11'1111;
 constexpr std::uint16_t TT_MOVE_PROMOTION_MASK = 0b111;
-constexpr std::uint16_t TT_MOVE_PRESENT_BIT = 0x8000;
 
 // Promotion pieces are encoded as 1..4 (knight, bishop, rook, queen) so that
 // 0 can mean "not a promotion". Colour is not stored—the position knows it.
@@ -245,8 +248,15 @@ std::uint16_t encode_promotion(std::optional<Piece> promotion) {
   case Piece::WR:
   case Piece::BR:
     return 3;
+  case Piece::WQ:
+  case Piece::BQ:
+    return 4;
   default:
-    return 4; // Queen; no other piece type can be promoted to.
+    // A pawn can only become a knight, bishop, rook or queen. Anything else is
+    // a malformed Move, and returning "no promotion" would quietly make it
+    // match the wrong move in decode_tt_move()—so trip in Debug builds.
+    assert(false && "promotion_piece must be a knight, bishop, rook or queen");
+    return 0;
   }
 }
 
@@ -327,7 +337,7 @@ void TranspositionTable::resize(std::size_t size_mb) {
 }
 
 void TranspositionTable::new_search() {
-  generation_ = static_cast<std::uint8_t>((generation_ + 1) % TT_GENERATION_LIMIT);
+  generation_ = static_cast<std::uint8_t>((generation_ + 1) % TT_GENERATION_COUNT);
 }
 
 std::uint32_t TranspositionTable::hashfull() const {
@@ -348,23 +358,30 @@ const TTEntry* TranspositionTable::probe(std::uint64_t key) const {
 // ---------------------------------------------------------------------------
 // REPLACEMENT POLICY
 // ---------------------------------------------------------------------------
-// Two positions that land on the same index have to fight over one slot. We
-// keep whichever is more likely to be useful again:
+// One slot, and every position whose key lands on that index wants it. We keep
+// whichever is more likely to earn its place again:
 //
-//   1. The slot is empty            — nothing to lose, always take it.
-//   2. Same key                     — this is the same position we are already
-//                                     storing; the fresh result comes from a
-//                                     search we just ran, so it supersedes.
-//   3. Stored entry is older        — it was written during an earlier search,
-//                                     probably about a branch of the game tree
-//                                     we have already left behind. Its depth
-//                                     is not worth defending.
-//   4. New depth >= stored depth    — within the current search, a deeper
-//                                     result is a better one, so it wins ties
-//                                     and improvements alike.
+//   1. The slot is empty       — nothing to lose, always take it.
+//   2. Stored entry is older   — written during an earlier search, so probably
+//                                about a branch of the game tree we have
+//                                already left behind. Its depth is not worth
+//                                defending against a result from right now.
+//   3. New bound is Exact      — an exact score answers ANY window, which no
+//                                bound can do. It is the most useful thing an
+//                                entry can hold, so it always goes in.
+//   4. Nearly as deep          — otherwise the new result must satisfy
+//                                depth + TT_REPLACEMENT_DEPTH_SLACK >= stored
+//                                depth. The slack is deliberate: a result from
+//                                the iteration we are running describes the
+//                                part of the tree we are actually walking,
+//                                while the deep entry may be about a line we
+//                                have already refuted. With zero slack the
+//                                table ossifies; with unlimited slack every
+//                                shallow probe throws away deep work.
 //
-// Otherwise a shallow result from this search would evict a deep result from
-// this same search, which is exactly the trade we do not want.
+// Note what rule 4 rules out even for the SAME position: a depth-2 upper bound
+// (or the depth-limited lower bound a null-move cutoff writes) must not erase
+// a depth-10 exact score we paid dearly for earlier in this very search.
 // ---------------------------------------------------------------------------
 
 void TranspositionTable::store(std::uint64_t key, std::uint8_t depth, int eval, Bound bound,
@@ -376,8 +393,9 @@ void TranspositionTable::store(std::uint64_t key, std::uint8_t depth, int eval, 
   const bool is_empty = entry.key == 0;
   const bool same_position = entry.key == key;
   const bool is_stale = entry.generation() != generation_;
+  const bool is_deep_enough = depth + TT_REPLACEMENT_DEPTH_SLACK >= static_cast<int>(entry.depth);
 
-  if (!is_empty && !same_position && !is_stale && depth < entry.depth) {
+  if (!is_empty && !is_stale && bound != Bound::Exact && !is_deep_enough) {
     return;
   }
 
@@ -688,10 +706,22 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
     if (null_eval >= beta) {
       // Passing was good enough—this position is probably winning.
-      // We have no move to offer (we did not make one), so we store TT_NO_MOVE
-      // and rely on the table to keep any move it already holds for this key.
-      if (!stopper.has_stopped()) {
-        tt.store(pos.key, depth, eval_in(null_eval, report.ply), Bound::Lower, TT_NO_MOVE);
+      //
+      // What we store is clamped to beta, the value this node actually
+      // returns. That matters most for mate scores: passing is not a legal
+      // chess move, so a "mate" found behind a null move is a mate against an
+      // opponent who was never allowed to reply. It does not exist on the real
+      // board. Because this table outlives the search, storing it would leave
+      // a fabricated forced win behind to mislead every later search that
+      // reaches this position, so we refuse to write a mate score from here at
+      // all. (Clamping alone is not quite enough: at the root beta can itself
+      // be a mate-range bound.)
+      //
+      // We also have no move to offer—we did not make one—so we store
+      // TT_NO_MOVE and rely on the table to keep any move it already holds.
+      const int null_bound = std::min(null_eval, beta);
+      if (!stopper.has_stopped() && null_bound < CENTIPAWN_MATE_THRESHOLD) {
+        tt.store(pos.key, depth, eval_in(null_bound, report.ply), Bound::Lower, TT_NO_MOVE);
       }
       return beta;
     }
@@ -930,7 +960,7 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
   result.eval = last_eval;
   result.pv = best_pv;
   result.nodes = report.nodes;
-  result.hashfull = result.nodes == 0 ? 0 : tt.hashfull();
+  result.hashfull = tt.hashfull();
 
   return result;
 }
