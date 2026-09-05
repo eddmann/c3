@@ -148,6 +148,33 @@ TEST(SearchOrdering, QuiescenceOrdersMvvLva) {
   }
 }
 
+TEST(SearchOrdering, QuiescencePrefersQueenPromotions) {
+  // A pawn reaching the last rank almost always wants to be a queen. An
+  // underpromotion is a curiosity that decides perhaps one game in ten
+  // thousand, so searching =N before =Q wastes the first—and often only—move
+  // the node gets to look at.
+  const auto promote_knight = make_move(Piece::WP, "b7", "b8", std::nullopt, Piece::WN);
+  const auto promote_rook = make_move(Piece::WP, "b7", "b8", std::nullopt, Piece::WR);
+  const auto promote_queen = make_move(Piece::WP, "b7", "b8", std::nullopt, Piece::WQ);
+  const auto capture_promote_knight = make_move(Piece::WP, "b7", "c8", Piece::BR, Piece::WN);
+  const auto capture_promote_queen = make_move(Piece::WP, "b7", "c8", Piece::BR, Piece::WQ);
+
+  MoveList moves = {promote_knight, promote_rook, promote_queen, capture_promote_knight,
+                    capture_promote_queen};
+
+  search::detail::order_quiescence_moves(moves);
+
+  const auto position_of = [&moves](const Move& mv) {
+    return std::ranges::find(moves, mv) - moves.begin();
+  };
+
+  EXPECT_EQ(moves[0], capture_promote_queen);
+  EXPECT_EQ(moves[1], promote_queen);
+  EXPECT_LT(position_of(capture_promote_queen), position_of(capture_promote_knight));
+  EXPECT_LT(position_of(promote_queen), position_of(promote_rook));
+  EXPECT_LT(position_of(promote_rook), position_of(promote_knight));
+}
+
 // Transposition table layout, move packing and replacement ---------------------
 
 TEST(TranspositionTable, PacksEntriesIntoSixteenBytes) {

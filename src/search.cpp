@@ -127,11 +127,13 @@ constexpr int FUTILITY_DEPTH = 2;
 // Returns negative so that std::sort orders best captures first (ascending).
 // =============================================================================
 
+constexpr int MVV_VICTIM_WEIGHT = 100;
+
 int capture_priority_score(const Move& mv) {
   if (mv.captured_piece.has_value()) {
     const auto victim_value = PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)];
     const auto attacker_value = PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
-    return -((victim_value * 100) - attacker_value);
+    return -((victim_value * MVV_VICTIM_WEIGHT) - attacker_value);
   }
 
   if (mv.promotion_piece.has_value()) {
@@ -139,6 +141,35 @@ int capture_priority_score(const Move& mv) {
   }
 
   return 0;
+}
+
+// PROMOTIONS ARE NOT CAPTURES BY THE PROMOTED PIECE
+// Feeding the promoted piece to MVV-LVA as the ATTACKER inverts the ranking a
+// promotion deserves: the more valuable the piece the pawn becomes, the worse
+// its "least valuable attacker" score, so =N sorted ahead of =Q and every node
+// with a promotion spent its first move on the one promotion nobody wants.
+//
+// What a promotion actually does is trade a pawn for the piece it becomes, so
+// it is scored like a capture whose victim is the new piece and whose attacker
+// is the pawn. A move that both captures and promotes earns both halves, which
+// is right: it is two gains in one move.
+//
+// Higher is better here, the opposite of capture_priority_score() above; that
+// one is a leftover of ordering by ascending sort and goes away with it.
+int noisy_move_score(const Move& mv) {
+  int score = 0;
+
+  if (mv.captured_piece.has_value()) {
+    score += (PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)] * MVV_VICTIM_WEIGHT) -
+             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  }
+
+  if (mv.promotion_piece.has_value()) {
+    score += (PIECE_VALUES[static_cast<std::size_t>(*mv.promotion_piece)] * MVV_VICTIM_WEIGHT) -
+             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  }
+
+  return score;
 }
 
 } // namespace
@@ -572,14 +603,7 @@ void detail::order_moves(MoveList& moves, const KillerMoves& killers, std::uint8
 
 void detail::order_quiescence_moves(MoveList& moves) {
   std::ranges::sort(moves, [](const Move& a, const Move& b) {
-    const auto score = [](const Move& mv) {
-      const auto victim = mv.captured_piece.value_or(pawn(colour(mv.piece)));
-      const auto lva = mv.promotion_piece.value_or(mv.piece);
-      const auto victim_score = PIECE_VALUES[static_cast<std::size_t>(victim)];
-      const auto lva_score = PIECE_VALUES[static_cast<std::size_t>(lva)];
-      return -((victim_score * 100) - lva_score);
-    };
-    return score(a) < score(b);
+    return noisy_move_score(a) > noisy_move_score(b);
   });
 }
 
