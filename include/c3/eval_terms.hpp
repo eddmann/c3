@@ -319,12 +319,11 @@ inline constexpr std::array<std::array<PieceSquareTable, 6>, 2> PIECE_SQUARE_BAS
 // Fold the base tables into a lookup indexed by [phase][piece][square] at
 // compile time, so the rank flipping above costs nothing at run time.
 //
-// That is a small saving next to the real cost: eval() walks both piece lists
-// twice, once per phase, so a tapered evaluation is roughly twice the work of a
-// single-phase one. We take that hit deliberately—reading two independent
-// component scores is much easier to follow than the usual trick of updating a
-// packed (middlegame, endgame) pair incrementally inside make_move, which is
-// where a later performance pass would take this.
+// These tables are what a from-scratch evaluation reads, and reading them for
+// every piece twice over—once per phase—is exactly the work that EvalAccumulator
+// below exists to avoid. eval() does not touch them at all; eval_psqt() still
+// walks them, as the reference implementation the accumulator is checked
+// against.
 constexpr std::array<std::array<PieceSquareTable, 12>, 2> build_psqt() {
   std::array<std::array<PieceSquareTable, 12>, 2> psqt{};
 
@@ -345,7 +344,6 @@ constexpr std::array<std::array<PieceSquareTable, 12>, 2> build_psqt() {
   return psqt;
 }
 
-inline constexpr auto PIECE_SQUARE_TABLES = build_psqt();
 } // namespace detail
 
 // The piece-square tables, indexed [phase][piece][square], already flipped for

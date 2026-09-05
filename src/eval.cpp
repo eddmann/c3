@@ -80,7 +80,7 @@ bool has_bishop_pair(const Board& board, Colour side) noexcept {
 
 } // namespace
 
-// Non-pawn material left on the board, on the 24-point scale described in eval.hpp.
+// Non-pawn material left on the board, on the 24-point scale described in eval_terms.hpp.
 int game_phase(const Board& board) noexcept {
   int phase = 0;
   for (const auto piece : all_pieces()) {

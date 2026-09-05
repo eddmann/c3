@@ -251,9 +251,11 @@ struct CandidateSource {
   int terms{3}; // 3 = sparse (the default), 2 = less so, 1 = a plain draw
 
   Bitboard next() {
-    // AND is commutative, so this consumes the same three draws, in the same
-    // order, as HashRng::next_sparse() does at terms == 3. Keeping that exact
-    // is what lets the generator reproduce the checked-in magic.hpp.
+    // At terms == 3 this draws the same three values as HashRng::next_sparse()
+    // and ANDs them together. AND is commutative, so the result matches
+    // next_sparse() whatever order the compiler evaluates its operands in—an
+    // order the standard leaves unspecified. That equivalence is what lets the
+    // generator reproduce the checked-in magic.hpp.
     Bitboard candidate = rng.next();
     for (int term = 1; term < terms; ++term) {
       candidate &= rng.next();

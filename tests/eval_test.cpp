@@ -498,6 +498,11 @@ bool test_has_bishop_pair(const Board& board, Colour side) {
 
 // eval() the slow way: walk both piece lists, twice, and taper the result.
 // This is the reference the incremental evaluation has to reproduce exactly.
+//
+// The taper, clamp and side-to-move flip below deliberately mirror eval()'s own
+// arithmetic rather than deriving it independently: only the accumulator is
+// under test here, so everything downstream of it is held constant on purpose.
+// A change to the taper formula has to be made in both places.
 int reference_eval(const Position& pos) {
   if (has_insufficient_material(pos.board)) {
     return CENTIPAWN_DRAW;

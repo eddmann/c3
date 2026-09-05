@@ -79,10 +79,13 @@ public:
   // Precondition: the square is empty. Dropping a piece onto an occupant would
   // overwrite the mailbox entry while leaving the displaced piece's bit set in
   // its own bitboard—a "phantom" piece that the mailbox denies and the bitboards
-  // insist on. Such a desync typically only surfaces plies later, in an
-  // unrelated evaluation or attack lookup, so Debug builds abort here instead.
-  // Release builds do not check: the assert is the whole enforcement, so callers
-  // that mean to replace a piece must remove_piece first either way.
+  // insist on. It would also add the new piece to the evaluation accumulator
+  // without ever subtracting the one it buried, so the running totals would be
+  // permanently too high by whatever that piece was worth. Such a desync
+  // typically only surfaces plies later, in an unrelated evaluation or attack
+  // lookup, so Debug builds abort here instead. Release builds do not check:
+  // the assert is the whole enforcement, so callers that mean to replace a
+  // piece must remove_piece first either way.
   void put_piece(Piece piece, Square square) noexcept {
     assert(!has_piece_at(square) && "put_piece expects an empty square");
 
@@ -133,17 +136,23 @@ public:
   [[nodiscard]] const EvalAccumulator& accumulator() const noexcept { return accumulator_; }
 
   // The same totals, rebuilt from the pieces actually on the board. This is the
-  // slow, obviously-correct version: Debug builds compare the two after every
-  // make_move and unmake_move, exactly as they compare the incremental Zobrist
-  // key against compute_key(). An accumulator that silently drifts would poison
-  // every evaluation from that node onwards, and the resulting bad move is
-  // impossible to trace back to its cause—so we catch the drift instead.
+  // slow, obviously-correct version: the EvalAccumulator tests compare it
+  // against the running totals, and builds configured with C3_EXPENSIVE_ASSERTS
+  // also compare after every make_move and unmake_move. An accumulator that
+  // silently drifts would poison every evaluation from that node onwards, and
+  // the resulting bad move is impossible to trace back to its cause—so we catch
+  // the drift instead.
+  //
+  // It walks the twelve piece bitboards rather than the 64-square mailbox, for
+  // the same reason compute_key() does: a real position has 32 pieces or fewer,
+  // so popping set bits visits only the squares that hold something, while the
+  // mailbox scan pays for all 64 and unwraps an optional at each one.
   [[nodiscard]] EvalAccumulator compute_accumulator() const noexcept {
     EvalAccumulator rebuilt;
-    for (std::uint8_t index = 0; index < 64; ++index) {
-      const Square square = Square::from_index(index);
-      if (const auto piece = piece_at(square)) {
-        rebuilt.add(*piece, square);
+    for (const auto piece : all_pieces()) {
+      Bitboard piece_squares = pieces(piece);
+      while (piece_squares != 0) {
+        rebuilt.add(piece, Square::pop_first_occupied(piece_squares));
       }
     }
     return rebuilt;
