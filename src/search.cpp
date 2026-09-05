@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -96,12 +97,6 @@ int history_bonus(std::uint8_t depth) {
   const int d = depth;
   return std::min(HISTORY_BONUS_SCALE * d * d, HISTORY_BONUS_CAP);
 }
-
-// How many quiet moves a node remembers for the history malus. A node that has
-// searched more than this before finding a cutoff has bigger problems than the
-// exactness of its bookkeeping, and the array keeps the recursion's stack
-// frames small.
-constexpr std::size_t MAX_PENALISED_QUIETS = 32;
 
 // Check if a side has any pieces besides pawns.
 // Used in null-move pruning: don't prune in pawn-only endgames (zugzwang risk).
@@ -623,6 +618,16 @@ void CounterMoves::store(const Move& previous, const Move& refutation) {
 }
 
 // ---------------------------------------------------------------------------
+// Search context
+// ---------------------------------------------------------------------------
+
+// The rows are allocated—and zeroed—once, here, rather than a frame at a time
+// inside the recursion. See WHY THE SCRATCH SPACE LIVES HERE in the header.
+SearchContext::SearchContext()
+    : plies_(std::make_unique<std::array<PlyScratch, MAX_DEPTH + 1>>()),
+      quiescence_(std::make_unique<std::array<MoveScratch, QUIESCENCE_MAX_DEPTH>>()) {}
+
+// ---------------------------------------------------------------------------
 // Mate score normalisation
 // ---------------------------------------------------------------------------
 
@@ -751,12 +756,17 @@ static_assert(HISTORY_MAX < ORDER_COUNTER_MOVE, "history must not outrank a coun
 // searched in generation order (see select()), never scored out of bounds.
 constexpr std::size_t MAX_SCORED_MOVES = MOVE_LIST_RESERVE;
 
+// The scores live in a row the caller owns—a SearchContext's per-ply scratch
+// during a search—rather than in this object. A quarter-kilobyte array of ints
+// is small in isolation and ruinous 255 frames deep; see WHY THE SCRATCH SPACE
+// LIVES HERE in search.hpp.
 class OrderedMoves {
 public:
   // Main search: the full priority list above.
-  OrderedMoves(MoveList& moves, const SearchContext& ctx, std::uint8_t ply,
+  OrderedMoves(MoveList& moves, std::span<int> scores, const SearchContext& ctx, std::uint8_t ply,
                const std::optional<Move>& hash_move, const std::optional<Move>& previous_move)
-      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)),
+      : moves_(moves), scores_(scores),
+        scored_(std::min({moves.size(), scores.size(), MAX_SCORED_MOVES})),
         killer1_(ctx.killers.probe(ply, 0)), killer2_(ctx.killers.probe(ply, 1)),
         counter_(previous_move.has_value() ? ctx.counters.probe(*previous_move) : std::nullopt) {
     for (std::size_t i = 0; i < scored_; ++i) {
@@ -766,8 +776,9 @@ public:
 
   // Quiescence: every move there is a capture or a promotion, so MVV-LVA is
   // the whole ordering—there are no killers or quiet moves to rank.
-  explicit OrderedMoves(MoveList& moves)
-      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)) {
+  OrderedMoves(MoveList& moves, std::span<int> scores)
+      : moves_(moves), scores_(scores),
+        scored_(std::min({moves.size(), scores.size(), MAX_SCORED_MOVES})) {
     for (std::size_t i = 0; i < scored_; ++i) {
       scores_[i] = noisy_move_score(moves_[i]);
     }
@@ -837,15 +848,17 @@ private:
   }
 
   MoveList& moves_;
+  // Entries [0, scored_) are written by the constructor before anything reads
+  // them, so nothing here depends on what the row held before.
+  std::span<int> scores_;
   std::size_t scored_;
   std::optional<Move> killer1_;
   std::optional<Move> killer2_;
   std::optional<Move> counter_;
-  // Deliberately left uninitialised: entries [0, scored_) are written by the
-  // constructor before anything reads them, and zeroing a kilobyte at every
-  // node would cost more than the ordering it serves.
-  std::array<int, MAX_SCORED_MOVES> scores_; // NOLINT(*-member-init)
 };
+
+static_assert(MAX_ORDERED_MOVES >= MAX_SCORED_MOVES,
+              "a scratch row must be long enough to score any move list");
 
 } // namespace
 
@@ -855,14 +868,17 @@ void detail::order_moves(MoveList& moves, const SearchContext& ctx, std::uint8_t
   // The eager form: run the lazy selection all the way to the end. The search
   // itself never calls this—it asks for one move at a time and usually stops
   // after the first—but "the whole list, in order" is what a test can read.
-  OrderedMoves ordering(moves, ctx, ply, hash_move, previous_move);
+  // Its score row is a local because nothing recursive calls this.
+  std::array<int, MAX_ORDERED_MOVES> scores{};
+  OrderedMoves ordering(moves, scores, ctx, ply, hash_move, previous_move);
   for (std::size_t i = 0; i < moves.size(); ++i) {
     ordering.select(i);
   }
 }
 
 void detail::order_quiescence_moves(MoveList& moves) {
-  OrderedMoves ordering(moves);
+  std::array<int, MAX_ORDERED_MOVES> scores{};
+  OrderedMoves ordering(moves, scores);
   for (std::size_t i = 0; i < moves.size(); ++i) {
     ordering.select(i);
   }
@@ -908,9 +924,21 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // Stopper makes sure that score is discarded rather than stored.
 // ---------------------------------------------------------------------------
 
-int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper& stopper) {
+int quiescence(Position& pos, int alpha, int beta, std::size_t quiescence_depth, SearchContext& ctx,
+               Report& report, const Stopper& stopper) {
   if (stopper.should_stop(report)) {
     return 0;
+  }
+
+  // THE QUIESCENCE DEPTH CAP
+  // "Search captures until the position is quiet" is a promise with no bound in
+  // it. In practice the bound is the board itself—every recursion has to find
+  // another capture or promotion, and there are only so many pieces to trade—
+  // but "in practice" is not a guarantee, and this recursion holds a move list
+  // per level. Past the cap we simply return the static evaluation, which is
+  // what a quiet position would have returned anyway. See QUIESCENCE_MAX_DEPTH.
+  if (quiescence_depth >= QUIESCENCE_MAX_DEPTH) {
+    return eval(pos);
   }
 
   // THIS position has already been counted—by the alphabeta leaf that handed
@@ -931,9 +959,13 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
 
   const Colour colour_to_move = pos.colour_to_move;
 
-  // Only search noisy moves (captures and promotions)
-  MoveList moves = pseudo_legal_noisy_moves(pos);
-  OrderedMoves ordering(moves);
+  // Only search noisy moves (captures and promotions). The list and its
+  // ordering scores come from the context's row for this quiescence depth, so
+  // this frame holds neither of them.
+  MoveScratch& scratch = ctx.at_quiescence_depth(quiescence_depth);
+  MoveList& moves = scratch.moves;
+  moves = pseudo_legal_noisy_moves(pos);
+  OrderedMoves ordering(moves, scratch.scores);
 
   for (std::size_t i = 0; i < moves.size(); ++i) {
     const Move mv = ordering.select(i);
@@ -951,7 +983,7 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
     report.nodes += 1;
 
     // Negamax: negate score and swap alpha/beta
-    const int score = -quiescence(pos, -beta, -alpha, report, stopper);
+    const int score = -quiescence(pos, -beta, -alpha, quiescence_depth + 1, ctx, report, stopper);
 
     pos.unmake_move(mv);
 
@@ -1019,13 +1051,13 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // is a real one; it simply stops growing the tree in a direction that has
   // nowhere left to go. See THE PLY CEILING in search.hpp.
   if (report.ply >= MAX_DEPTH) {
-    return quiescence(pos, alpha, beta, report, stopper);
+    return quiescence(pos, alpha, beta, 0, ctx, report, stopper);
   }
 
   // Leaf node: drop into quiescence search
   if (depth == 0) {
     if (!is_in_check(pos.colour_to_move, pos.board)) {
-      return quiescence(pos, alpha, beta, report, stopper);
+      return quiescence(pos, alpha, beta, 0, ctx, report, stopper);
     }
     // CHECK EXTENSION: Don't stop search while in check (tactical danger).
     // This is the one place the recursion does not spend a ply of depth, so it
@@ -1043,6 +1075,12 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // "better or worse than alpha?", so it has no line to report.
   const bool is_pv_node = beta - alpha > 1;
 
+  // report.ply moves up and down around every child call below, so this node's
+  // own ply is named once here: it is what the scratch rows are indexed by, and
+  // what mate distances and killer slots are measured in.
+  const std::uint8_t ply = report.ply;
+  PlyScratch& scratch = ctx.at_ply(ply);
+
   std::uint16_t hash_move_packed = TT_NO_MOVE;
 
   // TRANSPOSITION TABLE PROBE
@@ -1056,7 +1094,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // rely on. So PV nodes pay for the search and keep their line; they still
     // get the hash move below, which is where most of the speed came from.
     if (!is_pv_node && entry->depth >= depth) {
-      const int tt_eval = eval_out(entry->score, report.ply);
+      const int tt_eval = eval_out(entry->score, ply);
 
       switch (entry->bound()) {
       case Bound::Exact:
@@ -1098,12 +1136,15 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     report.ply += 1;
 
     const int r = depth > 6 ? 3 : 2; // Deeper positions allow more reduction
-    MoveList scratch;
     // Zero-window search: just checking if score >= beta
     // No previous move to answer: we did not make one. A counter-move keyed by
     // the opponent's last real move would be answering the wrong question.
+    // The line it produces is thrown away—a zero window proves "better or worse
+    // than beta" and nothing else—so it is written into the child's own row and
+    // never read.
     const int null_eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - r - 1), -beta,
-                                     -beta + 1, scratch, tt, ctx, report, stopper, std::nullopt);
+                                     -beta + 1, ctx.at_ply(static_cast<std::uint8_t>(ply + 1)).pv,
+                                     tt, ctx, report, stopper, std::nullopt);
 
     report.ply -= 1;
     pos.unmake_null_move();
@@ -1125,7 +1166,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // TT_NO_MOVE and rely on the table to keep any move it already holds.
       const int null_bound = std::min(null_eval, beta);
       if (!stopper.has_stopped() && null_bound < CENTIPAWN_MATE_THRESHOLD) {
-        tt.store(pos.key, depth, eval_in(null_bound, report.ply), Bound::Lower, TT_NO_MOVE);
+        tt.store(pos.key, depth, eval_in(null_bound, ply), Bound::Lower, TT_NO_MOVE);
       }
       return beta;
     }
@@ -1134,7 +1175,8 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // Static evaluation for futility pruning (only compute at shallow depths when not in check)
   const int static_eval = (depth <= FUTILITY_DEPTH && !in_check) ? eval(pos) : 0;
 
-  MoveList moves = pseudo_legal_moves(pos);
+  MoveList& moves = scratch.ordering.moves;
+  moves = pseudo_legal_moves(pos);
 
   // Turn the 16 packed bits back into a real Move by finding it among the
   // moves this position actually has. This is the only place a stored move is
@@ -1144,7 +1186,12 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // search is finding would make us search the same move twice.
   const std::optional<Move> hash_move = decode_tt_move(hash_move_packed, moves);
 
-  OrderedMoves ordering(moves, ctx, report.ply, hash_move, previous_move);
+  OrderedMoves ordering(moves, scratch.ordering.scores, ctx, ply, hash_move, previous_move);
+
+  // The line this node's children report back into. One row per ply, so the
+  // child's PV is written where the child's own row lives and this frame holds
+  // no move list at all.
+  MoveList& child_pv = ctx.at_ply(static_cast<std::uint8_t>(ply + 1)).pv;
 
   // How many legal moves this node has actually searched, so the move about to
   // be searched is number `moves_searched + 1`. Late move reductions are a
@@ -1159,7 +1206,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // The quiet moves searched here so far. If one of the moves after them causes
   // a cutoff, these are the ones that were tried first and did not work, and
   // history wants to hear about it.
-  std::array<Move, MAX_PENALISED_QUIETS> searched_quiets{};
+  auto& searched_quiets = scratch.searched_quiets;
   std::size_t searched_quiet_count = 0;
 
   // The hash move is simply the first move the ordering hands over, so it goes
@@ -1188,13 +1235,17 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     ++moves_searched;
     report.ply += 1;
 
-    MoveList child_pv;
     int eval;
 
     if (moves_searched == 1) {
       // First move: search with full window. Ordering says this is the likely
       // best move, and the score the rest are measured against has to come
       // from somewhere.
+      //
+      // child_pv is a shared row, so it is emptied before every search whose
+      // line we might keep. A local list gave that for free; a reused one would
+      // otherwise hand us the previous sibling's line.
+      child_pv.clear();
       eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt, ctx,
                         report, stopper, mv);
     } else {
@@ -1217,21 +1268,27 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // After the first move, search the rest with a "zero window"
       // (alpha, alpha+1). That only proves "worse than alpha" or "better", but
       // it proves it far more cheaply than a real search.
-      MoveList zero_window_pv;
+      //
+      // A zero-window search has no line to report—it answers a yes/no question
+      // about alpha—so these two calls write into the same shared row as the
+      // full-window search below, and whatever they leave there is overwritten
+      // by the clear() before that search. Giving each of them a list of its
+      // own is what used to put three move lists in this frame.
       eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1 - reduction), -alpha - 1, -alpha,
-                        zero_window_pv, tt, ctx, report, stopper, mv);
+                        child_pv, tt, ctx, report, stopper, mv);
 
       // The reduced search says the move is better than alpha, and a reduced
       // search is not entitled to that opinion: verify it at full depth, still
       // with the zero window.
       if (reduction > 0 && eval > alpha) {
-        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
-                          zero_window_pv, tt, ctx, report, stopper, mv);
+        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha, child_pv,
+                          tt, ctx, report, stopper, mv);
       }
 
       // Still looking like a new best move, so pay for the real thing: the full
       // window is what produces a true score and the line behind it.
       if (eval > alpha && eval < beta) {
+        child_pv.clear();
         eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
                           ctx, report, stopper, mv);
       }
@@ -1247,7 +1304,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // here would crowd out the quiet moves these tables exist to rescue from
       // the back of the list.
       if (is_quiet(mv)) {
-        ctx.killers.store(report.ply, mv);
+        ctx.killers.store(ply, mv);
 
         const int bonus = history_bonus(depth);
         ctx.history.update(mv, bonus);
@@ -1266,7 +1323,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
       // Store in TT as a lower bound (actual score might be even higher)
       if (!stopper.has_stopped()) {
-        tt.store(pos.key, depth, eval_in(eval, report.ply), Bound::Lower, encode_tt_move(mv));
+        tt.store(pos.key, depth, eval_in(eval, ply), Bound::Lower, encode_tt_move(mv));
       }
       return beta;
     }
@@ -1291,7 +1348,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   if (moves_searched == 0) {
     // Checkmate: return negative mate score (we're getting mated)
     // Stalemate: draw
-    return in_check ? -CENTIPAWN_MATE + report.ply : CENTIPAWN_DRAW;
+    return in_check ? -CENTIPAWN_MATE + ply : CENTIPAWN_DRAW;
   }
 
   // Store the result in the transposition table for future use.
@@ -1300,7 +1357,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // that into the table would poison the position with a fabricated "equal"
   // evaluation that outlives the aborted search, so we say nothing.
   if (!stopper.has_stopped()) {
-    tt.store(pos.key, depth, eval_in(alpha, report.ply), tt_bound,
+    tt.store(pos.key, depth, eval_in(alpha, ply), tt_bound,
              best_move.has_value() ? encode_tt_move(*best_move) : TT_NO_MOVE);
   }
 

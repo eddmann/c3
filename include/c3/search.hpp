@@ -528,12 +528,109 @@ private:
 // "cleared between searches", and it is what keeps `bench` reproducible.
 // (Stronger engines do carry history from move to move, halving it each time;
 // that is a refinement, not a correction.)
+//
+// WHY THE SCRATCH SPACE LIVES HERE TOO, AND NOT ON THE STACK
+// The context also owns the working storage each node needs while it decides:
+// the move list it generated, the ordering scores for those moves, the line it
+// reports to its parent, and the quiet moves it has already tried. Every one of
+// those is naturally a local variable, and every one of them is here instead.
+// Three reasons, in order of how badly they bite:
+//
+//   1. THREAD STACKS ARE SMALL, AND THE SEARCH IS 255 FRAMES DEEP. A MoveList
+//      is a fixed-capacity 256-slot array—two kilobytes—so a frame holding
+//      three of them costs six. Multiply by the ply ceiling and alpha-beta
+//      alone wants a megabyte and a half of stack. The main thread usually has
+//      eight megabytes, but the search does not run there: it runs on a
+//      std::thread so the UCI loop can keep reading `stop`, and a default
+//      std::thread gets 512 KiB on macOS and 1 MiB on Windows. The overflow
+//      that follows is not an exception, it is a dead process mid-game—and it
+//      only shows up on the deep tactical positions the engine most wants to
+//      get right. Moving the lists here leaves a frame small enough that the
+//      whole recursion fits in a fraction of the smallest of those stacks.
+//
+//   2. LOCALITY. A row is allocated once and reused by every node that visits
+//      that ply, so the same cache lines are hit again and again instead of a
+//      fresh, cold slice of stack being touched at each node.
+//
+//   3. REPRODUCIBILITY. Rows are zeroed once, when the context is built. A node
+//      that reads a row before writing it therefore sees the same bytes on
+//      every run, rather than whatever the previous frame left behind, which is
+//      what keeps `bench` reporting the same node count twice in a row.
+//
+// The rows are heap-allocated (a couple of megabytes) and owned by the context,
+// so they are freed when the search that needed them ends.
 // ---------------------------------------------------------------------------
 
-struct SearchContext {
+// How many quiet moves one node remembers, so that a later cutoff can penalise
+// the quiet moves that were tried before it and failed. A node that searched
+// more than this before finding a cutoff has bigger problems than the exactness
+// of its bookkeeping.
+inline constexpr std::size_t MAX_PENALISED_QUIETS = 32;
+
+// One ordering score per move. Move generation never produces more than 256
+// moves (the busiest legal position anyone has constructed offers 218), so a
+// row this long can score any list it can hand us.
+inline constexpr std::size_t MAX_ORDERED_MOVES = 256;
+
+// How deep quiescence may recurse before it stops resolving and simply returns
+// the static evaluation. In practice it never comes close: each recursion needs
+// another capture or promotion, and a position only has so many pieces to trade
+// off. The cap exists for the pathological case—a long forced sequence, or a
+// bug in move generation—where "keep going until it is quiet" would otherwise
+// be an unbounded promise, and it is what makes the per-depth storage below a
+// fixed, affordable size.
+inline constexpr std::size_t QUIESCENCE_MAX_DEPTH = 64;
+
+// The scratch one node needs to pick its moves: the list it generated, and the
+// score ordering gave each entry of that list.
+struct MoveScratch {
+  MoveList moves;
+  std::array<int, MAX_ORDERED_MOVES> scores{};
+};
+
+// Everything one ply of the main search needs, on top of the above: the line it
+// reports to its parent, and the quiet moves it has already tried.
+struct PlyScratch {
+  MoveScratch ordering;
+  MoveList pv;
+  std::array<Move, MAX_PENALISED_QUIETS> searched_quiets{};
+};
+
+class SearchContext {
+public:
+  SearchContext();
+
   KillerMoves killers;
   HistoryTable history;
   CounterMoves counters;
+
+  // TEST-ONLY SWITCH. Late move reductions have no output of their own—the only
+  // thing they change is how much work a search does—so the only honest way to
+  // measure them is to run the same search twice with them on and off. Nothing
+  // on the UCI path ever writes this; it is here for tests and for bench
+  // experiments, and it is why the reduction block in search.cpp asks a
+  // question that always answers "yes" in a real game.
+  bool reductions_enabled{true};
+
+  // The scratch row for a node at `ply`. Rows live for the whole search and are
+  // reused by every node that visits that ply, so a reference into one stays
+  // valid across the recursion below it—which is exactly what alphabeta relies
+  // on when it hands its child `at_ply(ply + 1).pv` to fill in.
+  [[nodiscard]] PlyScratch& at_ply(std::uint8_t ply) { return (*plies_)[ply]; }
+
+  // The same, for quiescence, indexed by how deep INTO quiescence we are rather
+  // than by search ply. Callers must respect QUIESCENCE_MAX_DEPTH.
+  [[nodiscard]] MoveScratch& at_quiescence_depth(std::size_t depth) {
+    return (*quiescence_)[depth];
+  }
+
+private:
+  // std::array rather than std::vector so the rows cannot be reallocated out
+  // from under a reference the recursion is still holding, and behind a
+  // unique_ptr because these are megabytes: putting them in the object itself
+  // would just move the stack problem to whoever declares a SearchContext.
+  std::unique_ptr<std::array<PlyScratch, MAX_DEPTH + 1>> plies_;
+  std::unique_ptr<std::array<MoveScratch, QUIESCENCE_MAX_DEPTH>> quiescence_;
 };
 
 // ---------------------------------------------------------------------------
