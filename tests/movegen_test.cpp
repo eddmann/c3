@@ -290,9 +290,10 @@ TEST(Movegen, GeneratesTheMostCrowdedKnownPosition) {
   // 218 legal moves is the highest count found for a legal chess position, and
   // the figure MOVE_LIST_RESERVE is sized from.
   const Position pos = parse_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1");
+  const auto moves = legal_moves(pos);
 
-  EXPECT_EQ(legal_moves(pos).size(), 218);
-  EXPECT_LE(legal_moves(pos).size(), MOVE_LIST_RESERVE);
+  EXPECT_EQ(moves.size(), 218);
+  EXPECT_LE(moves.size(), MOVE_LIST_RESERVE);
 }
 
 TEST(Movegen, LegalMovesRejectMovesByAPinnedPiece) {
