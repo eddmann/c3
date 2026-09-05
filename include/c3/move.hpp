@@ -43,4 +43,12 @@ struct Move {
   }
 };
 
+// Move is the most-copied object in the engine: move generation produces dozens
+// per node, ordering sorts them, the search stack keeps them alive across plies
+// and the transposition table stores one per entry. At eight bytes a 64-byte
+// cache line holds eight moves, so scoring and sorting a whole move list touches
+// a handful of lines instead of dozens. This assertion turns a future field (or
+// a widened Piece enum) into a build failure rather than a silent slowdown.
+static_assert(sizeof(Move) <= 8, "Move must stay small enough to pack move lists into cache lines");
+
 } // namespace c3

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <ostream>
 #include <string>
 
@@ -13,7 +14,13 @@ namespace c3 {
 /// Colours: W = White, B = Black
 /// Pieces: P = Pawn, N = Knight (N to avoid confusion with King),
 ///         B = Bishop, R = Rook, Q = Queen, K = King
-enum class Piece : int {
+///
+/// The underlying type is a single byte on purpose. A Piece is never stored
+/// alone for long: it travels inside Move (twice, wrapped in std::optional),
+/// and move lists are the data structure the search walks most often. Widening
+/// this enum to int would quadruple the piece fields and push Move past the
+/// size that lets several of them share one cache line.
+enum class Piece : std::uint8_t {
   WP, // White Pawn
   WN, // White Knight
   WB, // White Bishop
@@ -83,8 +90,10 @@ constexpr bool is_king(Piece piece) {
   return piece == Piece::WK || piece == Piece::BK;
 }
 
+// White occupies the first six enumerators, black the last six, so the colour
+// of a piece is a single comparison rather than a lookup.
 constexpr Colour colour(Piece piece) {
-  return static_cast<int>(piece) <= static_cast<int>(Piece::WK) ? Colour::White : Colour::Black;
+  return piece <= Piece::WK ? Colour::White : Colour::Black;
 }
 
 constexpr char to_char(Piece piece) {
