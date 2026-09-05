@@ -207,7 +207,11 @@ TEST(UciSession, StartposBestmovesDepth1To3) {
 
   const auto output = uci::run_script_for_test(script);
 
-  EXPECT_NE(output.find("bestmove g1f3"), std::string::npos);
+  // Nf3 and Nc3 are mirror images under this evaluation and score identically,
+  // so which one wins is decided by move-ordering ties; either is a correct answer.
+  EXPECT_TRUE(output.find("bestmove g1f3") != std::string::npos ||
+              output.find("bestmove b1c3") != std::string::npos)
+      << output;
   EXPECT_NE(output.find("info depth 1"), std::string::npos);
   EXPECT_NE(output.find("info depth 2"), std::string::npos);
   EXPECT_NE(output.find("info depth 3"), std::string::npos);
