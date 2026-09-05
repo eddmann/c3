@@ -30,11 +30,20 @@
 //   - Bitboards alone: Finding what's on E4 requires checking 12 bitboards
 //   - Hybrid: Both operations are O(1), for one extra copy of the position
 //
-// A Board is 248 bytes: 128 for the mailbox (std::optional<Piece> is 2 bytes
+// The Board also carries an EvalAccumulator: the running material, piece-square
+// and game-phase totals that the evaluation reads instead of walking the piece
+// lists at every node. It lives here rather than in Position because
+// put_piece/remove_piece below are the ONLY way a piece ever appears on or
+// leaves a square—FEN parsing, make_move, unmake_move and tests all funnel
+// through them—so keeping the totals current there makes it impossible for them
+// to drift out of sync. See eval_terms.hpp for what the totals contain and why.
+//
+// A Board is 272 bytes: 128 for the mailbox (std::optional<Piece> is 2 bytes
 // now that Piece is a single byte—it used to be 8, which alone made a Board
-// 624 bytes), 96 for the per-piece bitboards, 16 for the colour bitboards and 8
-// for the occupancy. Small enough that copying one is cheap and several fit in
-// L1 alongside everything else the search is touching.
+// 624 bytes), 96 for the per-piece bitboards, 16 for the colour bitboards, 8
+// for the occupancy and 20 for the accumulator, rounded up to a multiple of 8.
+// Small enough that copying one is cheap and several fit in L1 alongside
+// everything else the search is touching.
 //
 // =============================================================================
 
@@ -46,6 +55,7 @@
 
 #include "c3/bitboard.hpp"
 #include "c3/colour.hpp"
+#include "c3/eval_terms.hpp"
 #include "c3/piece.hpp"
 #include "c3/square.hpp"
 
@@ -69,10 +79,13 @@ public:
   // Precondition: the square is empty. Dropping a piece onto an occupant would
   // overwrite the mailbox entry while leaving the displaced piece's bit set in
   // its own bitboard—a "phantom" piece that the mailbox denies and the bitboards
-  // insist on. Such a desync typically only surfaces plies later, in an
-  // unrelated evaluation or attack lookup, so Debug builds abort here instead.
-  // Release builds do not check: the assert is the whole enforcement, so callers
-  // that mean to replace a piece must remove_piece first either way.
+  // insist on. It would also add the new piece to the evaluation accumulator
+  // without ever subtracting the one it buried, so the running totals would be
+  // permanently too high by whatever that piece was worth. Such a desync
+  // typically only surfaces plies later, in an unrelated evaluation or attack
+  // lookup, so Debug builds abort here instead. Release builds do not check:
+  // the assert is the whole enforcement, so callers that mean to replace a
+  // piece must remove_piece first either way.
   void put_piece(Piece piece, Square square) noexcept {
     assert(!has_piece_at(square) && "put_piece expects an empty square");
 
@@ -83,6 +96,7 @@ public:
     pieces_[idx] |= square;
     colours_[colour_idx] |= square;
     occupancy_ |= square;
+    accumulator_.add(piece, square);
   }
 
   [[nodiscard]] std::optional<Piece> piece_at(Square square) const noexcept {
@@ -110,11 +124,38 @@ public:
     pieces_[idx] &= ~Bitboard(square);
     colours_[colour_idx] &= ~Bitboard(square);
     occupancy_ &= ~Bitboard(square);
+    accumulator_.remove(*maybe_piece, square);
   }
 
   [[nodiscard]] Bitboard occupancy() const noexcept { return occupancy_; }
   [[nodiscard]] bool has_occupancy_at(Bitboard squares) const noexcept {
     return (occupancy() & squares) != 0;
+  }
+
+  // The running evaluation totals, maintained by put_piece/remove_piece.
+  [[nodiscard]] const EvalAccumulator& accumulator() const noexcept { return accumulator_; }
+
+  // The same totals, rebuilt from the pieces actually on the board. This is the
+  // slow, obviously-correct version: the EvalAccumulator tests compare it
+  // against the running totals, and builds configured with C3_EXPENSIVE_ASSERTS
+  // also compare after every make_move and unmake_move. An accumulator that
+  // silently drifts would poison every evaluation from that node onwards, and
+  // the resulting bad move is impossible to trace back to its cause—so we catch
+  // the drift instead.
+  //
+  // It walks the twelve piece bitboards rather than the 64-square mailbox, for
+  // the same reason compute_key() does: a real position has 32 pieces or fewer,
+  // so popping set bits visits only the squares that hold something, while the
+  // mailbox scan pays for all 64 and unwraps an optional at each one.
+  [[nodiscard]] EvalAccumulator compute_accumulator() const noexcept {
+    EvalAccumulator rebuilt;
+    for (const auto piece : all_pieces()) {
+      Bitboard piece_squares = pieces(piece);
+      while (piece_squares != 0) {
+        rebuilt.add(piece, Square::pop_first_occupied(piece_squares));
+      }
+    }
+    return rebuilt;
   }
 
 private:
@@ -126,14 +167,16 @@ private:
     return static_cast<std::size_t>(colour);
   }
 
-  // The four representations below are kept in sync by put_piece/remove_piece.
-  // This redundancy is intentional: different queries are fast with different
-  // representations, and the synchronization cost is minimal.
+  // The four representations below are kept in sync by put_piece/remove_piece,
+  // and so is the accumulator that rides along with them. This redundancy is
+  // intentional: different queries are fast with different representations, and
+  // the synchronization cost is minimal.
 
   std::array<std::optional<Piece>, 64> squares_{}; // Mailbox: square → piece
   std::array<Bitboard, 12> pieces_{};              // Bitboard per piece type
   std::array<Bitboard, 2> colours_{};              // Bitboard per colour
   Bitboard occupancy_{};                           // Union of both colour bitboards
+  EvalAccumulator accumulator_{};                  // Running material/PSQT/phase totals
 };
 
 } // namespace c3

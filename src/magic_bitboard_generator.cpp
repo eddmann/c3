@@ -1,3 +1,25 @@
+// =============================================================================
+// MAGIC BITBOARD TABLE GENERATOR
+// =============================================================================
+//
+// Finds, for every square, a "magic" 64-bit multiplier that turns the relevant
+// occupancy bits of a rook or bishop ray into a dense table index, then writes
+// the resulting tables out as include/c3/magic.hpp.
+//
+// The search is brute force: draw a random candidate, try to index the whole
+// occupancy set with it, and keep the first candidate that produces no index
+// collisions. That is the standard technique, and it works because valid magics
+// are common enough that a few thousand draws normally find one.
+//
+// "Normally" is doing real work in that sentence, which is why the search below
+// is bounded rather than a bare while(true): see find_magic_for_square.
+//
+// This program is only built and run when the build is configured with
+// -DC3_REGENERATE_MAGIC=ON. Its output is checked in, so a normal build never
+// pays for the search.
+//
+// =============================================================================
+
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -6,9 +28,9 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -210,6 +232,64 @@ Bitboard bit_permutation_from_index(std::size_t index, const std::vector<Bitboar
   return occupancy;
 }
 
+// =============================================================================
+// CANDIDATE MAGICS
+// =============================================================================
+// Magic candidates are drawn SPARSE—the AND of three random words, so roughly
+// eight bits set out of sixty-four. That is not superstition: the multiply has
+// to fold the occupancy bits into the top of the word without them landing on
+// top of each other, and a candidate with few set bits creates far fewer
+// overlapping partial products, so it succeeds far more often than a dense one.
+//
+// The number of terms ANDed together is a knob rather than a constant only so
+// that the search has somewhere to go if sparse candidates run out; see
+// find_magic_for_square.
+// =============================================================================
+
+struct CandidateSource {
+  HashRng rng;
+  int terms{3}; // 3 = sparse (the default), 2 = less so, 1 = a plain draw
+
+  Bitboard next() {
+    // At terms == 3 this draws the same three values as HashRng::next_sparse()
+    // and ANDs them together. AND is commutative, so the result matches
+    // next_sparse() whatever order the compiler evaluates its operands in—an
+    // order the standard leaves unspecified. That equivalence is what lets the
+    // generator reproduce the checked-in magic.hpp.
+    Bitboard candidate = rng.next();
+    for (int term = 1; term < terms; ++term) {
+      candidate &= rng.next();
+    }
+    return candidate;
+  }
+};
+
+// =============================================================================
+// BOUNDING THE SEARCH
+// =============================================================================
+// A valid magic exists for every square and the sparse search finds one within
+// a few thousand draws, so in practice the first round below always succeeds.
+// The bound is not there for the expected case; it is there because the
+// alternative is a bare while(true), and a bare while(true) turns any future
+// mistake—a wrong mask, a bad shift, a generator seeded to a degenerate
+// state—into a build that hangs forever with no output. A build that stops and
+// says which square defeated it is worth the handful of lines.
+//
+// Each round that runs out of attempts falls back rather than giving up:
+// reseeding moves the search to a different part of the candidate space, and
+// widening (fewer terms ANDed together) makes candidates denser, which is the
+// right direction if a square somehow has no sparse magic at all. Only when
+// every round is exhausted does the generator fail, and it fails loudly.
+// =============================================================================
+
+inline constexpr std::size_t MAX_ATTEMPTS_PER_ROUND = 1'000'000;
+
+// How sparse each round's candidates are: three rounds of the usual sparse
+// draws from three different seeds, then two rounds of denser ones, then a
+// round of plain random words.
+inline constexpr std::array<int, 6> ROUND_TERMS = {3, 3, 3, 2, 2, 1};
+inline constexpr int SEARCH_ROUNDS = static_cast<int>(ROUND_TERMS.size());
+
 FoundMagic find_magic_for_square(Square square, const std::function<Bitboard(Square)>& mask_fn,
                                  const std::function<Bitboard(Square, Bitboard)>& attacks_fn) {
   const Bitboard mask = mask_fn(square);
@@ -228,37 +308,57 @@ FoundMagic find_magic_for_square(Square square, const std::function<Bitboard(Squ
     attacks.push_back(attacks_fn(square, occupancy));
   }
 
-  HashRng rng(c3::HASH_SEED);
   const auto shift = static_cast<std::uint8_t>(64 - bit_count);
 
-  while (true) {
-    const Bitboard candidate = rng.next_sparse();
-    std::vector<std::optional<Bitboard>> table(table_size);
+  // The candidate table and its "which attempt last wrote this slot" stamps are
+  // allocated ONCE and reused across every attempt. The obvious version clears
+  // the table between attempts, which is a memset of up to 4096 entries per
+  // candidate and dominates the cost of the search; bumping a counter instead
+  // makes every stale slot invalid for free. The stamp cannot wrap: the whole
+  // search makes at most SEARCH_ROUNDS * MAX_ATTEMPTS_PER_ROUND attempts, far
+  // below the range of a 32-bit counter.
+  std::vector<Bitboard> table(table_size);
+  std::vector<std::uint32_t> written_on_attempt(table_size, 0);
+  std::uint32_t attempt_stamp = 0;
 
-    bool collision = false;
-    for (std::size_t i = 0; i < table_size; ++i) {
-      const auto idx = static_cast<std::size_t>((occupancies[i] * candidate) >> shift);
-      if (table[idx].has_value()) {
-        collision = true;
-        break;
-      }
-      table[idx] = attacks[i];
-    }
+  for (int round = 0; round < SEARCH_ROUNDS; ++round) {
+    // Round 0 is the sparse search from the standard seed—the one that produced
+    // the checked-in tables. Later rounds only exist as an escape hatch.
+    CandidateSource candidates{
+        .rng = HashRng(c3::HASH_SEED + static_cast<std::uint64_t>(round)),
+        .terms = ROUND_TERMS[static_cast<std::size_t>(round)],
+    };
 
-    if (!collision) {
-      std::vector<Bitboard> flattened;
-      flattened.reserve(table_size);
-      for (const auto& entry : table) {
-        flattened.push_back(*entry);
+    for (std::size_t attempt = 0; attempt < MAX_ATTEMPTS_PER_ROUND; ++attempt) {
+      const Bitboard candidate = candidates.next();
+      ++attempt_stamp;
+
+      bool collision = false;
+      for (std::size_t i = 0; i < table_size; ++i) {
+        const auto idx = static_cast<std::size_t>((occupancies[i] * candidate) >> shift);
+        if (written_on_attempt[idx] == attempt_stamp) {
+          collision = true;
+          break;
+        }
+        written_on_attempt[idx] = attempt_stamp;
+        table[idx] = attacks[i];
       }
-      return FoundMagic{
-          .mask = mask,
-          .num = candidate,
-          .shift = shift,
-          .table = std::move(flattened),
-      };
+
+      // No collisions means the multiply mapped the table_size occupancies onto
+      // the table_size indices one-to-one, so every slot now holds its attacks.
+      if (!collision) {
+        return FoundMagic{
+            .mask = mask,
+            .num = candidate,
+            .shift = shift,
+            .table = std::move(table),
+        };
+      }
     }
   }
+
+  throw std::runtime_error("no magic found for square " + square.to_string() + " after " +
+                           std::to_string(SEARCH_ROUNDS) + " rounds");
 }
 
 BuiltTables build_magics(const std::function<Bitboard(Square)>& mask_fn,
@@ -323,18 +423,28 @@ void write_header(const BuiltTables& rook, const BuiltTables& bishop,
     throw std::runtime_error("Failed to open output file: " + out_path.string());
   }
 
+  // Everything below is written in the shape clang-format would produce, so
+  // that regenerating the header and running the repo's formatter over it are
+  // the same thing. Emitting a "close enough" layout instead would make every
+  // regeneration show up as a large formatting diff on top of the real one.
   out << "#pragma once\n\n";
+  out << "// Generated by c3_magic_bitboard_generator - do not edit; regenerate with\n";
+  out << "// -DC3_REGENERATE_MAGIC=ON\n\n";
   out << "#include <array>\n";
   out << "#include <cstddef>\n";
   out << "#include <cstdint>\n\n";
   out << "namespace c3 {\n\n";
-  out << "struct Magic { std::uint64_t mask; std::uint64_t num; std::uint8_t shift; std::size_t "
-         "offset; };\n\n";
+  out << "struct Magic {\n";
+  out << "  std::uint64_t mask;\n";
+  out << "  std::uint64_t num;\n";
+  out << "  std::uint8_t shift;\n";
+  out << "  std::size_t offset;\n";
+  out << "};\n\n";
 
   write_tables(rook, "ROOK", out);
   write_tables(bishop, "BISHOP", out);
 
-  out << "}  // namespace c3\n";
+  out << "} // namespace c3\n";
 }
 
 } // namespace c3::magicgen

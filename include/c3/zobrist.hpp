@@ -25,6 +25,13 @@
 //   3. Low collision probability: With 64-bit random values, the chance of
 //      two different positions hashing to the same value is ~1/2^64.
 //
+// That third property is a claim about RANDOM values, and it is only as true as
+// the generator behind them. Because positions are hashed by XORing keys
+// together, any subset of keys that XORs to zero is a guaranteed collision
+// between two different positions—and a purely linear generator produces such
+// subsets by construction. That is why the table below draws from
+// next_scrambled() rather than next(); see rng.hpp for the full story.
+//
 // The hash is used as a key in the transposition table (see search.hpp) to
 // cache and retrieve previously computed position evaluations.
 //
@@ -68,23 +75,26 @@ consteval ZobristTable make_zobrist_table() {
   ZobristTable table{};
   HashRng rng(HASH_SEED); // Deterministic: same seed → same table always
 
+  // Every draw below goes through next_scrambled(), never next(). Mixing the
+  // two would reintroduce the linear relations the scrambler exists to break.
+
   for (const auto piece : all_pieces()) {
     for (std::uint8_t file = 0; file < 8; ++file) {
       for (std::uint8_t rank = 0; rank < 8; ++rank) {
         const auto square = Square::from_file_and_rank(file, rank);
-        table.piece_square[static_cast<std::size_t>(piece)][square.index()] = rng.next();
+        table.piece_square[static_cast<std::size_t>(piece)][square.index()] = rng.next_scrambled();
       }
     }
   }
 
-  table.colour_to_move = rng.next();
+  table.colour_to_move = rng.next_scrambled();
 
   for (auto& entry : table.castling_rights) {
-    entry = rng.next();
+    entry = rng.next_scrambled();
   }
 
   for (auto& entry : table.en_passant_files) {
-    entry = rng.next();
+    entry = rng.next_scrambled();
   }
 
   return table;

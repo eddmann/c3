@@ -23,6 +23,22 @@
 //      - XOR in the new piece position
 //    This is O(1) per move instead of O(number_of_pieces).
 //
+//    The evaluation totals are maintained the same way, but a level lower down:
+//    Board::put_piece and Board::remove_piece keep them current, so nothing in
+//    this file has to mention them.
+//
+//    Both invariants are checked by comparing the maintained value against a
+//    from-scratch recomputation at the end of every make and unmake, because an
+//    incremental update that is wrong once stays wrong for the rest of the
+//    game, and the check is what tells us which move broke it. The two checks
+//    are gated differently, though, because they do not cost the same. The
+//    Zobrist check runs in every Debug build. The accumulator check runs only
+//    when C3_EXPENSIVE_ASSERTS is defined (opt-in, off by default), because
+//    rebuilding the totals at every node roughly doubles the runtime of the
+//    perft suite—too much to pay on every Debug run for an invariant the
+//    EvalAccumulator tests already cover directly. Turn it on when hunting a
+//    suspected drift; leave it off the rest of the time.
+//
 // 3. REPETITION DETECTION
 //    Chess is drawn if the same position occurs three times. We detect this
 //    by comparing Zobrist keys in the move history. This is also used during
@@ -207,6 +223,9 @@ void Position::make_move(const Move& mv) {
 #ifndef NDEBUG
   assert(key == compute_key());
 #endif
+#ifdef C3_EXPENSIVE_ASSERTS
+  assert(board.accumulator() == board.compute_accumulator());
+#endif
 }
 
 void Position::unmake_move(const Move& mv) {
@@ -252,6 +271,9 @@ void Position::unmake_move(const Move& mv) {
 
 #ifndef NDEBUG
   assert(key == compute_key());
+#endif
+#ifdef C3_EXPENSIVE_ASSERTS
+  assert(board.accumulator() == board.compute_accumulator());
 #endif
 }
 

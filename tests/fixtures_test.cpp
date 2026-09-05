@@ -44,5 +44,5 @@ TEST(Fixtures, LoadZobristStartPosition) {
   const auto* record = find_by(records, [](const auto& r) { return r.name == "startpos"; });
   ASSERT_NE(record, nullptr);
 
-  EXPECT_EQ(record->key, 0xd9189e710b0d5138ULL);
+  EXPECT_EQ(record->key, 0x6c432230a29d4be0ULL);
 }
