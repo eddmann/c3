@@ -534,6 +534,36 @@ TEST(SearchDraw, RecognizesFiftyMoveRule) {
   EXPECT_LE(std::abs(result.eval), 50);
 }
 
+TEST(SearchDraw, ReportsADrawnPvAsADrawAndTruncatesIt) {
+  // King, bishop and knight against a bare king is a forced win, but not
+  // within the fifty-move rule from here: the clock is at 95, so the best
+  // line runs into the draw before the mate arrives. The engine must report
+  // what the line is actually worth—nothing—and stop the line at the move
+  // that draws, rather than advertise a bishop and a knight it never cashes.
+  //
+  // This is also where the search's own score and the reported score are
+  // allowed to differ. Only the reported one is sanitised; the searched one
+  // stays as it was so it can centre the next aspiration window.
+  Position pos = parse("8/8/8/3k4/8/8/8/3BNK2 w - - 95 60");
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 6;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  EXPECT_EQ(result.eval, CENTIPAWN_DRAW);
+  ASSERT_FALSE(result.pv.empty());
+
+  // The PV ends exactly at the drawing move, not before and not after.
+  Position replayed = pos;
+  for (std::size_t i = 0; i < result.pv.size(); ++i) {
+    replayed.make_move(result.pv[i]);
+    const bool drawn = replayed.is_fifty_move_draw() || replayed.is_repetition_draw(0);
+    EXPECT_EQ(drawn, i + 1 == result.pv.size()) << "at PV index " << i;
+  }
+}
+
 TEST(SearchDraw, DISABLED_AvoidsStalemateWhenWinning) {
   // Q+K vs K - white is winning but can stalemate
   // Position: white king g6, white queen f7, black king h8

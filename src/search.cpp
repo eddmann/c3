@@ -900,7 +900,26 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
 
   const std::uint8_t max_depth = limits.depth.has_value() ? *limits.depth : MAX_DEPTH;
 
-  int last_eval = 0;
+  // TWO SCORES, TWO JOBS. They are equal on almost every iteration, and it is
+  // tempting to keep one variable—but they answer different questions, and
+  // sanitise_pv() is exactly where they part company.
+  //
+  //   searched_eval  what alpha-beta actually returned. The next iteration's
+  //                  aspiration window is centred on THIS, because it is the
+  //                  search's own opinion of the position and therefore the
+  //                  best prediction of what the next, deeper search will say.
+  //
+  //   reported_eval  what we tell the GUI, and what SearchResult carries.
+  //                  sanitise_pv() rewrites it to a draw when the principal
+  //                  variation walks into a repetition or the fifty-move rule,
+  //                  because claiming "+3" for a line that ends in a handshake
+  //                  is a lie however good the position looks.
+  //
+  // Centring the window on the reported score would aim the next iteration at
+  // "equal" while the search still believes it is winning: every attempt would
+  // fail high, and each one costs a full re-search of the whole tree.
+  int searched_eval = 0;
+  int reported_eval = 0;
   MoveList best_pv;
   std::uint8_t best_depth = 0;
 
@@ -908,13 +927,13 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
     MoveList pv;
 
     const bool do_aspiration =
-        depth >= ASPIRATION_WINDOW_MIN_DEPTH && std::abs(last_eval) < CENTIPAWN_MATE_THRESHOLD;
+        depth >= ASPIRATION_WINDOW_MIN_DEPTH && std::abs(searched_eval) < CENTIPAWN_MATE_THRESHOLD;
 
     int delta_low = ASPIRATION_WINDOW_INITIAL_DELTA;
     int delta_high = ASPIRATION_WINDOW_INITIAL_DELTA;
 
-    int alpha = do_aspiration ? std::max(CENTIPAWN_MIN, last_eval - delta_low) : CENTIPAWN_MIN;
-    int beta = do_aspiration ? std::min(CENTIPAWN_MAX, last_eval + delta_high) : CENTIPAWN_MAX;
+    int alpha = do_aspiration ? std::max(CENTIPAWN_MIN, searched_eval - delta_low) : CENTIPAWN_MIN;
+    int beta = do_aspiration ? std::min(CENTIPAWN_MAX, searched_eval + delta_high) : CENTIPAWN_MAX;
 
     int eval_final = 0;
     std::uint8_t retries = 0;
@@ -945,10 +964,10 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
 
       if (eval <= alpha) {
         delta_low *= ASPIRATION_WINDOW_EXPANSION_FACTOR;
-        alpha = std::max(CENTIPAWN_MIN, last_eval - delta_low);
+        alpha = std::max(CENTIPAWN_MIN, searched_eval - delta_low);
       } else if (eval >= beta) {
         delta_high *= ASPIRATION_WINDOW_EXPANSION_FACTOR;
-        beta = std::min(CENTIPAWN_MAX, last_eval + delta_high);
+        beta = std::min(CENTIPAWN_MAX, searched_eval + delta_high);
       }
     }
 
@@ -956,10 +975,12 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
       break;
     }
 
-    // Sanitise the PV to detect draws and adjust eval accordingly
+    // Sanitise the PV to detect draws and adjust the REPORTED eval accordingly.
+    // The searched eval is kept as it was: see the note where both are declared.
     auto [sanitised_pv, sanitised_eval] = sanitise_pv(pos, pv, eval_final);
 
-    last_eval = sanitised_eval;
+    searched_eval = eval_final;
+    reported_eval = sanitised_eval;
     best_pv = sanitised_pv;
     best_depth = depth;
 
@@ -971,7 +992,7 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
 
   SearchResult result;
   result.depth = best_depth;
-  result.eval = last_eval;
+  result.eval = reported_eval;
   result.pv = best_pv;
   result.nodes = report.nodes;
   result.hashfull = tt.hashfull();
