@@ -93,12 +93,20 @@
     {
       "name": "tests",
       "configurePreset": "debug",
-      "output": {"outputOnFailure": true}
+      "output": {"outputOnFailure": true},
+      "filter": {"exclude": {"label": "^slow$"}}
     },
     {
       "name": "release-tests",
       "configurePreset": "release-tests",
-      "output": {"outputOnFailure": true}
+      "output": {"outputOnFailure": true},
+      "filter": {"exclude": {"label": "^slow$"}}
+    },
+    {
+      "name": "slow-tests",
+      "configurePreset": "debug",
+      "output": {"outputOnFailure": true},
+      "filter": {"include": {"label": "^slow$"}}
     }
   ]
 }

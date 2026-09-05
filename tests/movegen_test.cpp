@@ -351,28 +351,50 @@ TEST(Movegen, PawnPromotionWithAdvanceOrCapture) {
   assert_pseudo_legal_move_count("3q4/4P3/8/8/8/8/8/8 w - - 0 1", 8);
 }
 
+// The positions below cannot be reached through FEN any more: from_fen rejects
+// pawns on the back ranks and castling rights without the king and rook at
+// home. Movegen still guards against them because a Position can be built or
+// mutated directly (its members are public), so the tests do exactly that.
+
+Position with_piece_added(std::string_view fen, Piece piece, Square square) {
+  Position pos = parse_fen(fen);
+  pos.board.put_piece(piece, square);
+  pos.key = pos.compute_key();
+  return pos;
+}
+
+Position with_castling_rights(std::string_view fen, CastlingRights rights) {
+  Position pos = parse_fen(fen);
+  pos.castling_rights = rights;
+  pos.key = pos.compute_key();
+  return pos;
+}
+
 TEST(Movegen, WhitePawnOnPromotionRankHasNoAdvance) {
-  // Ranks 1 and 8 are unreachable for a pawn in a real game, but FEN syntax
-  // allows them, and a UCI GUI may hand us such a position. Advancing here
-  // would step off the 64-square board.
-  const Position pos = parse_fen("4k2P/8/8/8/8/8/8/4K3 w - - 0 1");
+  // Ranks 1 and 8 are unreachable for a pawn in a real game. Advancing from
+  // there would step off the 64-square board.
+  const Position pos = with_piece_added("4k3/8/8/8/8/8/8/4K3 w - - 0 1", Piece::WP, Square::H8);
   EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::H8), 0);
 }
 
 TEST(Movegen, BlackPawnOnPromotionRankHasNoAdvance) {
-  const Position pos = parse_fen("4k3/8/8/8/8/8/8/4Kp2 b - - 0 1");
+  const Position pos = with_piece_added("4k3/8/8/8/8/8/8/4K3 b - - 0 1", Piece::BP, Square::F1);
   EXPECT_EQ(moves_from_square(pseudo_legal_moves(pos), Square::F1), 0);
 }
 
 TEST(Movegen, NoCastlingWhenKingHasLeftItsHomeSquare) {
-  // Castling rights in a FEN can disagree with the pieces on the board; the
-  // king must actually stand on e1/e8 for a castling move to make sense.
-  const Position pos = parse_fen("4k3/8/8/8/8/8/8/R2K3R w KQ - 0 1");
+  // Castling rights can disagree with the pieces on the board; the king must
+  // actually stand on e1/e8 for a castling move to make sense.
+  const Position pos = with_castling_rights(
+      "4k3/8/8/8/8/8/8/R2K3R w - - 0 1",
+      CastlingRights::from({CastlingRight::WhiteKing, CastlingRight::WhiteQueen}));
   EXPECT_EQ(castling_move_count(pseudo_legal_moves(pos)), 0);
 }
 
 TEST(Movegen, OnlyKingSideCastlingWhenQueenRookIsMissing) {
-  const Position pos = parse_fen("4k3/8/8/8/8/8/8/4K2R w KQ - 0 1");
+  const Position pos = with_castling_rights(
+      "4k3/8/8/8/8/8/8/4K2R w - - 0 1",
+      CastlingRights::from({CastlingRight::WhiteKing, CastlingRight::WhiteQueen}));
   const auto moves = pseudo_legal_moves(pos);
 
   EXPECT_EQ(castling_move_count(moves), 1);
@@ -383,7 +405,9 @@ TEST(Movegen, OnlyKingSideCastlingWhenQueenRookIsMissing) {
 }
 
 TEST(Movegen, OnlyQueenSideCastlingWhenKingRookIsMissing) {
-  const Position pos = parse_fen("r3k3/8/8/8/8/8/8/4K3 b kq - 0 1");
+  const Position pos = with_castling_rights(
+      "r3k3/8/8/8/8/8/8/4K3 b - - 0 1",
+      CastlingRights::from({CastlingRight::BlackKing, CastlingRight::BlackQueen}));
   const auto moves = pseudo_legal_moves(pos);
 
   EXPECT_EQ(castling_move_count(moves), 1);

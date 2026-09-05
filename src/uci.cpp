@@ -576,29 +576,9 @@ calculate_allocated_time(std::chrono::milliseconds time_left,
 // Position helpers
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// The generator produces PSEUDO-legal moves: they respect how the piece moves
-// but may leave our own king in check. Filtering them the way the search does
-// (make, test the mover's king, unmake) yields the exact legal move list.
-// A shared `legal_moves()` will replace this local helper later.
-MoveList legal_moves(const Position& pos) {
-  Position working = pos;
-  MoveList legal;
-
-  for (const auto& mv : pseudo_legal_moves(working)) {
-    const Colour mover = working.colour_to_move;
-    working.make_move(mv);
-    if (!is_in_check(mover, working.board)) {
-      legal.push_back(mv);
-    }
-    working.unmake_move(mv);
-  }
-
-  return legal;
-}
-
-} // namespace
+// Both helpers below lean on `legal_moves()` from movegen: the generator
+// produces PSEUDO-legal moves, and that shared filter turns them into the
+// exact legal list by making each move, testing the mover's king and unmaking.
 
 // A UCI move string ("e2e4", "e7e8q") names only squares and a promotion
 // letter. Matching it against the legal move list does two jobs at once: it
