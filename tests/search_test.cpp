@@ -978,6 +978,71 @@ TEST(SearchMate, ReportsMoveCountUntilMate) {
 }
 
 // -----------------------------------------------------------------------------
+// Tactical Sanity
+// -----------------------------------------------------------------------------
+// Reductions and history are bets: that a quiet move ordering ranked last is as
+// bad as it looks, and that a move which worked elsewhere will work here. Both
+// bets are usually right and both fail in the same direction—by not looking at
+// the move that mattered. Nothing else in this file would notice: node counts
+// would improve, the mate tests would still pass, and the engine would quietly
+// start missing tactics.
+//
+// So: a handful of positions with one right answer, each cheap enough to search
+// under the sanitisers. They are deliberately of different shapes—a mate found
+// by a check, a mate whose key move is quiet, a fork that wins material without
+// mating—because a reduction bug shows up in some shapes and not others.
+// -----------------------------------------------------------------------------
+
+TEST(SearchTactics, FindsTheOnlyMoveInKnownPositions) {
+  struct Tactic {
+    std::string_view name;
+    std::string_view fen;
+    std::uint8_t depth;
+    std::string_view best;
+    bool is_mate;
+  };
+
+  const std::vector<Tactic> tactics = {
+      {"back-rank mate", "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1", 4, "a1a8", true},
+      {"Scholar's mate", "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1", 4,
+       "f3f7", true},
+      {"smothered mate: the rook and pawns are the cage", "6rk/6pp/8/6N1/8/8/8/6K1 w - - 0 1", 4,
+       "g5f7", true},
+      {"the pawn takes the last flight square away", "1k6/1P6/1K6/8/8/8/8/7R w - - 0 1", 4, "h1h8",
+       true},
+      // The key move is a quiet king move, which is exactly the kind of move a
+      // reduction is happiest to throw away.
+      {"mate in two behind a quiet king move", "7k/8/5K2/8/8/8/8/R7 w - - 0 1", 6, "f6g6", true},
+      // No mate anywhere: the reward is material, several plies away, and the
+      // move that wins it is quiet in the sense that matters here—it captures
+      // nothing.
+      {"knight fork wins the queen", "4k3/8/q7/3N4/8/8/4P3/7K w - - 0 1", 6, "d5c7", false},
+  };
+
+  for (const auto& tactic : tactics) {
+    SCOPED_TRACE(std::string(tactic.name) + " — " + std::string(tactic.fen));
+
+    Position pos = parse(tactic.fen);
+    search::NullReporter reporter;
+    search::Limits limits;
+    limits.depth = tactic.depth;
+
+    const auto result = search::search(pos, limits, reporter);
+
+    ASSERT_FALSE(result.pv.empty());
+    EXPECT_EQ(to_uci(result.pv[0]), std::string(tactic.best));
+
+    if (tactic.is_mate) {
+      EXPECT_GT(result.eval, CENTIPAWN_MATE_THRESHOLD) << "should be scored as a forced mate";
+    } else {
+      // A queen for a knight, with the knight getting out afterwards. The exact
+      // number belongs to the evaluation; that it is a large advantage does not.
+      EXPECT_GT(result.eval, 200);
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Search Limits
 // -----------------------------------------------------------------------------
 
