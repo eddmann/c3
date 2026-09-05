@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(C3_ENABLE_CLANG_TIDY "Run clang-tidy during builds" OFF)
+option(C3_BUILD_TESTS "Build the GoogleTest unit test suite" ON)
+option(C3_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
 # ASan/UBSan are incompatible with MSVC debug runtime (-MDd) on Windows.
 # Disable sanitizers by default on Windows to avoid the conflict.
@@ -40,11 +42,21 @@ endif()
 if(MSVC)
   set(RELEASE_COMPILE_FLAGS /O2 /GL)
   set(RELEASE_LINK_FLAGS /LTCG)
-  set(WARNING_FLAGS /W4 /WX-)
+  set(WARNING_FLAGS /W4)
+  # Warnings are only fatal when asked for: contributors run a wide range of
+  # compiler versions, so -Werror is opt-in locally and forced on in CI.
+  if(C3_WARNINGS_AS_ERRORS)
+    list(APPEND WARNING_FLAGS /WX)
+  else()
+    list(APPEND WARNING_FLAGS /WX-)
+  endif()
 else()
   set(RELEASE_COMPILE_FLAGS -O3 -flto)
   set(RELEASE_LINK_FLAGS -flto)
   set(WARNING_FLAGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion)
+  if(C3_WARNINGS_AS_ERRORS)
+    list(APPEND WARNING_FLAGS -Werror)
+  endif()
 endif()
 
 function(c3_apply_standard_settings target)
@@ -81,20 +93,34 @@ else()
   add_custom_target(generate_magic)
 endif()
 
-add_library(c3_core STATIC
-  src/about.cpp
-  src/eval.cpp
-  src/fen.cpp
-  src/position.cpp
-  src/movegen.cpp
-  src/engine.cpp
-  src/uci.cpp
-  src/search.cpp
+# Absolute paths so the library can also be created from tests/ (see below).
+set(C3_CORE_SOURCES
+  ${PROJECT_SOURCE_DIR}/src/about.cpp
+  ${PROJECT_SOURCE_DIR}/src/eval.cpp
+  ${PROJECT_SOURCE_DIR}/src/fen.cpp
+  ${PROJECT_SOURCE_DIR}/src/position.cpp
+  ${PROJECT_SOURCE_DIR}/src/movegen.cpp
+  ${PROJECT_SOURCE_DIR}/src/engine.cpp
+  ${PROJECT_SOURCE_DIR}/src/uci.cpp
+  ${PROJECT_SOURCE_DIR}/src/search.cpp
 )
-target_compile_definitions(c3_core PUBLIC C3_TESTING)
-add_dependencies(c3_core generate_magic)
-target_include_directories(c3_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
-c3_apply_standard_settings(c3_core)
+
+# The engine sources are compiled twice: once as `c3_core` for the shipped
+# binary and once as `c3_core_testing` (in tests/) with C3_TESTING defined.
+# Test-only helpers such as c3::uci::run_script_for_test live behind that
+# define, so building them separately keeps them out of the released engine
+# while the unit tests still get a library that exposes them.
+# Side effect: compile_commands.json then holds two entries per source file,
+# and an editor that picks the c3_core one greys out the C3_TESTING blocks as
+# inactive code. That is the shipped configuration, so it is the honest view.
+function(c3_add_core_library target)
+  add_library(${target} STATIC ${C3_CORE_SOURCES})
+  add_dependencies(${target} generate_magic)
+  target_include_directories(${target} PUBLIC ${PROJECT_SOURCE_DIR}/include)
+  c3_apply_standard_settings(${target})
+endfunction()
+
+c3_add_core_library(c3_core)
 
 add_executable(c3
   src/main.cpp
@@ -102,5 +128,7 @@ add_executable(c3
 target_link_libraries(c3 PRIVATE c3_core)
 c3_apply_standard_settings(c3)
 
-enable_testing()
-add_subdirectory(tests)
+if(C3_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

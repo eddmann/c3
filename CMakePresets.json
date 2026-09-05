@@ -19,11 +19,38 @@
     {
       "name": "release",
       "displayName": "Release (O3 + LTO)",
-      "description": "Optimized release build in build-release/",
+      "description": "Optimized release build in build-release/, engine only",
       "generator": "Ninja",
       "binaryDir": "build-release",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "C3_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "release-tests",
+      "displayName": "Release + tests",
+      "description": "Optimized build in build-release-tests/ that also builds the test suite",
+      "generator": "Ninja",
+      "binaryDir": "build-release-tests",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "C3_BUILD_TESTS": "ON",
+        "C3_ENABLE_ASAN": "OFF",
+        "C3_ENABLE_UBSAN": "OFF"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo (profiling)",
+      "description": "-O2 with debug info and no LTO in build-relwithdebinfo/, for profilers",
+      "generator": "Ninja",
+      "binaryDir": "build-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "C3_BUILD_TESTS": "OFF",
+        "C3_ENABLE_ASAN": "OFF",
+        "C3_ENABLE_UBSAN": "OFF"
       }
     },
     {
@@ -49,6 +76,15 @@
       "targets": ["c3"]
     },
     {
+      "name": "release-tests",
+      "configurePreset": "release-tests"
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo",
+      "targets": ["c3"]
+    },
+    {
       "name": "lint",
       "configurePreset": "lint"
     }
@@ -57,6 +93,11 @@
     {
       "name": "tests",
       "configurePreset": "debug",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "release-tests",
+      "configurePreset": "release-tests",
       "output": {"outputOnFailure": true}
     }
   ]
