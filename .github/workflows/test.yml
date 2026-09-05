@@ -25,14 +25,15 @@ jobs:
         run: |
           cmake --preset lint \
             -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DC3_WARNINGS_AS_ERRORS=ON
 
       - name: Lint (clang-tidy)
         run: cmake --build --preset lint
 
       - name: Check formatting
         run: |
-          find src include -name '*.cpp' -o -name '*.hpp' | xargs clang-format --dry-run --Werror
+          find src include tests -name '*.cpp' -o -name '*.hpp' | xargs clang-format --dry-run --Werror
 
   build-and-test:
     name: ${{ matrix.os }} / ${{ matrix.arch }}
@@ -47,6 +48,7 @@ jobs:
             arch: x64
             cc: clang
             cxx: clang++
+            werror: 'ON'
           - os: linux
             runner: ubuntu-latest
             arch: arm64
@@ -105,6 +107,7 @@ jobs:
           cmake --preset debug \
             -DCMAKE_C_COMPILER="${{ matrix.cc }}" \
             -DCMAKE_CXX_COMPILER="${{ matrix.cxx }}" \
+            -DC3_WARNINGS_AS_ERRORS="${{ matrix.werror || 'OFF' }}" \
             ${{ matrix.ninja_path && format('-DCMAKE_MAKE_PROGRAM="{0}"', matrix.ninja_path) || '' }}
 
       - name: Configure (Debug, cross-compile arm64)
@@ -116,6 +119,7 @@ jobs:
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DCMAKE_CROSSCOMPILING_EMULATOR="qemu-aarch64-static;-L;/usr/aarch64-linux-gnu" \
+            -DC3_WARNINGS_AS_ERRORS=ON \
             -DC3_ENABLE_ASAN=OFF \
             -DC3_ENABLE_UBSAN=OFF
 
@@ -124,3 +128,31 @@ jobs:
 
       - name: Test
         run: ctest --preset tests
+
+  release-tests:
+    name: Release tests / linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang
+
+      # The optimized build is what ships, so it gets exercised by the suite at
+      # least once: sanitizers off, -O3 on, no LTO surprises left untested.
+      - name: Configure (Release + tests)
+        run: |
+          cmake --preset release-tests \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DC3_WARNINGS_AS_ERRORS=ON
+
+      - name: Build (Release + tests)
+        run: cmake --build --preset release-tests
+
+      - name: Test
+        run: ctest --preset release-tests

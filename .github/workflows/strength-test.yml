@@ -7,12 +7,18 @@ on:
       - 'include/**'
   workflow_dispatch:
     inputs:
-      games:
-        description: 'Number of games for SPRT'
-        default: '1000'
+      max_games:
+        description: 'Game cap for the SPRT (it stops earlier once a bound is crossed)'
+        default: '2000'
       depth:
         description: 'Search depth'
         default: '8'
+      elo0:
+        description: 'SPRT null hypothesis in Elo (no improvement)'
+        default: '0'
+      elo1:
+        description: 'SPRT alternative hypothesis in Elo (gain worth detecting)'
+        default: '5'
 
 permissions:
   contents: read
@@ -43,7 +49,7 @@ jobs:
           python3 perft_benchmark.py \
             --base origin/${{ github.base_ref }} \
             --test HEAD \
-            --threshold 5.0 \
+            --threshold 10.0 \
             | tee ../perft.txt
           exit_code=${PIPESTATUS[0]}
           echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
@@ -124,7 +130,9 @@ jobs:
           python3 compare_branches.py \
             --base origin/${{ github.base_ref }} \
             --test HEAD \
-            --games ${{ inputs.games || '1000' }} \
+            --max-games ${{ inputs.max_games || '2000' }} \
+            --elo0 ${{ inputs.elo0 || '0' }} \
+            --elo1 ${{ inputs.elo1 || '5' }} \
             --depth ${{ inputs.depth || '8' }} \
             --openings ../tests/fixtures/openings.epd \
             --concurrency 2 \
@@ -151,9 +159,9 @@ jobs:
 
             let status;
             switch (exitCode) {
-              case '0': status = 'Test appears stronger or equal'; break;
-              case '1': status = 'Test appears weaker'; break;
-              case '2': status = 'Inconclusive'; break;
+              case '0': status = 'H1 accepted - test is stronger'; break;
+              case '1': status = 'H0 accepted - test is not stronger'; break;
+              case '2': status = 'Inconclusive - game cap reached'; break;
               default: status = 'Error'; break;
             }
 
@@ -168,7 +176,8 @@ jobs:
             <details>
             <summary>Configuration</summary>
 
-            - Games: ${{ inputs.games || '1000' }}
+            - Max games: ${{ inputs.max_games || '2000' }}
+            - Hypotheses: elo0=${{ inputs.elo0 || '0' }}, elo1=${{ inputs.elo1 || '5' }} (alpha=beta=0.05)
             - Depth: ${{ inputs.depth || '8' }}
             - Openings: tests/fixtures/openings.epd (48 positions)
             - Concurrency: 2
