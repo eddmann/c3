@@ -21,6 +21,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 
@@ -122,10 +123,14 @@ constexpr int FUTILITY_DEPTH = 2;
 // Score = (victim_value * 100) - attacker_value
 // Higher scores = better captures = searched first
 //
-// Example scores:
-//   PxQ = 900*100 - 100 = 89,900 (excellent)
-//   NxQ = 900*100 - 300 = 89,700 (great)
-//   QxP = 100*100 - 900 =  9,100 (questionable)
+// Multiplying the victim by 100 makes the victim dominate: every capture of a
+// queen sorts above every capture of a rook, whatever did the capturing. The
+// attacker's value then breaks ties within a victim class, cheapest first—if
+// two pieces can take the queen, try the one we mind losing least. So PxQ
+// beats NxQ beats QxQ, and all of them beat QxP.
+//
+// The values themselves live in PIECE_VALUES (eval.hpp); this ordering only
+// depends on their relative sizes, not on the exact numbers.
 //
 // Returns negative so that std::sort orders best captures first (ascending).
 // =============================================================================
@@ -178,7 +183,14 @@ void Stopper::at_elapsed(std::optional<std::chrono::milliseconds> elapsed) {
 }
 
 bool Stopper::should_stop(const Report& report) const {
+  // Once we have decided to stop we never change our mind: the rest of the
+  // tree is being abandoned, so nothing it produces may be trusted.
+  if (stopped_) {
+    return true;
+  }
+
   if (stop_signal_ && stop_signal_->load(std::memory_order_relaxed)) {
+    stopped_ = true;
     return true;
   }
 
@@ -186,15 +198,13 @@ bool Stopper::should_stop(const Report& report) const {
     return false;
   }
 
-  if (stop_signal_ && stop_signal_->load(std::memory_order_relaxed)) {
-    return true;
-  }
-
   if (elapsed_.has_value() && report.elapsed() > *elapsed_) {
+    stopped_ = true;
     return true;
   }
 
   if (nodes_.has_value() && report.nodes > *nodes_) {
+    stopped_ = true;
     return true;
   }
 
@@ -202,24 +212,139 @@ bool Stopper::should_stop(const Report& report) const {
 }
 
 // ---------------------------------------------------------------------------
+// PACKING A MOVE INTO 16 BITS
+// ---------------------------------------------------------------------------
+// A move needs a from square (0-63, 6 bits), a to square (6 bits) and, for a
+// pawn reaching the last rank, which piece it becomes (4 choices, 3 bits with
+// zero meaning "no promotion"). That is 15 bits; the 16th is
+// TT_MOVE_PRESENT_BIT, so that an all-zero entry unambiguously means "no move".
+//
+// Everything else about a Move—the moving piece, what it captured, whether it
+// was en passant—is deliberately dropped. Those fields are all recoverable
+// from the position itself, and recovering them is how we validate the move.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr unsigned TT_MOVE_TO_SHIFT = 6;
+constexpr unsigned TT_MOVE_PROMOTION_SHIFT = 12;
+constexpr std::uint16_t TT_MOVE_SQUARE_MASK = 0b11'1111;
+constexpr std::uint16_t TT_MOVE_PROMOTION_MASK = 0b111;
+
+// Promotion pieces are encoded as 1..4 (knight, bishop, rook, queen) so that
+// 0 can mean "not a promotion". Colour is not stored—the position knows it.
+std::uint16_t encode_promotion(std::optional<Piece> promotion) {
+  if (!promotion.has_value()) {
+    return 0;
+  }
+
+  switch (*promotion) {
+  case Piece::WN:
+  case Piece::BN:
+    return 1;
+  case Piece::WB:
+  case Piece::BB:
+    return 2;
+  case Piece::WR:
+  case Piece::BR:
+    return 3;
+  case Piece::WQ:
+  case Piece::BQ:
+    return 4;
+  default:
+    // A pawn can only become a knight, bishop, rook or queen. Anything else is
+    // a malformed Move, and returning "no promotion" would quietly make it
+    // match the wrong move in decode_tt_move()—so trip in Debug builds.
+    assert(false && "promotion_piece must be a knight, bishop, rook or queen");
+    return 0;
+  }
+}
+
+} // namespace
+
+std::uint16_t encode_tt_move(const Move& mv) {
+  return static_cast<std::uint16_t>(
+      TT_MOVE_PRESENT_BIT | mv.from.index() | (mv.to.index() << TT_MOVE_TO_SHIFT) |
+      (encode_promotion(mv.promotion_piece) << TT_MOVE_PROMOTION_SHIFT));
+}
+
+std::optional<Move> decode_tt_move(std::uint16_t packed, const MoveList& moves) {
+  if ((packed & TT_MOVE_PRESENT_BIT) == 0) {
+    return std::nullopt;
+  }
+
+  const auto from = packed & TT_MOVE_SQUARE_MASK;
+  const auto to = (packed >> TT_MOVE_TO_SHIFT) & TT_MOVE_SQUARE_MASK;
+  const auto promotion = (packed >> TT_MOVE_PROMOTION_SHIFT) & TT_MOVE_PROMOTION_MASK;
+
+  // Scan the position's own move list. A from/to/promotion triple identifies
+  // at most one move in a given position, so the first match is the move—and
+  // the fact that it is in this list is proof it is playable here.
+  for (const auto& mv : moves) {
+    if (mv.from.index() == from && mv.to.index() == to &&
+        encode_promotion(mv.promotion_piece) == promotion) {
+      return mv;
+    }
+  }
+
+  return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
 // Transposition table
 // ---------------------------------------------------------------------------
 
 TranspositionTable::TranspositionTable() {
-  const std::size_t size_bytes = size_mb() * 1024 * 1024;
-  std::size_t capacity = size_bytes / sizeof(TTEntry);
+  allocate(size_mb());
+}
 
-  // nearest lower power of two
-  std::size_t pow2 = 1;
-  while ((pow2 << 1) <= capacity) {
-    pow2 <<= 1;
+TranspositionTable::TranspositionTable(std::size_t size_mb) {
+  allocate(size_mb);
+}
+
+void TranspositionTable::allocate(std::size_t size_mb) {
+  if (size_mb < MIN_SIZE_MB || size_mb > MAX_SIZE_MB) {
+    throw std::invalid_argument("invalid transposition table size");
   }
-  if (pow2 == 0) {
-    pow2 = 1;
+
+  const std::size_t size_bytes = size_mb * 1024 * 1024;
+  const std::size_t requested = size_bytes / sizeof(TTEntry);
+
+  // Round down to a power of two so that indexing is `key & (capacity - 1)`
+  // instead of a modulo—an AND is a single instruction, and we do it on every
+  // probe and every store.
+  std::size_t pow2 = 1;
+  while ((pow2 << 1) <= requested) {
+    pow2 <<= 1;
   }
 
   capacity_ = pow2;
+  usage_ = 0;
   entries_.assign(capacity_, TTEntry{});
+}
+
+void TranspositionTable::clear() {
+  std::ranges::fill(entries_, TTEntry{});
+  usage_ = 0;
+  // Nothing is left to be older than anything else, so the generation counter
+  // may as well start again from zero.
+  generation_ = 0;
+}
+
+void TranspositionTable::resize(std::size_t size_mb) {
+  allocate(size_mb);
+  generation_ = 0;
+}
+
+void TranspositionTable::new_search() {
+  generation_ = static_cast<std::uint8_t>((generation_ + 1) % TT_GENERATION_COUNT);
+}
+
+std::uint32_t TranspositionTable::hashfull() const {
+  if (capacity_ == 0) {
+    return 0;
+  }
+  return static_cast<std::uint32_t>((usage_ * 1000) / capacity_);
 }
 
 const TTEntry* TranspositionTable::probe(std::uint64_t key) const {
@@ -230,21 +355,66 @@ const TTEntry* TranspositionTable::probe(std::uint64_t key) const {
   return nullptr;
 }
 
-void TranspositionTable::store(std::uint64_t key, std::uint8_t depth, int eval, Bound bound,
-                               std::optional<Move> move) {
-  const auto index = key & (capacity_ - 1);
-  auto& entry = entries_[index];
+// ---------------------------------------------------------------------------
+// REPLACEMENT POLICY
+// ---------------------------------------------------------------------------
+// One slot, and every position whose key lands on that index wants it. We keep
+// whichever is more likely to earn its place again:
+//
+//   1. The slot is empty       — nothing to lose, always take it.
+//   2. Stored entry is older   — written during an earlier search, so probably
+//                                about a branch of the game tree we have
+//                                already left behind. Its depth is not worth
+//                                defending against a result from right now.
+//   3. New bound is Exact      — an exact score answers ANY window, which no
+//                                bound can do. It is the most useful thing an
+//                                entry can hold, so it always goes in.
+//   4. Nearly as deep          — otherwise the new result must satisfy
+//                                depth + TT_REPLACEMENT_DEPTH_SLACK >= stored
+//                                depth. The slack is deliberate: a result from
+//                                the iteration we are running describes the
+//                                part of the tree we are actually walking,
+//                                while the deep entry may be about a line we
+//                                have already refuted. With zero slack the
+//                                table ossifies; with unlimited slack every
+//                                shallow probe throws away deep work.
+//
+// Note what rule 4 rules out even for the SAME position: a depth-2 upper bound
+// (or the depth-limited lower bound a null-move cutoff writes) must not erase
+// a depth-10 exact score we paid dearly for earlier in this very search.
+// ---------------------------------------------------------------------------
 
-  if (depth >= entry.depth) {
-    if (entry.key == 0) {
-      ++usage_;
-    }
-    entry.key = key;
-    entry.depth = depth;
-    entry.eval = eval;
-    entry.bound = bound;
-    entry.move = move;
+void TranspositionTable::store(std::uint64_t key, std::uint8_t depth, int eval, Bound bound,
+                               std::uint16_t packed_move) {
+  auto& entry = entries_[key & (capacity_ - 1)];
+
+  // Zobrist keys are effectively never zero, so a zero key marks a slot that
+  // has never been written.
+  const bool is_empty = entry.key == 0;
+  const bool same_position = entry.key == key;
+  const bool is_stale = entry.generation() != generation_;
+  const bool is_deep_enough = depth + TT_REPLACEMENT_DEPTH_SLACK >= static_cast<int>(entry.depth);
+
+  if (!is_empty && !is_stale && bound != Bound::Exact && !is_deep_enough) {
+    return;
   }
+
+  if (is_empty) {
+    ++usage_;
+  }
+
+  // A store with no move—the null-move cutoff in alphabeta() is the only case
+  // that has none—must not erase a real best move we already know for this
+  // position. The bound is new information; "no move" is an absence of it.
+  const std::uint16_t move_to_keep =
+      (packed_move == TT_NO_MOVE && same_position) ? entry.packed_move : packed_move;
+
+  entry.key = key;
+  entry.depth = depth;
+  entry.score = static_cast<std::int16_t>(eval);
+  entry.packed_move = move_to_keep;
+  entry.bound_and_generation =
+      static_cast<std::uint8_t>(static_cast<std::uint8_t>(bound) | (generation_ << 2U));
 }
 
 void TranspositionTable::set_size_mb(std::size_t size_mb) {
@@ -319,12 +489,18 @@ int eval_out(int eval, std::uint8_t ply) {
 //   5. Quiet moves (lowest priority)
 // ---------------------------------------------------------------------------
 
-void detail::order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply) {
+void detail::order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
+                         const std::optional<Move>& hash_move) {
   const auto killer1 = killers.probe(ply, 0);
   const auto killer2 = killers.probe(ply, 1);
 
   std::ranges::sort(moves, [&](const Move& a, const Move& b) {
     const auto score = [&](const Move& mv) {
+      // The hash move is the best move a previous (usually deeper) search
+      // found here, so nothing outranks it—not even a queen capture.
+      if (hash_move.has_value() && mv == *hash_move) {
+        return std::numeric_limits<int>::min();
+      }
       if (mv.captured_piece.has_value()) {
         return capture_priority_score(mv);
       }
@@ -455,16 +631,30 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     depth = 1;
   }
 
-  std::optional<Move> tt_move = std::nullopt;
+  // PV NODES vs NON-PV NODES
+  // A node searched with a full window (beta > alpha + 1) is a "PV node": it
+  // is on the principal variation, and its job is not just to produce a score
+  // but to produce the line of play behind that score. A node searched with a
+  // zero window (beta == alpha + 1) is a non-PV node; it only ever answers
+  // "better or worse than alpha?", so it has no line to report.
+  const bool is_pv_node = beta - alpha > 1;
+
+  std::uint16_t hash_move_packed = TT_NO_MOVE;
 
   // TRANSPOSITION TABLE PROBE
   // Check if we've seen this position before at sufficient depth.
   // If so, we may be able to return immediately or narrow alpha/beta.
   if (const auto* const entry = tt.probe(pos.key)) {
-    if (entry->depth >= depth) {
-      const int tt_eval = eval_out(entry->eval, report.ply);
+    // Cutting off here returns a score without filling in `pv`. At a non-PV
+    // node nobody wants the line, so that is a pure win. At a PV node it would
+    // hand the caller a score with a truncated—often empty—principal
+    // variation, which is what the GUI and the next iteration's move ordering
+    // rely on. So PV nodes pay for the search and keep their line; they still
+    // get the hash move below, which is where most of the speed came from.
+    if (!is_pv_node && entry->depth >= depth) {
+      const int tt_eval = eval_out(entry->score, report.ply);
 
-      switch (entry->bound) {
+      switch (entry->bound()) {
       case Bound::Exact:
         return tt_eval; // Exact score: we're done
       case Bound::Lower:
@@ -480,8 +670,9 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       }
     }
 
-    // Even if depth is insufficient, use the TT move for ordering
-    tt_move = entry->move;
+    // Even if depth is insufficient (or we refused the cutoff), the stored
+    // move is worth having: it is the best move a previous search found here.
+    hash_move_packed = entry->packed_move;
   }
 
   report.nodes += 1;
@@ -514,54 +705,53 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     pos.unmake_null_move();
 
     if (null_eval >= beta) {
-      // Passing was good enough—this position is probably winning
-      tt.store(pos.key, depth, eval_in(null_eval, report.ply), Bound::Lower, std::nullopt);
+      // Passing was good enough—this position is probably winning.
+      //
+      // What we store is clamped to beta, the value this node actually
+      // returns. That matters most for mate scores: passing is not a legal
+      // chess move, so a "mate" found behind a null move is a mate against an
+      // opponent who was never allowed to reply. It does not exist on the real
+      // board. Because this table outlives the search, storing it would leave
+      // a fabricated forced win behind to mislead every later search that
+      // reaches this position, so we refuse to write a mate score from here at
+      // all. (Clamping alone is not quite enough: at the root beta can itself
+      // be a mate-range bound.)
+      //
+      // We also have no move to offer—we did not make one—so we store
+      // TT_NO_MOVE and rely on the table to keep any move it already holds.
+      const int null_bound = std::min(null_eval, beta);
+      if (!stopper.has_stopped() && null_bound < CENTIPAWN_MATE_THRESHOLD) {
+        tt.store(pos.key, depth, eval_in(null_bound, report.ply), Bound::Lower, TT_NO_MOVE);
+      }
       return beta;
     }
-  }
-
-  bool has_searched_one = false;
-  Bound tt_bound = Bound::Upper;
-
-  if (tt_move.has_value()) {
-    pos.make_move(*tt_move);
-    report.ply += 1;
-
-    MoveList child_pv;
-    const int eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv,
-                                tt, killers, report, stopper);
-
-    report.ply -= 1;
-    pos.unmake_move(*tt_move);
-
-    if (eval >= beta) {
-      tt.store(pos.key, depth, eval_in(eval, report.ply), Bound::Lower, tt_move);
-      return beta;
-    }
-
-    if (eval > alpha) {
-      alpha = eval;
-      tt_bound = Bound::Exact;
-
-      pv.clear();
-      pv.push_back(*tt_move);
-      pv.insert(pv.end(), child_pv.begin(), child_pv.end());
-    }
-
-    has_searched_one = true;
   }
 
   // Static evaluation for futility pruning (only compute at shallow depths when not in check)
   const int static_eval = (depth <= FUTILITY_DEPTH && !in_check) ? eval(pos) : 0;
 
   MoveList moves = pseudo_legal_moves(pos);
-  detail::order_moves(moves, killers, report.ply);
 
+  // Turn the 16 packed bits back into a real Move by finding it among the
+  // moves this position actually has. This is the only place a stored move is
+  // allowed to become playable, so a corrupted or colliding entry can never
+  // reach make_move(). `hash_move` is const on purpose: it is the move a
+  // PREVIOUS search recommended, and confusing it with the best move THIS
+  // search is finding would make us search the same move twice.
+  const std::optional<Move> hash_move = decode_tt_move(hash_move_packed, moves);
+
+  detail::order_moves(moves, killers, report.ply, hash_move);
+
+  bool has_searched_one = false;
+  Bound tt_bound = Bound::Upper;
+
+  // The best move THIS search finds, kept apart from `hash_move` above.
+  std::optional<Move> best_move = std::nullopt;
+
+  // The hash move is simply the first entry of `moves` now, so it goes through
+  // the same loop as everything else: same legality check, same PVS treatment,
+  // and—crucially—exactly once.
   for (const auto& mv : moves) {
-    if (tt_move.has_value() && mv == *tt_move) {
-      continue;
-    }
-
     pos.make_move(mv);
 
     if (is_in_check(colour_to_move, pos.board)) {
@@ -620,14 +810,16 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       }
 
       // Store in TT as a lower bound (actual score might be even higher)
-      tt.store(pos.key, depth, eval_in(eval, report.ply), Bound::Lower, mv);
+      if (!stopper.has_stopped()) {
+        tt.store(pos.key, depth, eval_in(eval, report.ply), Bound::Lower, encode_tt_move(mv));
+      }
       return beta;
     }
 
     if (eval > alpha) {
       alpha = eval;
       tt_bound = Bound::Exact;
-      tt_move = mv;
+      best_move = mv;
 
       pv.clear();
       pv.push_back(mv);
@@ -644,8 +836,15 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     return in_check ? -CENTIPAWN_MATE + report.ply : CENTIPAWN_DRAW;
   }
 
-  // Store the result in the transposition table for future use
-  tt.store(pos.key, depth, eval_in(alpha, report.ply), tt_bound, tt_move);
+  // Store the result in the transposition table for future use.
+  // If the stopper fired somewhere below us, `alpha` was assembled from
+  // children that returned a placeholder 0 instead of a real score. Writing
+  // that into the table would poison the position with a fabricated "equal"
+  // evaluation that outlives the aborted search, so we say nothing.
+  if (!stopper.has_stopped()) {
+    tt.store(pos.key, depth, eval_in(alpha, report.ply), tt_bound,
+             best_move.has_value() ? encode_tt_move(*best_move) : TT_NO_MOVE);
+  }
 
   return alpha;
 }
@@ -670,14 +869,18 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 // are in the final iteration (exponential growth of the tree).
 // ---------------------------------------------------------------------------
 
-SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
+SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal) {
   Stopper stopper(std::move(stop_signal));
   stopper.at_depth(limits.depth);
   stopper.at_nodes(limits.nodes);
   stopper.at_elapsed(limits.time);
 
-  TranspositionTable tt;
+  // Mark everything already in the table as belonging to a previous search.
+  // Those entries stay readable—they are still true—but they become the first
+  // candidates for replacement as this search fills the table.
+  tt.new_search();
+
   KillerMoves killers;
   Report report;
 
@@ -704,6 +907,11 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
     bool using_full_window = !do_aspiration;
 
     while (true) {
+      // Each attempt rebuilds the line from scratch. Without this, a failed
+      // narrow window would leave its half-finished PV behind and the retry
+      // could report a mixture of two different searches.
+      pv.clear();
+
       const int eval = detail::alphabeta(pos, depth, alpha, beta, pv, tt, killers, report, stopper);
 
       // Accept result if: within bounds, stopped, or already using full window
@@ -752,10 +960,18 @@ SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
   result.eval = last_eval;
   result.pv = best_pv;
   result.nodes = report.nodes;
-  result.hashfull = static_cast<std::uint32_t>(
-      result.nodes == 0 || tt.capacity() == 0 ? 0 : (tt.usage() * 1000) / tt.capacity());
+  result.hashfull = tt.hashfull();
 
   return result;
+}
+
+SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
+                    std::shared_ptr<std::atomic_bool> stop_signal) {
+  // A table built here and thrown away when the function returns. Convenient,
+  // but it means this search starts from zero knowledge and pays the whole
+  // allocation cost up front—see the header for why an engine should not.
+  TranspositionTable tt;
+  return search(pos, tt, limits, reporter, std::move(stop_signal));
 }
 
 SearchResult search(Position& pos, std::uint8_t depth) {
