@@ -736,16 +736,21 @@ TEST(SearchTime, SoftLimitNeverExceedsTheHardOne) {
 TEST(SearchTime, RefusesAnIterationThatCannotFinish) {
   using namespace std::chrono_literals;
 
-  // 100ms gone, the last iteration cost 60ms, so the next one is predicted at
-  // 120ms: 220ms in total. It fits under 300ms but not under 200ms.
+  // 100ms gone and the last iteration cost 60ms, so the next one is predicted
+  // at 3 x 60 = 180ms: 280ms in total. That fits under 300ms but not 200ms.
   EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 60ms, 300ms));
   EXPECT_FALSE(search::detail::can_finish_next_iteration(100ms, 60ms, 200ms));
 
-  // Exactly on the limit still counts as affordable.
-  EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 50ms, 200ms));
+  // Landing exactly on the limit still counts as affordable.
+  EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 100ms, 400ms));
 
-  // No hard limit means nothing to be unable to afford.
+  // No hard limit means there is nothing to be unable to afford.
   EXPECT_TRUE(search::detail::can_finish_next_iteration(100ms, 10000ms, std::nullopt));
+
+  // The first iteration has no predecessor to measure, so it is never refused.
+  EXPECT_TRUE(search::detail::can_finish_next_iteration(std::chrono::steady_clock::duration::zero(),
+                                                        std::chrono::steady_clock::duration::zero(),
+                                                        1ms));
 }
 
 TEST(SearchTime, SoftLimitStopsBetweenIterations) {

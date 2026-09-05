@@ -421,14 +421,22 @@ SearchResult search(Position& pos, std::uint8_t depth);
 
 // How much bigger the next iteration is assumed to be than the one just
 // finished. Each extra ply multiplies the tree by the effective branching
-// factor, which good move ordering keeps near two for this engine—so if we
-// cannot afford twice the last iteration, we cannot afford the next one.
+// factor, so a fixed multiple of the last iteration is the natural estimate.
 //
-// The factor is deliberately conservative. Guessing too high wastes the tail
-// of the budget by refusing an iteration that would have fitted; guessing too
-// low starts an iteration the hard limit then kills, which is the outcome the
-// soft limit exists to avoid.
-inline constexpr int ITERATION_GROWTH_FACTOR = 2;
+// Three, from measurement rather than theory. Timing consecutive iterations
+// in a Release build gives ratios that scatter widely—0.75x to 8.4x on
+// Kiwipete—because an aspiration window that fails has to re-search the root
+// and can cost several times a clean iteration. Three is near the middle of
+// that spread.
+//
+// The estimate is only ever that, and it is wrong in both directions: it will
+// sometimes refuse an iteration that would have fitted, and sometimes start
+// one the hard limit then kills. Erring high is the cheaper mistake. An
+// abandoned iteration produces nothing at all—the latching Stopper refuses
+// its transposition-table stores precisely because its scores are untrue—so
+// it costs a ply AND the time, while refusing one only costs the ply, and the
+// time goes back to the clock for the next move.
+inline constexpr int ITERATION_GROWTH_FACTOR = 3;
 
 // Exposed for tests
 namespace detail {
