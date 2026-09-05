@@ -838,9 +838,9 @@ private:
 
   MoveList& moves_;
   std::size_t scored_;
-  std::optional<Move> killer1_{};
-  std::optional<Move> killer2_{};
-  std::optional<Move> counter_{};
+  std::optional<Move> killer1_;
+  std::optional<Move> killer2_;
+  std::optional<Move> counter_;
   // Deliberately left uninitialised: entries [0, scored_) are written by the
   // constructor before anything reads them, and zeroing a kilobyte at every
   // node would cost more than the ordering it serves.
@@ -861,6 +861,13 @@ void detail::order_moves(MoveList& moves, const SearchContext& ctx, std::uint8_t
   }
 }
 
+void detail::order_quiescence_moves(MoveList& moves) {
+  OrderedMoves ordering(moves);
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    ordering.select(i);
+  }
+}
+
 std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, bool is_pv_node) {
   const auto depth_index = std::min<std::size_t>(depth, LMR_TABLE_DEPTHS - 1);
   const auto move_index = std::min<std::size_t>(move_number, LMR_TABLE_MOVES - 1);
@@ -874,13 +881,6 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
   }
 
   return reduction;
-}
-
-void detail::order_quiescence_moves(MoveList& moves) {
-  OrderedMoves ordering(moves);
-  for (std::size_t i = 0; i < moves.size(); ++i) {
-    ordering.select(i);
-  }
 }
 
 // ---------------------------------------------------------------------------
