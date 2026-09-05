@@ -900,6 +900,143 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 }
 
 // ---------------------------------------------------------------------------
+// STATIC EXCHANGE EVALUATION
+// ---------------------------------------------------------------------------
+// The swap list. Capturing on a square starts an argument: I take, you take
+// back with your cheapest piece, I take back with mine, and so on until one
+// side runs out of attackers or decides it would rather stop. see() plays that
+// argument out on a private copy of the board and reports what the side that
+// started it ends up with.
+//
+// TWO PASSES. Forward, we record what each capture wins if it happens:
+// gain[d] = value of the piece standing on the square - gain[d - 1]. Backward,
+// we let each side refuse: nobody is obliged to recapture, so
+// gain[d - 1] = -max(-gain[d - 1], gain[d]) turns the list of "if everyone
+// captures" numbers into "what actually happens when both sides play sensibly".
+// The forward pass also stops early once neither side can profit from
+// continuing, which is the same decision made one step sooner.
+//
+// CHEAPEST ATTACKER FIRST is not a heuristic here, it is the rule: recapturing
+// with the queen when a pawn could do it hands the opponent a better trade, so
+// the least valuable attacker is always the right one to use.
+//
+// X-RAYS COME FREE. Pieces are physically removed from the board copy as they
+// capture, so a queen sitting behind a rook on the same file simply appears in
+// the next get_attackers() call. That is why this works on a Board rather than
+// on a precomputed set of attackers, and it is what makes a battery score the
+// way a human would read it.
+//
+// See the header for what SEE deliberately does not know—pins, most of all.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The king is worth more than everything else on the board put together, so
+// that "the king is the cheapest attacker left" can never look like a bargain.
+// The other values are the plain middlegame ones the ordering already uses.
+constexpr int SEE_KING_VALUE = 10'000;
+
+int see_value(Piece piece) {
+  return is_king(piece) ? SEE_KING_VALUE : PIECE_VALUES[static_cast<std::size_t>(piece)];
+}
+
+// One exchange per piece that can reach the square, and there are 32 pieces.
+constexpr std::size_t SEE_MAX_SWAPS = 32;
+
+// pieces_for() lists a colour's pieces in ascending value—pawn, knight, bishop,
+// rook, queen, king—so the first one that appears among the attackers is the
+// cheapest.
+std::optional<Piece> least_valuable_attacker(Bitboard attackers, Colour side, const Board& board) {
+  for (const auto piece : pieces_for(side)) {
+    if ((attackers & board.pieces(piece)) != 0) {
+      return piece;
+    }
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
+int detail::see(const Position& pos, const Move& mv) {
+  // Nothing changes hands, so there is no exchange to evaluate.
+  if (is_quiet(mv)) {
+    return 0;
+  }
+
+  const Square target = mv.to;
+  Board board = pos.board;
+
+  std::array<int, SEE_MAX_SWAPS> gain{};
+
+  // What the move itself wins: whatever it captured, plus—if it promotes—the
+  // difference between the piece the pawn becomes and the pawn it was.
+  const int promotion_gain =
+      mv.promotion_piece.has_value() ? see_value(*mv.promotion_piece) - see_value(mv.piece) : 0;
+  gain[0] = (mv.captured_piece.has_value() ? see_value(*mv.captured_piece) : 0) + promotion_gain;
+
+  // Play the move on the copy. capture_square() is the target for an ordinary
+  // capture and the square behind it for en passant, which is exactly the
+  // distinction that decides which piece leaves the board.
+  if (const auto captured_square = mv.capture_square()) {
+    board.remove_piece(*captured_square);
+  }
+  board.remove_piece(mv.from);
+  Piece occupier = mv.promotion_piece.value_or(mv.piece);
+  board.put_piece(occupier, target);
+
+  Colour side = !colour(mv.piece);
+  std::size_t depth = 0;
+
+  while (true) {
+    const Bitboard attackers = get_attackers(target, side, board);
+    const auto attacker = least_valuable_attacker(attackers, side, board);
+    if (!attacker.has_value()) {
+      break;
+    }
+
+    // A king may only capture on a square the other side no longer defends, so
+    // if anything still defends it the exchange stops here rather than ending
+    // in an illegal move. (Read from the board as it stands, which misses the
+    // rare defender that only appears once the king leaves its own square.)
+    if (is_king(*attacker) && get_attackers(target, !side, board) != 0) {
+      break;
+    }
+
+    if (depth + 1 >= SEE_MAX_SWAPS) {
+      break;
+    }
+    ++depth;
+
+    // What this capture wins, assuming it happens: the piece standing on the
+    // square, less whatever the previous capture had already banked.
+    gain[depth] = see_value(occupier) - gain[depth - 1];
+
+    // Neither side can profit from carrying on—the one to move here would
+    // rather stop, and so would the one before it. Everything past this point
+    // would be refused by the backward pass anyway.
+    if (std::max(-gain[depth - 1], gain[depth]) < 0) {
+      break;
+    }
+
+    const Square from = Square::first_occupied(attackers & board.pieces(*attacker));
+    board.remove_piece(target);
+    board.remove_piece(from);
+    board.put_piece(*attacker, target);
+    occupier = *attacker;
+    side = !side;
+  }
+
+  // Backward pass: at every step the side to move may decline the recapture, so
+  // it takes the better of "stop here" and "carry on".
+  while (depth > 0) {
+    gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
+    --depth;
+  }
+
+  return gain[0];
+}
+
+// ---------------------------------------------------------------------------
 // QUIESCENCE SEARCH
 // ---------------------------------------------------------------------------
 // Problem: If we evaluate a position at the search horizon, we might miss

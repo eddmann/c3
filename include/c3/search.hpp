@@ -767,6 +767,36 @@ void order_quiescence_moves(MoveList& moves);
 [[nodiscard]] std::uint8_t lmr_reduction(std::uint8_t depth, std::size_t move_number,
                                          bool is_pv_node);
 
+// STATIC EXCHANGE EVALUATION
+// "If I capture on this square and both sides then keep capturing there with
+// their cheapest piece, what do I end up with?" The answer is a material
+// number, in centipawns, computed without searching a single node: build the
+// swap list of alternating captures, then walk it backwards asking at each step
+// whether the side to move would rather stop than continue. PxQ comes out
+// positive, QxP defended by a pawn comes out negative, and a rook that trades
+// itself for a rook comes out at zero.
+//
+// WHAT IT IS FOR. Quiescence generates every capture, and most of them are
+// simply bad. MVV-LVA can only guess—it ranks by what is being taken, not by
+// what happens next—so it happily puts QxP at the front of a list where the
+// pawn is defended. SEE knows, so quiescence can refuse the capture outright
+// instead of searching a subtree to rediscover that it loses a queen.
+//
+// WHAT IT DOES NOT KNOW, AND WHY THAT IS ACCEPTED
+//   - PINS AND LEGALITY. A defender that is pinned against its own king cannot
+//     actually recapture, and SEE counts it anyway; the mirror case—a defender
+//     that would be giving away its king—is only handled for the king itself,
+//     which may not capture into a square the other side still defends.
+//   - PROMOTIONS DURING THE SWAP. The promotion of the move being scored is
+//     counted; a defending pawn that would itself promote while recapturing is
+//     scored as a pawn.
+//   - EVERYTHING THAT IS NOT MATERIAL. A capture that loses a rook to open a
+//     mating net scores badly, and rightly, as far as material goes.
+// X-rays ARE handled: pieces are removed from a private copy of the board as
+// they capture, so a queen behind a rook on the same file joins the exchange by
+// itself, which is the case a naive "count the attackers" version gets wrong.
+[[nodiscard]] int see(const Position& pos, const Move& mv);
+
 // The capture-only search alphabeta drops into at its leaves. Exposed so that
 // what it does and refuses to do—stand pat, resolve a check, prune a losing
 // capture—can be tested for itself, without a whole search wrapped round it.

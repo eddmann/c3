@@ -498,6 +498,95 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   EXPECT_LE(report.max_ply, search::MAX_DEPTH);
 }
 
+// Static exchange evaluation ---------------------------------------------------
+
+namespace {
+
+// The legal move from `from` to `to`, so a test can name a capture the way a
+// player would and still hand see() a fully-formed Move.
+Move capture(const Position& pos, std::string_view from, std::string_view to,
+             std::optional<Piece> promotion = std::nullopt) {
+  const auto from_sq = Square::parse(from);
+  const auto to_sq = Square::parse(to);
+  EXPECT_TRUE(from_sq.has_value());
+  EXPECT_TRUE(to_sq.has_value());
+
+  for (const auto& mv : legal_moves(pos)) {
+    if (mv.from == *from_sq && mv.to == *to_sq && mv.promotion_piece == promotion) {
+      return mv;
+    }
+  }
+
+  ADD_FAILURE() << "no legal move " << from << to;
+  return {};
+}
+
+int see_of(std::string_view fen, std::string_view from, std::string_view to) {
+  const Position pos = parse(fen);
+  return search::detail::see(pos, capture(pos, from, to));
+}
+
+constexpr int PAWN = PIECE_VALUES[static_cast<std::size_t>(Piece::WP)];
+constexpr int ROOK = PIECE_VALUES[static_cast<std::size_t>(Piece::WR)];
+constexpr int QUEEN = PIECE_VALUES[static_cast<std::size_t>(Piece::WQ)];
+
+} // namespace
+
+TEST(SearchSee, WinsTheWholePieceWhenNothingDefendsIt) {
+  // PxQ, the capture MVV-LVA and SEE agree about: an undefended queen taken by
+  // a pawn is a queen, and nothing comes back.
+  EXPECT_EQ(see_of("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1", "e4", "d5"), QUEEN);
+}
+
+TEST(SearchSee, ScoresACaptureIntoADefenceAsTheLoss) {
+  // QxP where a pawn defends: MVV-LVA still ranks it above every quiet move,
+  // because it only looks at what is being taken. SEE plays the reply and sees
+  // a queen going for a pawn.
+  const int score = see_of("4k3/8/2p5/3p4/8/8/8/3QK3 w - - 0 1", "d1", "d5");
+
+  EXPECT_LT(score, 0);
+  EXPECT_EQ(score, PAWN - QUEEN);
+}
+
+TEST(SearchSee, ScoresAnEvenTradeAtZero) {
+  // Rook takes rook, rook takes back. Neither side gained anything, and the
+  // capture is neither a blunder to be pruned nor a win to be searched first.
+  EXPECT_EQ(see_of("3rr1k1/8/8/8/8/8/8/3R2K1 w - - 0 1", "d1", "d8"), 0);
+}
+
+TEST(SearchSee, SeesTheQueenBehindTheRook) {
+  // A battery: white's queen on d1 sits behind its rook on d2, and only joins
+  // the exchange once the rook has left the file. Counting attackers up front
+  // misses it and calls the capture an even trade; removing pieces from the
+  // board as they capture makes the queen appear by itself.
+  const int with_battery = see_of("3rr1k1/8/8/8/8/8/3R4/3Q2K1 w - - 0 1", "d2", "d8");
+  const int without_battery = see_of("3rr1k1/8/8/8/8/8/3R4/6K1 w - - 0 1", "d2", "d8");
+
+  EXPECT_EQ(without_battery, 0);
+  EXPECT_GT(with_battery, without_battery);
+  EXPECT_EQ(with_battery, ROOK);
+}
+
+TEST(SearchSee, RefusesToLetTheKingCaptureIntoADefendedSquare) {
+  // Black's rook on d8 is defended only by its king. Whether the king may
+  // actually recapture depends on whether white still attacks d8 afterwards,
+  // and that is the whole difference between these two positions: doubled
+  // rooks, so the second one covers d8, against a single rook that leaves.
+  const int king_may_not_recapture = see_of("3r4/2k5/8/8/8/8/3R4/3R2K1 w - - 0 1", "d2", "d8");
+  const int king_may_recapture = see_of("3r4/2k5/8/8/8/8/3R4/6K1 w - - 0 1", "d2", "d8");
+
+  EXPECT_EQ(king_may_recapture, 0);
+  EXPECT_GT(king_may_not_recapture, king_may_recapture);
+  EXPECT_EQ(king_may_not_recapture, ROOK)
+      << "a rook the king is not allowed to take back is simply won";
+}
+
+TEST(SearchSee, IgnoresQuietMoves) {
+  // Nothing changes hands, so there is no exchange to price.
+  const Position pos = parse("4k3/8/8/8/8/8/8/4K2R w K - 0 1");
+  EXPECT_EQ(search::detail::see(pos, capture(pos, "h1", "h4")), 0);
+}
+
 // Quiescence -------------------------------------------------------------------
 
 namespace {
