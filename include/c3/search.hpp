@@ -108,10 +108,62 @@ public:
   void send(const Report&) override {}
 };
 
+// ---------------------------------------------------------------------------
+// TWO TIME LIMITS, NOT ONE
+// ---------------------------------------------------------------------------
+// A single deadline forces a bad choice. Set it where the engine should
+// normally stop thinking and it will be cut off mid-iteration whenever a
+// position turns out to be hard, throwing away everything that iteration had
+// cost. Set it where the engine must not overrun and the engine will happily
+// start a doomed iteration with a fraction of the time it needs.
+//
+// So there are two:
+//
+//   soft_time  the budget for this move. It is checked only BETWEEN
+//              iterations, where stopping is free: the previous iteration is
+//              complete and its move is ready to play. It also decides
+//              whether to start the next iteration at all.
+//
+//   hard_time  the point of no return, and the only one the search polls
+//              while it is running. Crossing it abandons the current
+//              iteration wherever it happens to be. Reaching it should be
+//              rare—it exists for the iteration that surprises us, not for
+//              routine stopping.
+//
+// Because the soft limit is allowed to be generous about the current
+// iteration and the hard limit is not, `hard >= soft` always; a caller that
+// asks for less has its soft limit pulled down to the hard one.
+// ---------------------------------------------------------------------------
+
+// Safety margin subtracted from the hard limit before the stopper polls it.
+// The clock is only consulted every few hundred nodes, and a `bestmove` still
+// has to be written afterwards, so the search aims to stop this much early.
+inline constexpr auto TIME_SAFETY_MARGIN = std::chrono::milliseconds{5};
+
+// Ceiling on any time limit, and the reason there is one: the search compares
+// budgets against steady_clock::duration, which counts NANOSECONDS in a signed
+// 64-bit integer and therefore overflows somewhere past 106 days. A GUI is
+// free to send `go wtime 9000000000000000000`—the UCI spec puts no bound on
+// the number, and a buggy or hostile one will—and a limit derived from that
+// wraps to a negative duration, which would make the engine stop instantly
+// rather than think for ever. A day is longer than any real move deserves and
+// leaves four orders of magnitude of headroom before the arithmetic can wrap.
+inline constexpr auto MAX_TIME_LIMIT = std::chrono::milliseconds{24 * 60 * 60 * 1000};
+
 struct Limits {
   std::optional<std::uint8_t> depth{};
   std::optional<std::uint64_t> nodes{};
+
+  // "One budget, meaning both." Convenient for tests and for `go movetime`,
+  // where the GUI really has named a single number. soft_time / hard_time
+  // below override it individually when set.
   std::optional<std::chrono::milliseconds> time{};
+
+  std::optional<std::chrono::milliseconds> soft_time{};
+  std::optional<std::chrono::milliseconds> hard_time{};
+
+  [[nodiscard]] std::optional<std::chrono::milliseconds> soft_limit() const;
+  [[nodiscard]] std::optional<std::chrono::milliseconds> hard_limit() const;
 };
 
 class Stopper {
@@ -119,7 +171,9 @@ public:
   explicit Stopper(std::shared_ptr<std::atomic_bool> stop_signal = nullptr)
       : stop_signal_(std::move(stop_signal)) {}
 
-  void at_depth(std::optional<std::uint8_t> depth) { depth_ = depth; }
+  // No at_depth(): depth is not a stop condition. Iterative deepening is a
+  // loop, and its bound is where the loop ends—asking the stopper about depth
+  // as well would be a second, silent copy of the same rule.
   void at_elapsed(std::optional<std::chrono::milliseconds> elapsed);
   void at_nodes(std::optional<std::uint64_t> nodes) { nodes_ = nodes; }
 
@@ -135,7 +189,6 @@ public:
 
 private:
   std::shared_ptr<std::atomic_bool> stop_signal_{};
-  std::optional<std::uint8_t> depth_{};
   std::optional<std::chrono::milliseconds> elapsed_{};
   std::optional<std::uint64_t> nodes_{};
   // Written from the single searching thread; `mutable` so the latch can be
@@ -264,6 +317,9 @@ inline constexpr std::uint8_t TT_REPLACEMENT_DEPTH_SLACK = 4;
 
 class TranspositionTable {
 public:
+  // Sized at TT_DEFAULT_SIZE_MB. There is deliberately no process-wide "current
+  // size" to inherit instead: the only table whose size a user can change is
+  // the one an Engine owns, and that one is resized through resize().
   TranspositionTable();
   explicit TranspositionTable(std::size_t size_mb);
 
@@ -301,12 +357,6 @@ public:
 
   // Fill level in permille (0-1000), the unit UCI's `hashfull` expects.
   [[nodiscard]] std::uint32_t hashfull() const;
-
-  // Default size applied to newly constructed tables. This is a convenience
-  // for code paths that build their own throwaway table; a table owned by an
-  // Engine is sized through resize() instead.
-  static void set_size_mb(std::size_t size_mb);
-  static std::size_t size_mb();
 
 private:
   void allocate(std::size_t size_mb);
@@ -374,15 +424,93 @@ struct SearchResult {
 SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 
-// Convenience/test entry point: builds a throwaway table for this one search.
-// Handy in tests and one-shot tools, but a real engine should not pay the
-// allocation on every move—use the overload above.
+// TEST-ONLY convenience entry point: builds a throwaway table for this one
+// search and destroys it on return. It exists so a test can say "search this
+// position" without owning a table, and it is the wrong thing for anything
+// that plays chess—it pays the whole allocation on every call and starts from
+// zero knowledge every time. Nothing on the UCI path uses it; the frontend
+// searches through the Engine's own table.
 SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal = nullptr);
 SearchResult search(Position& pos, std::uint8_t depth);
 
+// How much bigger the next iteration is assumed to be than the one just
+// finished. Each extra ply multiplies the tree by the effective branching
+// factor, so a fixed multiple of the last iteration is the natural estimate.
+//
+// Four, from measurement rather than theory. Timing consecutive iterations in
+// a Release build gives ratios that scatter widely—0.75x to 8.4x measured
+// across startpos and Kiwipete—because an aspiration window that fails has to
+// re-search the root and can cost several times a clean iteration.
+//
+// The estimate is wrong in both directions, and erring high is the cheaper
+// mistake. An abandoned iteration produces nothing at all—the latching Stopper
+// refuses its transposition-table stores precisely because its scores are
+// untrue—so it costs a ply AND the time, while refusing one costs only the
+// ply, and the time goes back to the clock for the next move.
+//
+// Together with uci::HARD_TIME_MULTIPLIER (the m in hard = m x soft), this is
+// the k in the rule the search actually applies:
+//
+//     start another iteration only while  elapsed + k x last <= hard
+//
+// so with m = 3 and k = 4 a search may commit to roughly three times its soft
+// budget, and stops looking for more once the next ply is predicted to cost
+// more than a quarter of what remains.
+inline constexpr int ITERATION_GROWTH_FACTOR = 4;
+
+// The same prediction, half as much again, used when soft and hard are the
+// same number—which is what `go movetime` produces.
+//
+// WHY IT DIFFERS. With headroom, a prediction that comes in low is absorbed:
+// the iteration overruns the soft limit and finishes anyway inside the hard
+// one. Without headroom there is nothing to absorb it, so the iteration is
+// killed and its entire cost is lost. The bar to clear is therefore higher.
+//
+// WHY SIX. Measured on startpos in a Release build, where the depth 9 -> 10
+// step is the anomaly the rule exists to catch (923ms against depth 9's
+// 136ms, a ratio of 6.8):
+//
+//   go movetime 1000   after depth 9 at 232ms, 6 x 138 predicts past 995ms
+//                      -> refused, and rightly: depth 10 would not have fitted
+//   go movetime 400    after depth 8 at ~90ms, 6 x ~50 predicts ~390ms
+//                      -> allowed, and rightly: depth 9 finished at 231ms
+//
+// Eight refuses that second one too and throws a whole ply away for nothing;
+// four admits the first and loses ~760ms to an iteration that is then killed.
+//
+// BUT THE TWO CASES ARE BARELY SEPARABLE, and it is worth being honest about
+// that. At each decision point the search has used almost exactly the same
+// FRACTION of its budget—232/995 and ~90/395, both about 0.23—so no rule
+// phrased in terms of elapsed-against-budget can cleanly tell them apart. What
+// actually differs is the true cost of the next iteration, which is not
+// knowable until it has been paid. Six lands on the right side of both, but
+// the second one is close enough that ordinary timing noise occasionally
+// pushes it over and costs a ply. Tuning nearer than this would be fitting to
+// noise; a real fix needs a better predictor than "the last iteration, times a
+// constant".
+inline constexpr int NO_HEADROOM_GROWTH_FACTOR = 6;
+
 // Exposed for tests
 namespace detail {
+
+// Should iterative deepening start another iteration? Both time rules live
+// here so they are decided in one place and can be reasoned about—and tested—
+// without running a search:
+//
+//   1. The soft limit is spent. We have a complete answer; stop.
+//   2. The next iteration is predicted not to fit inside the hard limit.
+//      Its cost is estimated from the last one, which is the only evidence
+//      there is: an iteration's cost is not knowable until it has been paid.
+//
+// The prediction is measured against the hard limit MINUS TIME_SAFETY_MARGIN,
+// because that is where the stopper actually fires—comparing against the raw
+// limit would predict a finish the search is not allowed to reach.
+[[nodiscard]] bool should_continue_deepening(std::chrono::steady_clock::duration elapsed,
+                                             std::chrono::steady_clock::duration last_iteration,
+                                             std::optional<std::chrono::milliseconds> soft_time,
+                                             std::optional<std::chrono::milliseconds> hard_time);
+
 void order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
                  const std::optional<Move>& hash_move = std::nullopt);
 void order_quiescence_moves(MoveList& moves);

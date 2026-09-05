@@ -2,12 +2,19 @@
 
 #include <chrono>
 #include <cstdint>
+#include <istream>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <ostream>
 #include <sstream>
+#include <streambuf>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
+#include "c3/search.hpp"
 #include "c3/uci.hpp"
 
 using namespace c3;
@@ -102,6 +109,52 @@ TEST(UciTime, MatchesExpectedAllocations) {
   EXPECT_EQ(bullet, std::make_optional(2000ms));
   EXPECT_EQ(scramble, std::make_optional(416ms));
   EXPECT_EQ(long_inc, std::make_optional(85500ms));
+}
+
+TEST(UciTime, BudgetGivesTheSoftLimitRoomToOverrun) {
+  // The soft limit is still the old allocation; the hard limit is three times
+  // it, so an iteration that turns out expensive can finish instead of being
+  // thrown away half-done.
+  const auto blitz = uci::calculate_time_budget(180000ms, std::make_optional(2000ms));
+
+  EXPECT_EQ(blitz.soft, 7000ms);
+  EXPECT_EQ(blitz.hard, 21000ms);
+  EXPECT_EQ(blitz.soft, uci::calculate_allocated_time(180000ms, std::make_optional(2000ms)));
+}
+
+TEST(UciTime, BudgetNeverPromisesMoreThanTheClockHolds) {
+  // Three times a healthy budget can exceed the whole remaining clock. What is
+  // left after the reserve is the real ceiling.
+  const auto scramble = uci::calculate_time_budget(5000ms, std::make_optional(500ms));
+
+  EXPECT_EQ(scramble.soft, 416ms);
+  EXPECT_EQ(scramble.hard, 1248ms); // 3 x 416, comfortably inside 5000 - 250
+  EXPECT_LE(scramble.hard, 5000ms - 250ms);
+
+  // With almost nothing left, the floor has already claimed everything the
+  // clock can afford, so there is no headroom to give and the two coincide.
+  const auto desperate = uci::calculate_time_budget(20ms, std::nullopt);
+  EXPECT_EQ(desperate.hard, desperate.soft);
+}
+
+TEST(UciTime, BudgetSurvivesAnAbsurdClock) {
+  // UCI puts no bound on `wtime`, so a buggy GUI can send a clock whose triple
+  // does not fit in a signed 64-bit millisecond count. Multiplying it anyway is
+  // undefined behaviour, and the wrapped value comes out negative—which would
+  // read as "no time at all".
+  const auto absurd = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+  const auto budget = uci::calculate_time_budget(absurd, std::make_optional(absurd));
+
+  EXPECT_GT(budget.soft.count(), 0);
+  EXPECT_GE(budget.hard, budget.soft);
+  EXPECT_LE(budget.hard, search::MAX_TIME_LIMIT);
+}
+
+TEST(UciTime, BudgetHardLimitIsNeverBelowTheSoftOne) {
+  for (const auto clock : {10ms, 60ms, 500ms, 5000ms, 60000ms, 600000ms}) {
+    const auto budget = uci::calculate_time_budget(clock, std::nullopt);
+    EXPECT_GE(budget.hard, budget.soft) << "clock " << clock.count() << "ms";
+  }
 }
 
 TEST(UciReporter, PrintsInfoAndTracksBestMove) {
@@ -533,6 +586,17 @@ TEST(UciLoop, EofStopsTheSearchAndStillReportsOneBestMove) {
   EXPECT_EQ(bestmoves[0].find("(none)"), std::string::npos) << output;
 }
 
+TEST(UciLoop, AnAbsurdClockStillProducesALegalBestMove) {
+  // UCI does not bound the clock a GUI may send. Whatever arrives, the search
+  // has to end in a legal move rather than in wrapped arithmetic.
+  const auto output = run_uci("position startpos\ngo wtime 9000000000000000000 "
+                              "winc 9000000000000000000 depth 3\nquit\n");
+
+  const auto bestmoves = lines_starting_with(output, "bestmove ");
+  ASSERT_EQ(bestmoves.size(), 1U) << output;
+  EXPECT_EQ(bestmoves[0].find("(none)"), std::string::npos) << output;
+}
+
 TEST(UciLoop, ZeroClockStillProducesALegalBestMove) {
   const auto output = run_uci("position startpos\ngo wtime 0 btime 0\nquit\n");
 
@@ -725,4 +789,340 @@ TEST(UciLoop, EveryLineIsAValidUciCommand) {
                        line == "uciok" || line == "readyok";
     EXPECT_TRUE(valid) << "not a UCI line: " << line << '\n' << output;
   }
+}
+
+// -----------------------------------------------------------------------------
+// The Engine's transposition table, seen through the loop
+// -----------------------------------------------------------------------------
+//
+// These tests need a search to run to its full depth, which `run_uci` cannot
+// give them: it hands the loop the whole script at once, so the next command
+// arrives microseconds after `go` and the `stop()` it performs cuts the search
+// off just after its depth-1 report. A real GUI does not do that—it waits for
+// `bestmove` before sending anything else—so the harness below paces the
+// session the same way.
+// -----------------------------------------------------------------------------
+
+namespace {
+
+// An output sink both the loop's search thread and the test read, so every
+// access goes through one mutex.
+class RecordingSink : public std::streambuf {
+public:
+  [[nodiscard]] std::string text() const {
+    const std::scoped_lock lock(mutex_);
+    return text_;
+  }
+
+  // Anchored to the start of a line: `bestmove` also appears mid-line in
+  // bench's `info string ... bestmove e2e4` reports, and counting those would
+  // release the next command before the search that owes us a reply has sent
+  // one.
+  [[nodiscard]] std::size_t bestmove_count() const {
+    const std::scoped_lock lock(mutex_);
+    static constexpr std::string_view REPLY = "bestmove ";
+
+    std::size_t count = 0;
+    for (std::size_t at = 0; at < text_.size();) {
+      const auto line_end = text_.find('\n', at);
+      if (text_.compare(at, REPLY.size(), REPLY) == 0) {
+        count += 1;
+      }
+      if (line_end == std::string::npos) {
+        break;
+      }
+      at = line_end + 1;
+    }
+    return count;
+  }
+
+protected:
+  int_type overflow(int_type ch) override {
+    if (ch != traits_type::eof()) {
+      const std::scoped_lock lock(mutex_);
+      text_.push_back(static_cast<char>(ch));
+    }
+    return ch;
+  }
+
+  std::streamsize xsputn(const char* data, std::streamsize size) override {
+    const std::scoped_lock lock(mutex_);
+    text_.append(data, static_cast<std::size_t>(size));
+    return size;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::string text_;
+};
+
+// Releases one command at a time, and never the command after a `go` until
+// that `go` has been answered with a `bestmove`.
+class PacedInput : public std::streambuf {
+public:
+  PacedInput(std::vector<std::string> commands, const RecordingSink& sink)
+      : commands_(std::move(commands)), sink_(&sink) {}
+
+protected:
+  int_type underflow() override {
+    if (gptr() < egptr()) {
+      return traits_type::to_int_type(*gptr());
+    }
+
+    if (next_ == commands_.size()) {
+      return traits_type::eof();
+    }
+
+    // Bounded so a search that never answers fails the test instead of
+    // hanging the whole suite.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (sink_->bestmove_count() < searches_started_ &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    line_ = commands_[next_] + "\n";
+    if (commands_[next_].rfind("go", 0) == 0) {
+      ++searches_started_;
+    }
+    ++next_;
+
+    setg(line_.data(), line_.data(), line_.data() + line_.size());
+    return traits_type::to_int_type(line_[0]);
+  }
+
+private:
+  std::vector<std::string> commands_;
+  const RecordingSink* sink_;
+  std::string line_;
+  std::size_t next_{0};
+  std::size_t searches_started_{0};
+};
+
+std::string run_uci_paced(const std::vector<std::string>& commands) {
+  RecordingSink sink;
+  std::ostream out(&sink);
+  PacedInput input(commands, sink);
+  std::istream in(&input);
+
+  uci::run_loop(in, out);
+
+  return sink.text();
+}
+
+// Node count from the last `info depth` line of each search, in order: one
+// entry per `bestmove`, which is one entry per `go`.
+std::vector<std::uint64_t> node_counts_per_search(const std::string& output) {
+  std::vector<std::uint64_t> counts;
+  std::uint64_t latest = 0;
+
+  for (const auto& line : split_lines(output)) {
+    if (line.rfind("info depth ", 0) == 0) {
+      const auto nodes = line.find(" nodes ");
+      if (nodes != std::string::npos) {
+        std::istringstream value(line.substr(nodes + std::string(" nodes ").size()));
+        value >> latest;
+      }
+      continue;
+    }
+
+    if (line.rfind("bestmove ", 0) == 0) {
+      counts.push_back(latest);
+      latest = 0;
+    }
+  }
+
+  return counts;
+}
+
+// Deep enough that a warm table saves an obvious amount of work, shallow
+// enough to stay quick in a Debug build with sanitisers on.
+constexpr auto WARM_TABLE_GO = "go depth 6";
+
+} // namespace
+
+TEST(UciLoop, SecondGoReusesTheTableTheFirstOneFilled) {
+  // The loop must search through the Engine's table rather than build a
+  // throwaway one per `go`. When it does, the second search of the same
+  // position starts from everything the first one learned and costs a
+  // fraction of the nodes.
+  const auto output = run_uci_paced({"position startpos", WARM_TABLE_GO, WARM_TABLE_GO, "quit"});
+
+  const auto counts = node_counts_per_search(output);
+  ASSERT_EQ(counts.size(), 2U) << output;
+  ASSERT_GT(counts[0], 0U) << output;
+  EXPECT_LT(counts[1], counts[0] / 2) << output;
+}
+
+// -----------------------------------------------------------------------------
+// bench
+// -----------------------------------------------------------------------------
+
+namespace {
+
+// The `info string bench nodes <N> nps <M>` line's node total, or nullopt when
+// the run did not produce one.
+std::optional<std::uint64_t> bench_total(const std::string& output) {
+  for (const auto& line : lines_starting_with(output, "info string bench nodes ")) {
+    std::istringstream fields(line.substr(std::string("info string bench nodes ").size()));
+    std::uint64_t nodes = 0;
+    if (fields >> nodes) {
+      return nodes;
+    }
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
+TEST(UciBench, RunsEveryPositionAndTotalsTheNodes) {
+  const auto output = run_uci("bench 1\nquit\n");
+
+  // One line per position, then the timing line and the total.
+  const auto positions = lines_starting_with(output, "info string bench position ");
+  EXPECT_EQ(positions.size(), 12U) << output;
+
+  const auto total = bench_total(output);
+  ASSERT_TRUE(total.has_value()) << output;
+  EXPECT_GT(*total, 0U) << output;
+  EXPECT_NE(output.find(" nps "), std::string::npos) << output;
+}
+
+TEST(UciBench, TwoRunsAgreeExactly) {
+  // The whole point of bench: the same build searching the same positions must
+  // reach the same total, or the number cannot be compared between builds.
+  // Clearing the table before each position is what makes that true.
+  const auto first = bench_total(run_uci("bench 1\nquit\n"));
+  const auto second = bench_total(run_uci("bench 1\nquit\n"));
+
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(*first, *second);
+}
+
+TEST(UciBench, IsUnaffectedByWhatCameBeforeIt) {
+  // A search run first leaves the table full. If bench inherited it, its total
+  // would depend on the session's history rather than on the engine.
+  const auto cold = bench_total(run_uci("bench 1\nquit\n"));
+  const auto warm = bench_total(run_uci("position startpos\ngo depth 4\nbench 1\nquit\n"));
+
+  ASSERT_TRUE(cold.has_value());
+  ASSERT_TRUE(warm.has_value());
+  EXPECT_EQ(*cold, *warm);
+}
+
+TEST(UciBench, DeeperRunsSearchMore) {
+  const auto shallow = bench_total(run_uci("bench 1\nquit\n"));
+  const auto deeper = bench_total(run_uci("bench 3\nquit\n"));
+
+  ASSERT_TRUE(shallow.has_value());
+  ASSERT_TRUE(deeper.has_value());
+  EXPECT_GT(*deeper, *shallow);
+}
+
+TEST(UciBench, LeavesNoStateBehindInTheTable) {
+  // bench clears the table before each position; it must also clear after the
+  // last one, or the session it was run in carries the final position's
+  // results into whatever the user does next. A 1 MB table makes the leftovers
+  // visible in `hashfull`.
+  const auto output =
+      run_uci("setoption name Hash value 1\nbench 4\nposition startpos\ngo depth 1\nquit\n");
+
+  const auto info = lines_starting_with(output, "info depth ");
+  ASSERT_FALSE(info.empty()) << output;
+
+  const auto at = info.back().find(" hashfull ");
+  ASSERT_NE(at, std::string::npos) << output;
+  std::istringstream value(info.back().substr(at + std::string(" hashfull ").size()));
+  std::uint32_t hashfull = 0;
+  ASSERT_TRUE(static_cast<bool>(value >> hashfull)) << output;
+
+  EXPECT_EQ(hashfull, 0U) << "bench left its last position in the table\n" << output;
+}
+
+TEST(UciBench, RejectsADepthItCannotHonour) {
+  // `bench 0` searched nothing and printed zeros; `bench 200` ran on the
+  // reader's own thread with no way to interrupt it. Both are clamped into a
+  // range bench can actually deliver, and the user is told when that happens—
+  // the same treatment `go depth` gives an out-of-range depth.
+  const auto zero = uci::parse_command("bench 0");
+  ASSERT_EQ(zero.type, uci::CommandType::Bench);
+  EXPECT_EQ(zero.bench_depth, 1);
+  EXPECT_FALSE(zero.diagnostics.empty()) << "clamping must be reported";
+
+  const auto huge = uci::parse_command("bench 200");
+  EXPECT_EQ(huge.bench_depth, uci::BENCH_MAX_DEPTH);
+  EXPECT_FALSE(huge.diagnostics.empty()) << "clamping must be reported";
+
+  const auto fine = uci::parse_command("bench 4");
+  EXPECT_EQ(fine.bench_depth, 4);
+  EXPECT_TRUE(fine.diagnostics.empty());
+
+  const auto bare = uci::parse_command("bench");
+  EXPECT_FALSE(bare.bench_depth.has_value());
+  EXPECT_TRUE(bare.diagnostics.empty());
+}
+
+TEST(UciBench, ReportsTokensItDoesNotUnderstand) {
+  // `go` reports what it skipped rather than silently obeying half a command;
+  // bench does the same for an unreadable depth and for trailing junk.
+  const auto junk = uci::parse_command("bench 5 junk");
+  ASSERT_EQ(junk.type, uci::CommandType::Bench);
+  EXPECT_EQ(junk.bench_depth, 5);
+  EXPECT_FALSE(junk.diagnostics.empty()) << "trailing tokens must be reported";
+
+  const auto unreadable = uci::parse_command("bench banana");
+  EXPECT_FALSE(unreadable.bench_depth.has_value()) << "an unreadable depth falls back to default";
+  EXPECT_FALSE(unreadable.diagnostics.empty());
+}
+
+TEST(UciBench, ADepthItCannotHonourIsStillAnsweredAsUci) {
+  // The clamp has to reach the loop, not just the parser: `bench 0` must still
+  // produce a real total rather than twelve zeros.
+  const auto output = run_uci("bench 0\nquit\n");
+
+  const auto total = bench_total(output);
+  ASSERT_TRUE(total.has_value()) << output;
+  EXPECT_GT(*total, 0U) << output;
+  EXPECT_FALSE(lines_starting_with(output, "info string ").empty()) << output;
+}
+
+TEST(UciBench, EveryLineIsAValidUciLine) {
+  // bench is a developer tool, but it still writes to the same stream a GUI is
+  // reading, so it may not emit bare text.
+  const auto output = run_uci("bench 1\nquit\n");
+
+  for (const auto& line : split_lines(output)) {
+    if (line.empty()) {
+      continue;
+    }
+    EXPECT_EQ(line.rfind("info ", 0), 0U) << "not a UCI line: " << line;
+  }
+}
+
+TEST(UciLoop, HashOptionStopsTheSearchBeforeResizingTheTable) {
+  // Resizing frees the memory the search is reading, so the search must be
+  // joined before the table is touched. The visible consequence is that the
+  // interrupted `go` still gets its one `bestmove`, and the session survives
+  // to answer afterwards.
+  const auto output = run_uci("position startpos\ngo infinite\nsetoption name Hash value 1\n"
+                              "isready\nquit\n");
+
+  const auto bestmoves = lines_starting_with(output, "bestmove ");
+  ASSERT_EQ(bestmoves.size(), 1U) << output;
+  EXPECT_EQ(bestmoves[0].find("(none)"), std::string::npos) << output;
+  EXPECT_NE(output.find("readyok"), std::string::npos) << output;
+}
+
+TEST(UciLoop, NewGameForgetsWhatTheTableLearned) {
+  // `ucinewgame` says the next position belongs to a different game, so the
+  // stored scores describe a tree we will never visit again. After it the
+  // search has to pay full price once more.
+  const auto output = run_uci_paced({"position startpos", WARM_TABLE_GO, "ucinewgame",
+                                     "position startpos", WARM_TABLE_GO, "quit"});
+
+  const auto counts = node_counts_per_search(output);
+  ASSERT_EQ(counts.size(), 2U) << output;
+  ASSERT_GT(counts[0], 0U) << output;
+  EXPECT_GT(counts[1], counts[0] / 2) << output;
 }

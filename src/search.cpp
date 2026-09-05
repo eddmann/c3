@@ -53,12 +53,6 @@ constexpr std::uint8_t ASPIRATION_WINDOW_MAX_RETRIES = 3; // Then fall back to f
 // Checking involves atomic loads and time queries—amortizing the cost matters.
 constexpr std::uint64_t STOPPER_NODES_MASK = 0xFF;
 
-// Safety margin for time management to prevent overshooting the time limit.
-// The engine checks time only every STOPPER_NODES_MASK nodes, and there's
-// additional overhead for UCI output after search completes. This margin
-// ensures we stop early enough to report the move within the allotted time.
-constexpr auto TIME_SAFETY_MARGIN = std::chrono::milliseconds(5);
-
 // Sanitise the PV by checking if it leads to a draw. If the PV results in a
 // fifty-move draw or repetition, truncate it and return CENTIPAWN_DRAW. This
 // prevents the engine from reporting a winning eval when the best line
@@ -79,8 +73,6 @@ std::pair<MoveList, int> sanitise_pv(Position pos, const MoveList& moves, int ev
 constexpr std::size_t MIN_SIZE_MB = TT_MIN_SIZE_MB;
 constexpr std::size_t MAX_SIZE_MB = TT_MAX_SIZE_MB;
 constexpr std::size_t DEFAULT_SIZE_MB = TT_DEFAULT_SIZE_MB;
-
-std::atomic<std::size_t> TT_SIZE_MB{DEFAULT_SIZE_MB};
 
 // Check if a side has any pieces besides pawns.
 // Used in null-move pruning: don't prune in pawn-only endgames (zugzwang risk).
@@ -168,6 +160,70 @@ std::optional<std::uint8_t> Report::moves_until_mate() const {
   }
 
   return static_cast<std::uint8_t>(CENTIPAWN_MATE - abs_eval);
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Every limit passes through here on its way into the search, so a budget too
+// large to be a steady_clock::duration cannot reach the arithmetic that would
+// wrap it. See MAX_TIME_LIMIT for why the ceiling exists at all.
+std::optional<std::chrono::milliseconds> capped(std::optional<std::chrono::milliseconds> limit) {
+  if (!limit.has_value()) {
+    return std::nullopt;
+  }
+  return std::min(*limit, MAX_TIME_LIMIT);
+}
+
+} // namespace
+
+std::optional<std::chrono::milliseconds> Limits::hard_limit() const {
+  return capped(hard_time.has_value() ? hard_time : time);
+}
+
+std::optional<std::chrono::milliseconds> Limits::soft_limit() const {
+  const auto soft = capped(soft_time.has_value() ? soft_time : time);
+  const auto hard = hard_limit();
+
+  if (!soft.has_value()) {
+    return hard;
+  }
+
+  // A soft limit beyond the hard one would promise time the search is not
+  // allowed to take, so the ceiling wins.
+  return hard.has_value() ? std::make_optional(std::min(*soft, *hard)) : soft;
+}
+
+bool detail::should_continue_deepening(std::chrono::steady_clock::duration elapsed,
+                                       std::chrono::steady_clock::duration last_iteration,
+                                       std::optional<std::chrono::milliseconds> soft_time,
+                                       std::optional<std::chrono::milliseconds> hard_time) {
+  // The budget for this move is spent, and an iteration has just finished, so
+  // there is a complete answer to hand over. Nothing is lost by stopping.
+  if (soft_time.has_value() && elapsed > *soft_time) {
+    return false;
+  }
+
+  if (!hard_time.has_value()) {
+    return true;
+  }
+
+  // No headroom (soft == hard, as `go movetime` produces) means an iteration
+  // that overruns is killed outright rather than absorbed, so the prediction
+  // has to clear a higher bar. See NO_HEADROOM_GROWTH_FACTOR.
+  // A soft limit ABOVE the hard one counts as no headroom too—Limits clamps
+  // that away before the search sees it, and the cautious reading is right
+  // either way, since the hard limit is the real constraint.
+  const bool has_headroom = !soft_time.has_value() || *soft_time < *hard_time;
+  const int factor = has_headroom ? ITERATION_GROWTH_FACTOR : NO_HEADROOM_GROWTH_FACTOR;
+
+  // Measured against where the stopper really fires, not the raw limit.
+  const auto deadline = *hard_time - TIME_SAFETY_MARGIN;
+
+  return elapsed + (last_iteration * factor) <= deadline;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +351,7 @@ std::optional<Move> decode_tt_move(std::uint16_t packed, const MoveList& moves) 
 // ---------------------------------------------------------------------------
 
 TranspositionTable::TranspositionTable() {
-  allocate(size_mb());
+  allocate(DEFAULT_SIZE_MB);
 }
 
 TranspositionTable::TranspositionTable(std::size_t size_mb) {
@@ -318,9 +374,14 @@ void TranspositionTable::allocate(std::size_t size_mb) {
     pow2 <<= 1;
   }
 
+  // Storage first, then the fields that describe it. assign() can throw
+  // (bad_alloc on a large table), and publishing capacity_ before the memory
+  // exists would leave the table claiming millions of entries it does not
+  // have—every probe would then index into whatever the old, smaller vector
+  // still held, or past its end.
+  entries_.assign(pow2, TTEntry{});
   capacity_ = pow2;
   usage_ = 0;
-  entries_.assign(capacity_, TTEntry{});
 }
 
 void TranspositionTable::clear() {
@@ -415,17 +476,6 @@ void TranspositionTable::store(std::uint64_t key, std::uint8_t depth, int eval, 
   entry.packed_move = move_to_keep;
   entry.bound_and_generation =
       static_cast<std::uint8_t>(static_cast<std::uint8_t>(bound) | (generation_ << 2U));
-}
-
-void TranspositionTable::set_size_mb(std::size_t size_mb) {
-  if (size_mb < MIN_SIZE_MB || size_mb > MAX_SIZE_MB) {
-    throw std::invalid_argument("invalid transposition table size");
-  }
-  TT_SIZE_MB.store(size_mb, std::memory_order_release);
-}
-
-std::size_t TranspositionTable::size_mb() {
-  return TT_SIZE_MB.load(std::memory_order_acquire);
 }
 
 // ---------------------------------------------------------------------------
@@ -546,10 +596,27 @@ void detail::order_quiescence_moves(MoveList& moves) {
 // Stand-pat: The current static evaluation serves as a baseline. The side to
 // move can always "stand pat" (decline to capture) if no capture improves the
 // position. This prevents quiescence from searching forever.
+//
+// QUIESCENCE MUST ASK THE STOPPER TOO
+// "Until the position is quiet" is not a bound anybody set. A middlegame with
+// both sides' pieces contesting the same squares can spend thousands of nodes
+// resolving one exchange, and while it does so the search is not looking at
+// the clock at all. Skipping the check here therefore made every limit
+// approximate: `go nodes` overshot, and a move played on the last second of
+// the clock could be handed in late. So quiescence polls like alphabeta does,
+// and returns the same placeholder score when it is told to stop—the latching
+// Stopper makes sure that score is discarded rather than stored.
 // ---------------------------------------------------------------------------
 
-int quiescence(Position& pos, int alpha, int beta, Report& report) {
-  report.nodes += 1;
+int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper& stopper) {
+  if (stopper.should_stop(report)) {
+    return 0;
+  }
+
+  // THIS position has already been counted—by the alphabeta leaf that handed
+  // it over, or by the recursive call below. Quiescence counts each child it
+  // decides to visit instead, which keeps every position worth exactly one
+  // node whichever of the two searches resolves it.
 
   // Stand-pat: static evaluation as the fallback
   const int stand_pat = eval(pos);
@@ -577,8 +644,12 @@ int quiescence(Position& pos, int alpha, int beta, Report& report) {
       continue;
     }
 
+    // The child is a position we are about to enter and decide, so it is
+    // counted here—the callee will not count itself.
+    report.nodes += 1;
+
     // Negamax: negate score and swap alpha/beta
-    const int score = -quiescence(pos, -beta, -alpha, report);
+    const int score = -quiescence(pos, -beta, -alpha, report, stopper);
 
     pos.unmake_move(mv);
 
@@ -617,6 +688,21 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     return 0;
   }
 
+  // NODE ACCOUNTING
+  // A "node" is a position the search entered and decided, and this is where
+  // one is counted: at true entry, above the draw tests and the transposition
+  // probe and every other way out below. Counting further down made the two
+  // cheapest outcomes free—a drawn terminal and a transposition cutoff each
+  // returned an answer without reaching the increment—which understated nps by
+  // exactly what the table was saving, and let `go nodes N` run well past N,
+  // because the nodes the limit is meant to count were the ones it could not
+  // see.
+  //
+  // This one increment covers the quiescence hand-off below too: a leaf is
+  // counted here and quiescence does not count itself, so every position costs
+  // exactly one node no matter which of the two searches resolves it.
+  report.nodes += 1;
+
   // Draw detection: 50-move rule or threefold repetition
   if (pos.is_fifty_move_draw() || pos.is_repetition_draw(report.ply)) {
     return CENTIPAWN_DRAW;
@@ -625,7 +711,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // Leaf node: drop into quiescence search
   if (depth == 0) {
     if (!is_in_check(pos.colour_to_move, pos.board)) {
-      return quiescence(pos, alpha, beta, report);
+      return quiescence(pos, alpha, beta, report, stopper);
     }
     // CHECK EXTENSION: Don't stop search while in check (tactical danger)
     depth = 1;
@@ -674,8 +760,6 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // move is worth having: it is the best move a previous search found here.
     hash_move_packed = entry->packed_move;
   }
-
-  report.nodes += 1;
 
   const Colour colour_to_move = pos.colour_to_move;
   const bool in_check = is_in_check(colour_to_move, pos.board);
@@ -871,10 +955,14 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
 SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal) {
+  const auto soft_time = limits.soft_limit();
+  const auto hard_time = limits.hard_limit();
+
   Stopper stopper(std::move(stop_signal));
-  stopper.at_depth(limits.depth);
   stopper.at_nodes(limits.nodes);
-  stopper.at_elapsed(limits.time);
+  // Only the hard limit is polled inside the tree. The soft limit is a
+  // between-iterations decision, made at the bottom of the loop below.
+  stopper.at_elapsed(hard_time);
 
   // Mark everything already in the table as belonging to a previous search.
   // Those entries stay readable—they are still true—but they become the first
@@ -886,21 +974,45 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
 
   const std::uint8_t max_depth = limits.depth.has_value() ? *limits.depth : MAX_DEPTH;
 
-  int last_eval = 0;
+  // TWO SCORES, TWO JOBS. They are equal on almost every iteration, and it is
+  // tempting to keep one variable—but they answer different questions, and
+  // sanitise_pv() is exactly where they part company.
+  //
+  //   searched_eval  what alpha-beta actually returned. The next iteration's
+  //                  aspiration window is centred on THIS, because it is the
+  //                  search's own opinion of the position and therefore the
+  //                  best prediction of what the next, deeper search will say.
+  //
+  //   reported_eval  what we tell the GUI, and what SearchResult carries.
+  //                  sanitise_pv() rewrites it to a draw when the principal
+  //                  variation walks into a repetition or the fifty-move rule,
+  //                  because claiming "+3" for a line that ends in a handshake
+  //                  is a lie however good the position looks.
+  //
+  // Centring the window on the reported score would aim the next iteration at
+  // "equal" while the search still believes it is winning: every attempt would
+  // fail high, and each one costs a full re-search of the whole tree.
+  int searched_eval = 0;
+  int reported_eval = 0;
   MoveList best_pv;
   std::uint8_t best_depth = 0;
 
+  // How long the iteration that just finished took. It is the only estimate we
+  // have of what the next one will cost.
+  auto last_iteration = std::chrono::steady_clock::duration::zero();
+
   for (std::uint8_t depth = 1; depth <= max_depth; ++depth) {
+    const auto iteration_started = std::chrono::steady_clock::now();
     MoveList pv;
 
     const bool do_aspiration =
-        depth >= ASPIRATION_WINDOW_MIN_DEPTH && std::abs(last_eval) < CENTIPAWN_MATE_THRESHOLD;
+        depth >= ASPIRATION_WINDOW_MIN_DEPTH && std::abs(searched_eval) < CENTIPAWN_MATE_THRESHOLD;
 
     int delta_low = ASPIRATION_WINDOW_INITIAL_DELTA;
     int delta_high = ASPIRATION_WINDOW_INITIAL_DELTA;
 
-    int alpha = do_aspiration ? std::max(CENTIPAWN_MIN, last_eval - delta_low) : CENTIPAWN_MIN;
-    int beta = do_aspiration ? std::min(CENTIPAWN_MAX, last_eval + delta_high) : CENTIPAWN_MAX;
+    int alpha = do_aspiration ? std::max(CENTIPAWN_MIN, searched_eval - delta_low) : CENTIPAWN_MIN;
+    int beta = do_aspiration ? std::min(CENTIPAWN_MAX, searched_eval + delta_high) : CENTIPAWN_MAX;
 
     int eval_final = 0;
     std::uint8_t retries = 0;
@@ -931,10 +1043,10 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
 
       if (eval <= alpha) {
         delta_low *= ASPIRATION_WINDOW_EXPANSION_FACTOR;
-        alpha = std::max(CENTIPAWN_MIN, last_eval - delta_low);
+        alpha = std::max(CENTIPAWN_MIN, searched_eval - delta_low);
       } else if (eval >= beta) {
         delta_high *= ASPIRATION_WINDOW_EXPANSION_FACTOR;
-        beta = std::min(CENTIPAWN_MAX, last_eval + delta_high);
+        beta = std::min(CENTIPAWN_MAX, searched_eval + delta_high);
       }
     }
 
@@ -942,10 +1054,12 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
       break;
     }
 
-    // Sanitise the PV to detect draws and adjust eval accordingly
+    // Sanitise the PV to detect draws and adjust the REPORTED eval accordingly.
+    // The searched eval is kept as it was: see the note where both are declared.
     auto [sanitised_pv, sanitised_eval] = sanitise_pv(pos, pv, eval_final);
 
-    last_eval = sanitised_eval;
+    searched_eval = eval_final;
+    reported_eval = sanitised_eval;
     best_pv = sanitised_pv;
     best_depth = depth;
 
@@ -953,11 +1067,20 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
     report.pv = std::make_pair(sanitised_pv, sanitised_eval);
     report.tt_stats = {tt.usage(), tt.capacity()};
     reporter.send(report);
+
+    last_iteration = std::chrono::steady_clock::now() - iteration_started;
+
+    // Both time rules—"the budget is spent" and "the next ply will not fit"—
+    // are decided together in should_continue_deepening.
+    if (!detail::should_continue_deepening(report.elapsed(), last_iteration, soft_time,
+                                           hard_time)) {
+      break;
+    }
   }
 
   SearchResult result;
   result.depth = best_depth;
-  result.eval = last_eval;
+  result.eval = reported_eval;
   result.pv = best_pv;
   result.nodes = report.nodes;
   result.hashfull = tt.hashfull();
@@ -967,9 +1090,9 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
 
 SearchResult search(Position& pos, const Limits& limits, Reporter& reporter,
                     std::shared_ptr<std::atomic_bool> stop_signal) {
-  // A table built here and thrown away when the function returns. Convenient,
-  // but it means this search starts from zero knowledge and pays the whole
-  // allocation cost up front—see the header for why an engine should not.
+  // Test-only: a table built here and thrown away when the function returns.
+  // This search starts from zero knowledge and pays the whole allocation cost
+  // up front—see the header for why nothing that plays chess may use it.
   TranspositionTable tt;
   return search(pos, tt, limits, reporter, std::move(stop_signal));
 }

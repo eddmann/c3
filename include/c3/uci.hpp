@@ -29,6 +29,41 @@
 // LIKELY. It does not make it certain: only the fallback move above
 // guarantees that the GUI gets a reply at all.
 //
+// RULE 3: A CLOCK BUYS TWO LIMITS, NOT ONE
+// What the GUI sends is a clock, not a deadline, and the engine turns it into
+// a pair: a soft limit (what this move is worth, checked between iterations)
+// and a hard limit (what it must not exceed, polled inside the search). See
+// calculate_time_budget in uci.cpp for the arithmetic and search.hpp for what
+// the search does with the two. `go movetime` is the exception—there the GUI
+// really has named a single deadline, so both limits are that number.
+//
+// THE `bench` COMMAND (not part of UCI)
+// `bench [depth]` searches a fixed list of positions to a fixed depth and
+// reports the total node count. Its whole value is that the number is
+// REPRODUCIBLE: two runs of the same build must print the same total, so a
+// change to search or evaluation announces itself as a changed bench, and two
+// builds that print the same number are searching the same tree. That is why
+// the transposition table is cleared before each position—a table carried over
+// from the previous one would make the total depend on the order and on
+// whatever the engine happened to be doing beforehand.
+//
+// It runs on the main thread, so nothing else is answered until it finishes—
+// which is also why the depth it accepts is capped (see BENCH_MAX_DEPTH):
+// there is no way to interrupt it once it starts. It clears the transposition
+// table before each position AND once more at the end, so a bench leaves the
+// session exactly as it found it. Neither restriction matters in practice:
+// bench is a tool for whoever is developing the engine, not something a GUI
+// sends.
+//
+// Output is `info string` lines, including the final
+//
+//     info string bench nodes <N> nps <M>
+//
+// Some engines print a bare `<N> nodes <M> nps` for scripts to grep. This one
+// does not: every line this engine writes has to be a line a GUI can parse and
+// skip, and bare text is not. Scripts can match on the `bench nodes` line just
+// as easily.
+//
 // Anything else we want to say—diagnostics, warnings about input we did not
 // understand—travels as `info string ...`, the protocol's free-text line. The
 // UCI spec requires unknown commands and unknown tokens to be tolerated rather
@@ -63,6 +98,7 @@ enum class CommandType {
   DoMove,
   Position,
   Go,
+  Bench,
   SetOption,
   Stop,
   Quit,
@@ -127,9 +163,18 @@ struct SetOptionCommand {
   std::optional<std::string> value;
 };
 
+// Deepest bench this command will accept. bench runs on the reader's own
+// thread, so nothing can interrupt it once started—a depth that takes an hour
+// wedges the session with no way out. Twelve is around two minutes for the
+// whole list in a Release build (depth 8, the default, is under three
+// seconds), which is a long wait but a bounded one. A deeper search of a
+// single position is what `go depth` is for.
+inline constexpr std::uint8_t BENCH_MAX_DEPTH = 12;
+
 struct UciCommand {
   CommandType type{CommandType::Init};
   std::optional<std::uint8_t> perft_depth{};
+  std::optional<std::uint8_t> bench_depth{};
   std::optional<UciMove> move{};
   std::optional<PositionCommand> position{};
   std::optional<GoParams> go_params{};
@@ -148,6 +193,19 @@ UciCommand parse_command(const std::string& command);
 calculate_allocated_time(std::chrono::milliseconds time_left,
                          std::optional<std::chrono::milliseconds> increment,
                          std::optional<std::uint32_t> moves_to_go = std::nullopt) noexcept;
+
+// The pair of limits the search wants: what we mean to spend on this move, and
+// what we must not exceed. See calculate_time_budget in uci.cpp for how the
+// hard limit is derived from the soft one.
+struct TimeBudget {
+  std::chrono::milliseconds soft{};
+  std::chrono::milliseconds hard{};
+};
+
+[[nodiscard]] TimeBudget
+calculate_time_budget(std::chrono::milliseconds time_left,
+                      std::optional<std::chrono::milliseconds> increment,
+                      std::optional<std::uint32_t> moves_to_go = std::nullopt) noexcept;
 
 // Resolves a UCI move string against the legal moves of `pos`; throws if the
 // move is not legal there.

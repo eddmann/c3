@@ -451,7 +451,9 @@ TEST(TranspositionTable, NonPvNodesTakeCutoffsFromEveryBoundType) {
     const int eval = search::detail::alphabeta(pos, 3, 0, 1, pv, tt, killers, report, stopper);
 
     EXPECT_EQ(eval, scenario.expected) << scenario.name;
-    EXPECT_EQ(report.nodes, 0U) << scenario.name << ": cutoff should search nothing";
+    // One node: the cutoff node itself, which we did enter and did decide.
+    // Nothing BELOW it was searched, which is the saving the table exists for.
+    EXPECT_EQ(report.nodes, 1U) << scenario.name << ": cutoff should search no children";
   }
 }
 
@@ -530,6 +532,36 @@ TEST(SearchDraw, RecognizesFiftyMoveRule) {
 
   // Eval should be close to 0 (draw)
   EXPECT_LE(std::abs(result.eval), 50);
+}
+
+TEST(SearchDraw, ReportsADrawnPvAsADrawAndTruncatesIt) {
+  // King, bishop and knight against a bare king is a forced win, but not
+  // within the fifty-move rule from here: the clock is at 95, so the best
+  // line runs into the draw before the mate arrives. The engine must report
+  // what the line is actually worth—nothing—and stop the line at the move
+  // that draws, rather than advertise a bishop and a knight it never cashes.
+  //
+  // This is also where the search's own score and the reported score are
+  // allowed to differ. Only the reported one is sanitised; the searched one
+  // stays as it was so it can centre the next aspiration window.
+  Position pos = parse("8/8/8/3k4/8/8/8/3BNK2 w - - 95 60");
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 6;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  EXPECT_EQ(result.eval, CENTIPAWN_DRAW);
+  ASSERT_FALSE(result.pv.empty());
+
+  // The PV ends exactly at the drawing move, not before and not after.
+  Position replayed = pos;
+  for (std::size_t i = 0; i < result.pv.size(); ++i) {
+    replayed.make_move(result.pv[i]);
+    const bool drawn = replayed.is_fifty_move_draw() || replayed.is_repetition_draw(0);
+    EXPECT_EQ(drawn, i + 1 == result.pv.size()) << "at PV index " << i;
+  }
 }
 
 TEST(SearchDraw, DISABLED_AvoidsStalemateWhenWinning) {
@@ -667,6 +699,233 @@ TEST(SearchLimits, RespectsNodeLimit) {
   EXPECT_LE(result.nodes, 600);
 }
 
+// -----------------------------------------------------------------------------
+// Soft and hard time limits
+// -----------------------------------------------------------------------------
+
+TEST(SearchTime, PlainTimeStillMeansBothLimits) {
+  // Every caller that has one number in mind keeps working: `time` fills in
+  // for whichever of the two was not named.
+  search::Limits both;
+  both.time = std::chrono::milliseconds{500};
+  EXPECT_EQ(both.soft_limit(), std::chrono::milliseconds{500});
+  EXPECT_EQ(both.hard_limit(), std::chrono::milliseconds{500});
+
+  search::Limits split;
+  split.soft_time = std::chrono::milliseconds{100};
+  split.hard_time = std::chrono::milliseconds{300};
+  EXPECT_EQ(split.soft_limit(), std::chrono::milliseconds{100});
+  EXPECT_EQ(split.hard_limit(), std::chrono::milliseconds{300});
+
+  const search::Limits none;
+  EXPECT_FALSE(none.soft_limit().has_value());
+  EXPECT_FALSE(none.hard_limit().has_value());
+}
+
+TEST(SearchTime, AbsurdClocksAreCappedBeforeTheyOverflow) {
+  // Budgets are compared against steady_clock::duration, which counts
+  // nanoseconds in a signed 64-bit integer. A limit of a few quintillion
+  // milliseconds—which a GUI is free to send—cannot be converted to one, and
+  // the wrap makes the engine stop instantly instead of thinking for ever.
+  search::Limits limits;
+  limits.time = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+
+  ASSERT_TRUE(limits.soft_limit().has_value());
+  ASSERT_TRUE(limits.hard_limit().has_value());
+  EXPECT_EQ(*limits.soft_limit(), search::MAX_TIME_LIMIT);
+  EXPECT_EQ(*limits.hard_limit(), search::MAX_TIME_LIMIT);
+
+  // The capped value survives the conversion the search actually performs.
+  const auto as_duration = std::chrono::steady_clock::duration{*limits.hard_limit()};
+  EXPECT_GT(as_duration.count(), 0);
+
+  search::Limits split;
+  split.soft_time = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+  split.hard_time = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+  EXPECT_EQ(*split.soft_limit(), search::MAX_TIME_LIMIT);
+  EXPECT_EQ(*split.hard_limit(), search::MAX_TIME_LIMIT);
+}
+
+TEST(SearchTime, SearchRunsCleanlyUnderAnAbsurdClock) {
+  // The arithmetic above is exercised for real here: under the sanitisers this
+  // is what catches a limit that wrapped on its way into the search.
+  Position pos = Position::startpos();
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = 4;
+  limits.time = std::chrono::milliseconds{9'000'000'000'000'000'000LL};
+
+  const auto result = search::search(pos, limits, reporter);
+
+  // A clock that large is no limit at all, so the depth bound is what stops it.
+  EXPECT_EQ(result.depth, 4);
+  EXPECT_FALSE(result.pv.empty());
+}
+
+TEST(SearchTime, SoftLimitNeverExceedsTheHardOne) {
+  // A soft limit past the hard one would promise time the search is not
+  // allowed to take, so the ceiling wins.
+  search::Limits limits;
+  limits.soft_time = std::chrono::milliseconds{900};
+  limits.hard_time = std::chrono::milliseconds{200};
+
+  EXPECT_EQ(limits.soft_limit(), std::chrono::milliseconds{200});
+  EXPECT_EQ(limits.hard_limit(), std::chrono::milliseconds{200});
+}
+
+TEST(SearchTime, RefusesAnIterationThatCannotFinish) {
+  using namespace std::chrono_literals;
+
+  // With headroom (soft < hard) the factor is 4. 40ms gone and a 60ms last
+  // iteration predicts 240ms more: 280ms in total, measured against the hard
+  // limit less the 5ms safety margin. The soft limit is set clear of the
+  // elapsed time so that only the affordability rule can answer here.
+  const auto soft = std::make_optional(100ms);
+  EXPECT_TRUE(search::detail::should_continue_deepening(40ms, 60ms, soft, 400ms));
+  EXPECT_FALSE(search::detail::should_continue_deepening(40ms, 60ms, soft, 250ms));
+
+  // Landing exactly on the deadline still counts as affordable:
+  // 40 + 4 x 40 = 200, against 205 - 5.
+  EXPECT_TRUE(search::detail::should_continue_deepening(40ms, 40ms, soft, 205ms));
+
+  // Without a hard limit there is nothing to be unable to afford.
+  EXPECT_TRUE(search::detail::should_continue_deepening(40ms, 10000ms, soft, std::nullopt));
+
+  // The first iteration has no predecessor to measure, so it is never refused.
+  EXPECT_TRUE(search::detail::should_continue_deepening(std::chrono::steady_clock::duration::zero(),
+                                                        std::chrono::steady_clock::duration::zero(),
+                                                        std::nullopt, 6ms));
+}
+
+TEST(SearchTime, StopsOnceTheSoftBudgetIsSpent) {
+  using namespace std::chrono_literals;
+  const auto generous_hard = std::make_optional(10000ms);
+
+  // Under the soft limit: keep going. Past it: stop, however much the hard
+  // limit would still allow.
+  EXPECT_TRUE(search::detail::should_continue_deepening(50ms, 1ms, std::make_optional(100ms),
+                                                        generous_hard));
+  EXPECT_FALSE(search::detail::should_continue_deepening(150ms, 1ms, std::make_optional(100ms),
+                                                         generous_hard));
+
+  // Neither limit set is an unbounded search: it never stops on time.
+  EXPECT_TRUE(search::detail::should_continue_deepening(
+      std::chrono::hours{1}, std::chrono::hours{1}, std::nullopt, std::nullopt));
+}
+
+TEST(SearchTime, IsMoreCautiousWhenThereIsNoHeadroom) {
+  using namespace std::chrono_literals;
+
+  // `go movetime` makes soft and hard the same number. An iteration that
+  // overruns is then killed outright instead of being absorbed by the
+  // headroom, so the same prediction has to clear a higher bar: 4x with
+  // headroom, 6x without.
+  //
+  // 100ms gone, last iteration 50ms. With headroom the prediction is 200ms
+  // (300ms in total); without, 300ms (400ms). A 395ms deadline—400ms less the
+  // 5ms safety margin—admits the first and refuses the second.
+  EXPECT_TRUE(
+      search::detail::should_continue_deepening(100ms, 50ms, std::make_optional(200ms), 400ms));
+  EXPECT_FALSE(
+      search::detail::should_continue_deepening(100ms, 50ms, std::make_optional(400ms), 400ms));
+}
+
+namespace {
+
+// Records the depth of the last iteration the search actually reported. An
+// iteration the clock abandons never reaches the reporter, so this is how far
+// the search really got.
+struct LastReportedDepth : search::Reporter {
+  std::uint8_t depth{0};
+  std::size_t reports{0};
+
+  void send(const search::Report& report) override {
+    depth = report.depth;
+    reports += 1;
+  }
+};
+
+} // namespace
+
+TEST(SearchTime, SoftLimitStopsBetweenIterations) {
+  // The soft limit is small and the hard limit is far away, so the only thing
+  // that can end this search is the between-iterations check—and that check
+  // only ever fires with a completed iteration in hand.
+  Position pos = Position::startpos();
+
+  LastReportedDepth reporter;
+  search::Limits limits;
+  limits.soft_time = std::chrono::milliseconds{100};
+  limits.hard_time = std::chrono::milliseconds{30000};
+
+  const auto started = std::chrono::steady_clock::now();
+  const auto result = search::search(pos, limits, reporter);
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_LT(elapsed, std::chrono::seconds{20}) << "the soft limit did not end the search";
+  EXPECT_GE(result.depth, 1);
+  EXPECT_FALSE(result.pv.empty()) << "stopping between iterations must leave a complete answer";
+
+  // Nothing was abandoned: what the search returns is exactly the last
+  // iteration it finished and reported.
+  EXPECT_EQ(result.depth, reporter.depth);
+}
+
+TEST(SearchTime, HardLimitCutsAnIterationShort) {
+  // soft == hard is what `go movetime` produces: no headroom, so the only
+  // thing that can end the search is the limit the stopper polls, and that one
+  // fires wherever in the tree the search happens to be.
+  //
+  // The discriminating fact is the depth. Given the same depth bound and no
+  // clock at all the search reports every iteration up to it; with the clock
+  // it does not get that far, and the iteration it was in the middle of is
+  // never reported and never returned.
+  Position pos = Position::startpos();
+
+  constexpr std::uint8_t DEPTH = 6;
+
+  LastReportedDepth without_clock;
+  search::Limits unclocked;
+  unclocked.depth = DEPTH;
+  search::search(pos, unclocked, without_clock);
+
+  LastReportedDepth with_clock;
+  search::Limits clocked;
+  clocked.depth = DEPTH;
+  clocked.soft_time = std::chrono::milliseconds{5};
+  clocked.hard_time = std::chrono::milliseconds{5};
+  const auto result = search::search(pos, clocked, with_clock);
+
+  ASSERT_EQ(without_clock.depth, DEPTH) << "the unclocked run must reach the depth bound";
+  EXPECT_LT(with_clock.depth, without_clock.depth) << "the clock did not cut the search short";
+  EXPECT_LT(with_clock.reports, without_clock.reports);
+
+  // Whatever it managed to finish is what it returns: an abandoned iteration
+  // never becomes the answer.
+  EXPECT_EQ(result.depth, with_clock.depth);
+}
+
+TEST(SearchLimits, NodeLimitHoldsInACaptureHeavyPosition) {
+  // Quiescence used to run without ever asking the stopper, so once the search
+  // dropped into a thicket of captures the node limit stopped applying: the
+  // capture tree ran to its natural end however many nodes that took. This
+  // position is nothing but captures—two full sets of pieces contesting the
+  // same central squares—so a quiescence search that does not poll overshoots
+  // by orders of magnitude.
+  Position pos = parse("r2q1rk1/pp2ppbp/2np1np1/2pP4/2P1PB2/2N2N2/PP2BPPP/R2Q1RK1 b - - 0 1");
+
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.nodes = 2000;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  // The stopper is only consulted every 256 nodes and the tree still has to
+  // unwind, so a small overshoot is expected and a large one is the bug.
+  EXPECT_LE(result.nodes, limits.nodes.value() + 256 + 64);
+}
+
 TEST(SearchLimits, StopSignalHalts) {
   Position pos = Position::startpos();
 
@@ -765,6 +1024,49 @@ TEST(SearchNodes, SearchesTheHashMoveExactlyOnce) {
   EXPECT_LT(report.nodes, 5U) << "the hash move was searched twice";
   ASSERT_FALSE(pv.empty());
   EXPECT_EQ(to_uci(pv[0]), "a6a7");
+}
+
+TEST(SearchNodes, CountsANodeAnsweredByTheTable) {
+  // A node whose score comes straight out of the table is still a node: we
+  // reached the position, probed for it, and returned an answer. Counting
+  // below the probe instead made every transposition cutoff invisible, so
+  // `go nodes N` sailed past N and the reported nps understated the search by
+  // exactly the amount the table was saving.
+  Position pos = parse("8/8/P7/8/8/8/5k2/7K w - - 0 1");
+
+  search::TranspositionTable tt;
+  search::KillerMoves killers;
+  search::Report report;
+  search::Stopper stopper;
+
+  // A deep exact score for this very position, so the probe answers at once.
+  // The zero window makes this a non-PV node, the only kind allowed to take
+  // a cutoff.
+  tt.store(pos.key, 10, 42, search::Bound::Exact, search::TT_NO_MOVE);
+
+  MoveList pv;
+  const int eval = search::detail::alphabeta(pos, 4, 0, 1, pv, tt, killers, report, stopper);
+
+  ASSERT_EQ(eval, 42) << "no cutoff happened, so this test measures nothing";
+  EXPECT_EQ(report.nodes, 1U) << "a transposition cutoff was counted as zero nodes";
+}
+
+TEST(SearchNodes, CountsADrawTerminal) {
+  // Same argument for a position the rules have already decided: no moves are
+  // searched, but we still visited it and still spent the draw tests on it.
+  Position pos = parse("8/8/8/8/8/3k4/8/R3K3 w - - 100 50");
+
+  search::TranspositionTable tt;
+  search::KillerMoves killers;
+  search::Report report;
+  search::Stopper stopper;
+
+  MoveList pv;
+  const int eval = search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers,
+                                             report, stopper);
+
+  ASSERT_EQ(eval, CENTIPAWN_DRAW);
+  EXPECT_EQ(report.nodes, 1U) << "a drawn terminal was counted as zero nodes";
 }
 
 TEST(SearchNodes, SkipsAHashMoveThatLeavesTheKingInCheck) {

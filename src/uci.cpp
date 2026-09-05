@@ -1,12 +1,14 @@
 #include "c3/uci.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -363,6 +365,37 @@ GoParams parse_go(const std::vector<std::string>& args, std::vector<std::string>
   return params;
 }
 
+// `bench [depth]`. Like `go`, this never throws: a depth we cannot read or
+// cannot honour is reported through `diagnostics` and replaced with something
+// workable, because refusing the whole command would just leave the user
+// staring at nothing.
+std::optional<std::uint8_t> parse_bench(const std::vector<std::string>& args,
+                                        std::vector<std::string>& diagnostics) {
+  if (args.empty()) {
+    return std::nullopt; // The default depth, chosen by the loop.
+  }
+
+  std::optional<std::uint8_t> depth;
+  try {
+    const auto requested = parse_u32_attr("depth", args[0]);
+    const auto clamped = std::clamp<std::uint32_t>(requested, 1, BENCH_MAX_DEPTH);
+
+    if (clamped != requested) {
+      diagnostics.push_back("bench depth " + args[0] + " is out of range, using " +
+                            std::to_string(clamped));
+    }
+    depth = static_cast<std::uint8_t>(clamped);
+  } catch (const std::exception& ex) {
+    diagnostics.push_back(std::string(ex.what()) + " (running bench at its default depth)");
+  }
+
+  if (args.size() > 1) {
+    diagnostics.emplace_back("bench takes only a depth, ignoring trailing tokens");
+  }
+
+  return depth;
+}
+
 SetOptionCommand parse_setoption(
     const std::vector<std::string>& args) { // NOLINT(readability-function-cognitive-complexity)
   if (args.empty() || args[0] != "name") {
@@ -477,6 +510,11 @@ UciCommand parse_command(const std::string& command) {
       throw std::runtime_error("invalid move");
     }
     result.move = mv;
+  } else if (head == "bench") {
+    // The depth is optional: `bench` on its own is the number people compare
+    // between builds, and `bench <depth>` is for a quicker or deeper run.
+    result.type = CommandType::Bench;
+    result.bench_depth = parse_bench(args, result.diagnostics);
   } else if (head == "position") {
     result.type = CommandType::Position;
     result.position = parse_position(args);
@@ -516,9 +554,12 @@ namespace {
 constexpr std::int64_t ASSUMED_MOVES_REMAINING = 30;
 
 // Fraction of the clock held back for protocol and GUI latency, plus a floor
-// so that even a tiny clock keeps a few milliseconds of slack. Note that the
-// search subtracts a further safety margin of its own (TIME_SAFETY_MARGIN,
-// 5ms) from whatever budget we hand it: the two reserves stack.
+// so that even a tiny clock keeps a few milliseconds of slack. A further
+// reserve stacks on top of this one, but only on the HARD limit: the search
+// subtracts search::TIME_SAFETY_MARGIN (5ms) from it before polling, because
+// that is the limit it can be caught mid-iteration by. The soft limit is
+// checked between iterations, where being a few milliseconds late costs
+// nothing, so it is used as-is.
 constexpr std::int64_t TIME_RESERVE_DIVISOR = 20;
 constexpr auto MINIMUM_TIME_RESERVE = std::chrono::milliseconds{50};
 
@@ -534,6 +575,16 @@ constexpr std::int64_t MOVES_TO_GO_CAP_DIVISOR = 2;
 // slow machine. The fallback move in the `go` handler is what actually
 // guarantees the reply; this floor only improves its quality.
 constexpr auto MINIMUM_ALLOCATED_TIME = std::chrono::milliseconds{10};
+
+// How far past the move's budget a single iteration may run before it is
+// abandoned. See calculate_time_budget for why the slack is worth having.
+//
+// This is the m in hard = m x soft. The search pairs it with
+// search::ITERATION_GROWTH_FACTOR (the k in "start another iteration only
+// while elapsed + k x last <= hard"), so the two together say what a move may
+// really spend: up to m times its soft budget, and only while the next ply is
+// predicted to cost less than what remains of that.
+constexpr std::int64_t HARD_TIME_MULTIPLIER = 3;
 
 } // namespace
 
@@ -570,6 +621,52 @@ calculate_allocated_time(std::chrono::milliseconds time_left,
 
   return std::max(std::chrono::milliseconds{allocated.count()},
                   std::min(MINIMUM_ALLOCATED_TIME, time_left));
+}
+
+// SOFT AND HARD BUDGET FOR ONE MOVE
+//
+//   soft = calculate_allocated_time(...)          "what this move is worth"
+//   hard = min(soft * 3, time_left - reserve)     "what we must not exceed"
+//
+// WHY THREE TIMES. The soft limit is an average, and averages are wrong on the
+// interesting moves: the iteration that finds a refutation, fails low and has
+// to re-search the whole root costs several times a quiet one. Cutting that
+// iteration off at the average throws away everything it has done and plays
+// the move it was in the middle of refuting. Three times the budget is enough
+// slack for that iteration to finish, while still being a hard stop—and what
+// we borrow here is not lost, because the next move's share is recomputed from
+// whatever is actually left on the clock.
+//
+// WHY THE CLOCK STILL WINS. Three times a healthy budget can exceed the whole
+// remaining clock in a time scramble, so the reserve-adjusted clock caps it.
+// The hard limit is never below the soft one: when the floor in
+// calculate_allocated_time has already raised soft above what the clock can
+// afford, there is nothing left to hold back and the two coincide.
+TimeBudget calculate_time_budget(std::chrono::milliseconds time_left,
+                                 std::optional<std::chrono::milliseconds> increment,
+                                 std::optional<std::uint32_t> moves_to_go) noexcept {
+  // Capped here as well as in Limits: UCI puts no bound on `wtime`, and a
+  // clock of a few quintillion milliseconds makes every number downstream of
+  // it meaningless. See search::MAX_TIME_LIMIT.
+  const auto soft = std::min(calculate_allocated_time(time_left, increment, moves_to_go)
+                                 .value_or(std::chrono::milliseconds{0}),
+                             search::MAX_TIME_LIMIT);
+
+  const auto reserve = std::max(time_left / TIME_RESERVE_DIVISOR, MINIMUM_TIME_RESERVE);
+  const auto affordable = time_left > reserve ? time_left - reserve : std::chrono::milliseconds{0};
+
+  // The multiplication is GUARDED rather than performed and then clamped. On
+  // an absurd clock `soft * 3` overflows a signed 64-bit millisecond count,
+  // which is undefined behaviour, and the value it produces in practice is
+  // negative—so the engine would read its budget as "no time at all" and come
+  // back with no move. When the product could not fit under `affordable`
+  // anyway, `affordable` is already the answer and there is nothing to compute.
+  const auto headroom = soft < affordable / HARD_TIME_MULTIPLIER
+                            ? std::min(soft * HARD_TIME_MULTIPLIER, affordable)
+                            : affordable;
+
+  return TimeBudget{.soft = soft,
+                    .hard = std::min(std::max(soft, headroom), search::MAX_TIME_LIMIT)};
 }
 
 // ---------------------------------------------------------------------------
@@ -790,24 +887,37 @@ struct SearchHandle {
   }
 };
 
-// Turns the clock half of a `go` command into a single search budget.
-std::optional<std::chrono::milliseconds> resolve_time_limit(const GoParams& params,
-                                                            Colour colour_to_move) {
+// Turns the clock half of a `go` command into the search's two time limits.
+//
+//   `infinite`, or a bare `depth`/`nodes` search: no clock at all. The GUI has
+//       named the bound itself, and inventing a deadline on top of it would
+//       silently answer a different question than the one asked.
+//   `movetime`: the GUI has said exactly how long to think, so there is
+//       nothing to manage—soft and hard are both that number.
+//   a clock: the allocation is what we mean to spend, with headroom above it
+//       for an iteration that turns out expensive (see calculate_time_budget).
+void apply_time_limits(search::Limits& limits, const GoParams& params, Colour colour_to_move) {
   if (params.infinite) {
-    return std::nullopt;
+    return;
   }
 
   if (params.movetime.has_value()) {
-    return params.movetime;
+    limits.soft_time = params.movetime;
+    limits.hard_time = params.movetime;
+    return;
   }
 
   const bool white = colour_to_move == Colour::White;
   const auto time_left = white ? params.wtime : params.btime;
   if (!time_left.has_value()) {
-    return std::nullopt;
+    return;
   }
 
-  return calculate_allocated_time(*time_left, white ? params.winc : params.binc, params.movestogo);
+  const auto budget =
+      calculate_time_budget(*time_left, white ? params.winc : params.binc, params.movestogo);
+
+  limits.soft_time = budget.soft;
+  limits.hard_time = budget.hard;
 }
 
 // Runs one search on `handle`'s thread and reports its result.
@@ -818,12 +928,23 @@ std::optional<std::chrono::milliseconds> resolve_time_limit(const GoParams& para
 // allocate its transposition table. Holding the first legal move of the root
 // position in reserve means the only way to answer `bestmove (none)` is the
 // honest one: there is no legal move at all (checkmate or stalemate).
+//
+// THE TABLE IS BORROWED, NOT OWNED. `tt` belongs to the loop's Engine and is
+// captured by reference so that what this search learns is still there for the
+// next move—the whole reason the table is persistent. Three things make that
+// safe, and all three are the caller's job:
+//   1. The Engine is declared BEFORE the SearchHandle in run_loop_impl, so the
+//      handle's destructor joins this thread while the table is still alive.
+//   2. Every command that could disturb the table (`ucinewgame`, `setoption
+//      name Hash`) stops the search first, on the main thread.
+//   3. Only one search thread exists at a time, so the table has exactly one
+//      writer.
 void start_search(SearchHandle& handle, const GoParams& params, const Position& root,
-                  std::ostream& out, std::mutex& out_mutex) {
+                  search::TranspositionTable& tt, std::ostream& out, std::mutex& out_mutex) {
   search::Limits limits;
   limits.depth = params.depth;
   limits.nodes = params.nodes;
-  limits.time = resolve_time_limit(params, root.colour_to_move);
+  apply_time_limits(limits, params, root.colour_to_move);
 
   const auto root_moves = legal_moves(root);
   const std::optional<UciMove> fallback_move =
@@ -833,8 +954,8 @@ void start_search(SearchHandle& handle, const GoParams& params, const Position& 
   auto gate = std::make_shared<SearchGate>();
   Position pos_copy = root;
 
-  handle.thread =
-      std::thread([pos_copy, limits, stop_signal, gate, fallback_move, &out, &out_mutex]() mutable {
+  handle.thread = std::thread(
+      [pos_copy, limits, stop_signal, gate, fallback_move, &tt, &out, &out_mutex]() mutable {
         // An exception escaping a std::thread calls std::terminate, so this body
         // swallows everything: a failed search costs us one move, a terminated
         // process costs us the game.
@@ -853,7 +974,7 @@ void start_search(SearchHandle& handle, const GoParams& params, const Position& 
 
           try {
             GatedUciReporter reporter(out, &out_mutex, *gate);
-            search::search(pos_copy, limits, reporter, stop_signal);
+            search::search(pos_copy, tt, limits, reporter, stop_signal);
             searched_move = reporter.best_move();
           } catch (const std::exception& ex) {
             // Most plausibly std::bad_alloc while sizing the transposition table
@@ -877,6 +998,99 @@ void start_search(SearchHandle& handle, const GoParams& params, const Position& 
   handle.gate = gate;
 }
 
+// ---------------------------------------------------------------------------
+// BENCH
+// ---------------------------------------------------------------------------
+// Twelve positions chosen to make the total node count mean something. A bench
+// dominated by one kind of position would only measure the search's behaviour
+// there, so the list spans what a game actually contains: the opening (where
+// the branching factor is highest), quiet middlegames, sharp tactical ones
+// (where the quiescence search does most of the work), and endgames (where the
+// tree is narrow and deep and the transposition table matters most).
+//
+// startpos and Kiwipete are in the list because they are the two positions
+// everyone recognises—if a bench looks wrong, they are the first thing to
+// check against by hand.
+//
+// The list is FIXED. Changing it changes the bench number, which is the one
+// thing the bench must not do for reasons unrelated to the search itself.
+// ---------------------------------------------------------------------------
+
+constexpr std::array<const char*, 12> BENCH_POSITIONS = {
+    // Opening: the start position, and a symmetrical closed opening.
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "rnbqkb1r/pp3ppp/4pn2/2pp4/3P4/2N1PN2/PPP2PPP/R1BQKB1R w KQkq - 0 6",
+    // Kiwipete and friends: dense middlegames full of captures and castling.
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    // Tactical: promotions, hanging pieces, forcing lines.
+    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    // Queenless middlegame: quiet, and dominated by piece activity.
+    "2r3k1/pp3pp1/4p2p/3nP3/3P4/P4N2/1P3PPP/2R3K1 w - - 0 25",
+    // Endgames: narrow and deep, where the table earns the most.
+    "8/8/4R3/5k2/8/8/4K3/6r1 w - - 0 50",
+    "8/8/8/4k3/8/4K3/4P3/8 w - - 0 60",
+    "8/5ppp/8/8/8/8/5PPP/4K1k1 w - - 0 45",
+};
+
+// Deep enough that the search does real work at every position, shallow enough
+// that a Release build finishes the whole list in a few seconds (measured at
+// roughly 2.4s; depth 9 was over 7s, which is too slow to run casually).
+constexpr std::uint8_t BENCH_DEFAULT_DEPTH = 8;
+
+// Runs the bench on the main thread and reports the total.
+//
+// The Engine's table is CLEARED before each position, which is the point: a
+// table still holding the previous position's results would make each search
+// cheaper by an amount that depends on the order of the list, and the total
+// would stop being reproducible. It is cleared once more at the end for the
+// same reason in reverse—bench is a measurement, and a measurement should not
+// leave its subject changed. Without that last clear the twelfth position's
+// results would sit in the table skewing whatever the session did next. The
+// engine's own game position is untouched throughout: bench searches copies.
+void run_bench(Engine& engine, std::uint8_t depth,
+               const std::function<void(const std::string&)>& write_line) {
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = depth;
+
+  std::uint64_t total_nodes = 0;
+  const auto started = std::chrono::steady_clock::now();
+
+  for (std::size_t i = 0; i < BENCH_POSITIONS.size(); ++i) {
+    engine.transposition_table().clear();
+
+    Position pos = Position::from_fen(BENCH_POSITIONS[i]);
+    const auto result =
+        search::search(pos, engine.transposition_table(), limits, reporter, nullptr);
+
+    total_nodes += result.nodes;
+
+    std::string line = "info string bench position " + std::to_string(i + 1) + "/" +
+                       std::to_string(BENCH_POSITIONS.size()) + " depth " +
+                       std::to_string(result.depth) + " nodes " + std::to_string(result.nodes);
+    if (!result.pv.empty()) {
+      line += " bestmove " + to_uci_string(to_uci_move(result.pv[0]));
+    }
+    write_line(line);
+  }
+
+  // Leave the table as bench found it, not full of the last position.
+  engine.transposition_table().clear();
+
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  const auto ms = std::max<std::int64_t>(elapsed.count(), 1);
+  const auto nps = total_nodes * 1000 / static_cast<std::uint64_t>(ms);
+
+  write_line("info string bench time " + std::to_string(ms) + " ms");
+  write_line("info string bench nodes " + std::to_string(total_nodes) + " nps " +
+             std::to_string(nps));
+}
+
 } // namespace
 
 namespace {
@@ -884,8 +1098,9 @@ void run_loop_impl(std::istream& in,
                    std::ostream& out) { // NOLINT(readability-function-cognitive-complexity)
   // DECLARATION ORDER MATTERS: locals are destroyed in reverse, so the search
   // handle (which joins the search thread) must be declared last. The thread
-  // writes to `out` while holding `out_mutex`; destroying either before the
-  // join would leave it writing through dead objects.
+  // writes to `out` while holding `out_mutex`, and it searches through the
+  // Engine's transposition table; destroying any of the three before the join
+  // would leave it working through dead objects.
   std::mutex out_mutex;
   Engine engine;
   SearchHandle search_handle;
@@ -988,7 +1203,15 @@ void run_loop_impl(std::istream& in,
           throw std::runtime_error("missing go parameters");
         }
         search_handle.stop();
-        start_search(search_handle, *cmd.go_params, engine.position(), out, out_mutex);
+        start_search(search_handle, *cmd.go_params, engine.position(), engine.transposition_table(),
+                     out, out_mutex);
+        break;
+
+      case CommandType::Bench:
+        // Runs on this thread and clears the table as it goes, so any search
+        // in flight has to be gone first.
+        search_handle.stop();
+        run_bench(engine, cmd.bench_depth.value_or(BENCH_DEFAULT_DEPTH), write_line);
         break;
 
       case CommandType::SetOption:
@@ -996,6 +1219,11 @@ void run_loop_impl(std::istream& in,
           throw std::runtime_error("missing option payload");
         }
         if (cmd.option->name == "hash") {
+          // Resizing frees the storage the running search is reading and
+          // writing, so the search has to be gone first—and it has to be gone
+          // before we touch the table, not merely asked to stop. stop() joins,
+          // so once it returns this thread is the table's only user.
+          search_handle.stop();
           engine.set_hash_size_mb(std::stoull(cmd.option->value.value()));
         }
         break;
@@ -1109,7 +1337,7 @@ std::string run_script_for_test(
       search::Limits limits;
       limits.depth = cmd.go_params->depth;
       limits.nodes = cmd.go_params->nodes;
-      limits.time = resolve_time_limit(*cmd.go_params, pos.colour_to_move);
+      apply_time_limits(limits, *cmd.go_params, pos.colour_to_move);
 
       search::Report report;
       search::Stopper stopper;
@@ -1138,11 +1366,15 @@ std::string run_script_for_test(
     }
 
     case CommandType::SetOption:
-      if (cmd.option->name == "hash" && cmd.option->value.has_value()) {
-        search::TranspositionTable::set_size_mb(std::stoull(*cmd.option->value));
-      }
+      // Nothing to do: this harness builds its own table for each `go`, so
+      // there is no persistent table whose size could be changed. The parser
+      // has already validated the value, which is all these tests check.
       break;
 
+    case CommandType::Bench:
+      // Not offered here: bench needs an Engine (for the table it clears
+      // between positions) and this harness only has a bare Position. The
+      // `UciLoop` tests drive the real loop, which is where bench lives.
     case CommandType::NoOp:
     case CommandType::Stop:
     case CommandType::Quit:
