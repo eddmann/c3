@@ -10,6 +10,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(C3_ENABLE_CLANG_TIDY "Run clang-tidy during builds" OFF)
 option(C3_BUILD_TESTS "Build the GoogleTest unit test suite" ON)
 option(C3_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+# Some Debug invariants are too expensive to check on every node (for example
+# rebuilding the incremental evaluation totals after each make/unmake). They
+# are compiled in only when this is ON, so the everyday sanitizer build stays
+# quick while a nightly or a suspicious bug hunt can still turn them on.
+option(C3_EXPENSIVE_ASSERTS "Enable slow Debug-only consistency checks" OFF)
 
 # ASan/UBSan are incompatible with MSVC debug runtime (-MDd) on Windows.
 # Disable sanitizers by default on Windows to avoid the conflict.
@@ -61,6 +66,9 @@ endif()
 
 function(c3_apply_standard_settings target)
   target_compile_features(${target} PUBLIC cxx_std_23)
+  if(C3_EXPENSIVE_ASSERTS)
+    target_compile_definitions(${target} PRIVATE C3_EXPENSIVE_ASSERTS)
+  endif()
   target_compile_options(${target} PRIVATE
     ${WARNING_FLAGS}
     $<$<CONFIG:Debug>:${SANITIZER_FLAGS}>
