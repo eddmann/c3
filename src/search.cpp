@@ -75,6 +75,34 @@ constexpr std::size_t MIN_SIZE_MB = TT_MIN_SIZE_MB;
 constexpr std::size_t MAX_SIZE_MB = TT_MAX_SIZE_MB;
 constexpr std::size_t DEFAULT_SIZE_MB = TT_DEFAULT_SIZE_MB;
 
+// A move is "quiet" when it neither captures nor promotes—nothing on the board
+// changes hands. Quiet moves are the ones killers, history, counter-moves,
+// futility pruning and late move reductions all talk about, because they are
+// the ones that look alike and the ones that are usually pointless.
+bool is_quiet(const Move& mv) {
+  return !mv.captured_piece.has_value() && !mv.promotion_piece.has_value();
+}
+
+// HOW MUCH A CUTOFF IS WORTH
+// A cutoff at depth 8 was expensive to find and speaks about a large subtree; a
+// cutoff at depth 1 is cheap and local. Scaling with depth squared says so, and
+// is the shape every engine settles on. The cap keeps a single very deep cutoff
+// from saturating an entry on its own, which would freeze that move at the
+// front of the quiet moves no matter what happened afterwards.
+constexpr int HISTORY_BONUS_SCALE = 16;
+constexpr int HISTORY_BONUS_CAP = 1'200;
+
+int history_bonus(std::uint8_t depth) {
+  const int d = depth;
+  return std::min(HISTORY_BONUS_SCALE * d * d, HISTORY_BONUS_CAP);
+}
+
+// How many quiet moves a node remembers for the history malus. A node that has
+// searched more than this before finding a cutoff has bigger problems than the
+// exactness of its bookkeeping, and the array keeps the recursion's stack
+// frames small.
+constexpr std::size_t MAX_PENALISED_QUIETS = 32;
+
 // Check if a side has any pieces besides pawns.
 // Used in null-move pruning: don't prune in pawn-only endgames (zugzwang risk).
 bool has_non_pawn_material(const Board& board, Colour colour) {
@@ -467,6 +495,53 @@ void KillerMoves::store(std::uint8_t ply, const Move& mv) {
 }
 
 // ---------------------------------------------------------------------------
+// History heuristic
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::size_t history_colour_index(const Move& mv) {
+  return static_cast<std::size_t>(colour(mv.piece));
+}
+
+} // namespace
+
+int HistoryTable::probe(const Move& mv) const {
+  return scores_[history_colour_index(mv)][mv.from.index()][mv.to.index()];
+}
+
+void HistoryTable::update(const Move& mv, int bonus) {
+  // A bonus larger than the ceiling would make the gravity term overshoot and
+  // push the score the wrong way, so it is clamped before anything else.
+  const int clamped = std::clamp(bonus, -HISTORY_MAX, HISTORY_MAX);
+  int& score = scores_[history_colour_index(mv)][mv.from.index()][mv.to.index()];
+
+  // The gravity term: nothing while the score is small, exactly -bonus once the
+  // score reaches HISTORY_MAX. See the header for why this shape is wanted.
+  score += clamped - ((score * std::abs(clamped)) / HISTORY_MAX);
+}
+
+void HistoryTable::clear() {
+  for (auto& by_colour : scores_) {
+    for (auto& by_from : by_colour) {
+      by_from.fill(0);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Counter moves
+// ---------------------------------------------------------------------------
+
+std::optional<Move> CounterMoves::probe(const Move& previous) const {
+  return moves_[static_cast<std::size_t>(previous.piece)][previous.to.index()];
+}
+
+void CounterMoves::store(const Move& previous, const Move& refutation) {
+  moves_[static_cast<std::size_t>(previous.piece)][previous.to.index()] = refutation;
+}
+
+// ---------------------------------------------------------------------------
 // Mate score normalisation
 // ---------------------------------------------------------------------------
 
@@ -504,7 +579,9 @@ int eval_out(int eval, std::uint8_t ply) {
 //   3. Killer 1           the quiet move that most recently caused a cutoff
 //                         at this ply
 //   4. Killer 2           the one before it
-//   5. Everything else    the quiet moves
+//   5. Counter-move       the quiet move that last refuted the move the
+//                         opponent has just played
+//   6. Everything else    quiet moves, ranked by their history score
 //
 // MVV-LVA: MOST VALUABLE VICTIM, LEAST VALUABLE ATTACKER
 // The best captures tend to be high-value pieces taken by low-value ones. PxQ
@@ -581,6 +658,11 @@ constexpr int ORDER_HASH_MOVE = 100'000'000;
 constexpr int ORDER_NOISY = 1'000'000;
 constexpr int ORDER_KILLER_1 = 900'000;
 constexpr int ORDER_KILLER_2 = 800'000;
+constexpr int ORDER_COUNTER_MOVE = 700'000;
+
+// Quiet moves are ranked by history alone, which saturates at ±HISTORY_MAX and
+// so can never climb into the counter-move band above.
+static_assert(HISTORY_MAX < ORDER_COUNTER_MOVE, "history must not outrank a counter-move");
 
 // The busiest legal position anyone has constructed offers 218 moves, and 256
 // is the round number engines conventionally allow for. Nothing is written past
@@ -591,14 +673,13 @@ constexpr std::size_t MAX_SCORED_MOVES = MOVE_LIST_RESERVE;
 class OrderedMoves {
 public:
   // Main search: the full priority list above.
-  OrderedMoves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
-               const std::optional<Move>& hash_move)
-      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)) {
-    const auto killer1 = killers.probe(ply, 0);
-    const auto killer2 = killers.probe(ply, 1);
-
+  OrderedMoves(MoveList& moves, const SearchContext& ctx, std::uint8_t ply,
+               const std::optional<Move>& hash_move, const std::optional<Move>& previous_move)
+      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)),
+        killer1_(ctx.killers.probe(ply, 0)), killer2_(ctx.killers.probe(ply, 1)),
+        counter_(previous_move.has_value() ? ctx.counters.probe(*previous_move) : std::nullopt) {
     for (std::size_t i = 0; i < scored_; ++i) {
-      scores_[i] = score(moves_[i], hash_move, killer1, killer2);
+      scores_[i] = score(moves_[i], ctx.history, hash_move);
     }
   }
 
@@ -609,6 +690,14 @@ public:
     for (std::size_t i = 0; i < scored_; ++i) {
       scores_[i] = noisy_move_score(moves_[i]);
     }
+  }
+
+  // The quiet moves this node has specific reason to believe in. Reductions
+  // leave them alone: they are the moves most likely to be the exception that
+  // a reduced search would miss.
+  [[nodiscard]] bool is_refutation(const Move& mv) const {
+    return (killer1_.has_value() && mv == *killer1_) || (killer2_.has_value() && mv == *killer2_) ||
+           (counter_.has_value() && mv == *counter_);
   }
 
   // Hand over the best move not yet searched, swapping it into `index` so that
@@ -635,31 +724,42 @@ public:
   }
 
 private:
-  static int score(const Move& mv, const std::optional<Move>& hash_move,
-                   const std::optional<Move>& killer1, const std::optional<Move>& killer2) {
+  int score(const Move& mv, const HistoryTable& history,
+            const std::optional<Move>& hash_move) const {
     // The hash move is the best move a previous (usually deeper) search found
     // here, so nothing outranks it—not even a queen capture.
     if (hash_move.has_value() && mv == *hash_move) {
       return ORDER_HASH_MOVE;
     }
 
-    if (mv.captured_piece.has_value() || mv.promotion_piece.has_value()) {
+    if (!is_quiet(mv)) {
       return ORDER_NOISY + noisy_move_score(mv);
     }
 
-    if (killer1.has_value() && mv == *killer1) {
+    if (killer1_.has_value() && mv == *killer1_) {
       return ORDER_KILLER_1;
     }
 
-    if (killer2.has_value() && mv == *killer2) {
+    if (killer2_.has_value() && mv == *killer2_) {
       return ORDER_KILLER_2;
     }
 
-    return 0;
+    if (counter_.has_value() && mv == *counter_) {
+      return ORDER_COUNTER_MOVE;
+    }
+
+    // Everything left is a quiet move with nothing special about it, and
+    // history is the only thing that distinguishes one from another. A move
+    // that has been failing is ranked BELOW an untried one, which is the whole
+    // point of the malus.
+    return history.probe(mv);
   }
 
   MoveList& moves_;
   std::size_t scored_;
+  std::optional<Move> killer1_{};
+  std::optional<Move> killer2_{};
+  std::optional<Move> counter_{};
   // Deliberately left uninitialised: entries [0, scored_) are written by the
   // constructor before anything reads them, and zeroing a kilobyte at every
   // node would cost more than the ordering it serves.
@@ -668,12 +768,13 @@ private:
 
 } // namespace
 
-void detail::order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
-                         const std::optional<Move>& hash_move) {
+void detail::order_moves(MoveList& moves, const SearchContext& ctx, std::uint8_t ply,
+                         const std::optional<Move>& hash_move,
+                         const std::optional<Move>& previous_move) {
   // The eager form: run the lazy selection all the way to the end. The search
   // itself never calls this—it asks for one move at a time and usually stops
   // after the first—but "the whole list, in order" is what a test can read.
-  OrderedMoves ordering(moves, killers, ply, hash_move);
+  OrderedMoves ordering(moves, ctx, ply, hash_move, previous_move);
   for (std::size_t i = 0; i < moves.size(); ++i) {
     ordering.select(i);
   }
@@ -786,8 +887,8 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
-                      TranspositionTable& tt, KillerMoves& killers, Report& report,
-                      const Stopper& stopper) {
+                      TranspositionTable& tt, SearchContext& ctx, Report& report,
+                      const Stopper& stopper, const std::optional<Move>& previous_move) {
   // Check if we should stop searching (time limit, node limit, external signal)
   if (stopper.should_stop(report)) {
     return 0;
@@ -887,8 +988,10 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     const int r = depth > 6 ? 3 : 2; // Deeper positions allow more reduction
     MoveList scratch;
     // Zero-window search: just checking if score >= beta
+    // No previous move to answer: we did not make one. A counter-move keyed by
+    // the opponent's last real move would be answering the wrong question.
     const int null_eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - r - 1), -beta,
-                                     -beta + 1, scratch, tt, killers, report, stopper);
+                                     -beta + 1, scratch, tt, ctx, report, stopper, std::nullopt);
 
     report.ply -= 1;
     pos.unmake_null_move();
@@ -929,13 +1032,19 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // search is finding would make us search the same move twice.
   const std::optional<Move> hash_move = decode_tt_move(hash_move_packed, moves);
 
-  OrderedMoves ordering(moves, killers, report.ply, hash_move);
+  OrderedMoves ordering(moves, ctx, report.ply, hash_move, previous_move);
 
   bool has_searched_one = false;
   Bound tt_bound = Bound::Upper;
 
   // The best move THIS search finds, kept apart from `hash_move` above.
   std::optional<Move> best_move = std::nullopt;
+
+  // The quiet moves searched here so far. If one of the moves after them causes
+  // a cutoff, these are the ones that were tried first and did not work, and
+  // history wants to hear about it.
+  std::array<Move, MAX_PENALISED_QUIETS> searched_quiets{};
+  std::size_t searched_quiet_count = 0;
 
   // The hash move is simply the first move the ordering hands over, so it goes
   // through the same loop as everything else: same legality check, same PVS
@@ -954,8 +1063,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // At shallow depths, skip quiet moves that can't possibly raise alpha.
     // Don't prune captures, promotions, or when in check.
     // Only prune after first move to avoid falsely returning stalemate.
-    if (has_searched_one && depth <= FUTILITY_DEPTH && !in_check &&
-        !mv.captured_piece.has_value() && !mv.promotion_piece.has_value() &&
+    if (has_searched_one && depth <= FUTILITY_DEPTH && !in_check && is_quiet(mv) &&
         static_eval + FUTILITY_MARGIN[depth] <= alpha) {
       pos.unmake_move(mv);
       continue;
@@ -977,17 +1085,17 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       MoveList zero_window_pv;
       // Zero-window: just checking if move can beat alpha
       eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
-                        zero_window_pv, tt, killers, report, stopper);
+                        zero_window_pv, tt, ctx, report, stopper, mv);
 
       // Re-search with full window if zero-window found a potential improvement
       if (eval > alpha && eval < beta) {
         eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
-                          killers, report, stopper);
+                          ctx, report, stopper, mv);
       }
     } else {
       // First move: search with full window
-      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
-                        killers, report, stopper);
+      eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt, ctx,
+                        report, stopper, mv);
     }
 
     report.ply -= 1;
@@ -995,9 +1103,26 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
     // BETA CUTOFF: This move is too good—opponent won't allow this position
     if (eval >= beta) {
-      // Store quiet moves that cause cutoffs as "killer moves"
-      if (!mv.captured_piece.has_value() && !mv.promotion_piece.has_value()) {
-        killers.store(report.ply, mv);
+      // A quiet move that causes a cutoff is the only kind worth remembering.
+      // Captures need no help: MVV-LVA already ranks them, and recording them
+      // here would crowd out the quiet moves these tables exist to rescue from
+      // the back of the list.
+      if (is_quiet(mv)) {
+        ctx.killers.store(report.ply, mv);
+
+        const int bonus = history_bonus(depth);
+        ctx.history.update(mv, bonus);
+
+        // ...and the quiet moves that were searched before it are evidence
+        // against themselves: they were ranked ahead of the move that actually
+        // worked, and the malus is what moves them back.
+        for (std::size_t q = 0; q < searched_quiet_count; ++q) {
+          ctx.history.update(searched_quiets[q], -bonus);
+        }
+
+        if (previous_move.has_value()) {
+          ctx.counters.store(*previous_move, mv);
+        }
       }
 
       // Store in TT as a lower bound (actual score might be even higher)
@@ -1015,6 +1140,11 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       pv.clear();
       pv.push_back(mv);
       pv.insert(pv.end(), child_pv.begin(), child_pv.end());
+    }
+
+    if (is_quiet(mv) && searched_quiet_count < searched_quiets.size()) {
+      searched_quiets[searched_quiet_count] = mv;
+      ++searched_quiet_count;
     }
 
     has_searched_one = true;
@@ -1038,6 +1168,18 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   }
 
   return alpha;
+}
+
+int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
+                      TranspositionTable& tt, KillerMoves& killers, Report& report,
+                      const Stopper& stopper) {
+  SearchContext ctx;
+  ctx.killers = killers;
+
+  const int eval = alphabeta(pos, depth, alpha, beta, pv, tt, ctx, report, stopper);
+
+  killers = ctx.killers;
+  return eval;
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,7 +1218,10 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
   // candidates for replacement as this search fills the table.
   tt.new_search();
 
-  KillerMoves killers;
+  // Everything this search learns about move ordering, built here and thrown
+  // away on return. See SearchContext in the header for why it does not outlive
+  // one search the way the transposition table does.
+  SearchContext ctx;
   Report report;
 
   const std::uint8_t max_depth = limits.depth.has_value() ? *limits.depth : MAX_DEPTH;
@@ -1131,7 +1276,7 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
       // could report a mixture of two different searches.
       pv.clear();
 
-      const int eval = detail::alphabeta(pos, depth, alpha, beta, pv, tt, killers, report, stopper);
+      const int eval = detail::alphabeta(pos, depth, alpha, beta, pv, tt, ctx, report, stopper);
 
       // Accept result if: within bounds, stopped, or already using full window
       // (full window means we can't widen further, so accept whatever we get)

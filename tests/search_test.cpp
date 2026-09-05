@@ -89,12 +89,12 @@ TEST(SearchOrdering, OrdersMvvLvaAndKillers) {
                     knight_cap_rook,
                     knight_cap_knight};
 
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   const std::uint8_t ply = 0;
-  killers.store(ply, killer2);
-  killers.store(ply, killer1);
+  ctx.killers.store(ply, killer2);
+  ctx.killers.store(ply, killer1);
 
-  search::detail::order_moves(moves, killers, ply);
+  search::detail::order_moves(moves, ctx, ply);
 
   const MoveList expected = {pawn_cap_queen,    knight_cap_queen,  knight_cap_rook,
                              knight_cap_bishop, knight_cap_knight, pawn_cap_pawn,
@@ -113,12 +113,12 @@ TEST(SearchOrdering, PutsTheHashMoveAheadOfEverything) {
 
   MoveList moves = {quiet, killer, pawn_cap_queen};
 
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   const std::uint8_t ply = 0;
-  killers.store(ply, killer);
+  ctx.killers.store(ply, killer);
 
   // A previous search already proved a move best here; it outranks even PxQ.
-  search::detail::order_moves(moves, killers, ply, quiet);
+  search::detail::order_moves(moves, ctx, ply, quiet);
 
   ASSERT_EQ(moves.size(), 3U);
   EXPECT_EQ(moves[0], quiet);
@@ -173,6 +173,195 @@ TEST(SearchOrdering, QuiescencePrefersQueenPromotions) {
   EXPECT_LT(position_of(capture_promote_queen), position_of(capture_promote_knight));
   EXPECT_LT(position_of(promote_queen), position_of(promote_rook));
   EXPECT_LT(position_of(promote_rook), position_of(promote_knight));
+}
+
+TEST(SearchOrdering, TriesTheCounterMoveAfterTheKillers) {
+  const auto previous = make_move(Piece::BN, "g8", "f6");
+  const auto counter = make_move(Piece::WP, "e4", "e5");
+  const auto killer1 = make_move(Piece::WP, "a2", "a3");
+  const auto killer2 = make_move(Piece::WP, "b2", "b3");
+  const auto quiet = make_move(Piece::WP, "c2", "c3");
+  const auto capture = make_move(Piece::WN, "f4", "d5", Piece::BQ);
+
+  MoveList moves = {quiet, counter, killer2, killer1, capture};
+
+  search::SearchContext ctx;
+  const std::uint8_t ply = 0;
+  ctx.killers.store(ply, killer2);
+  ctx.killers.store(ply, killer1);
+  ctx.counters.store(previous, counter);
+
+  search::detail::order_moves(moves, ctx, ply, std::nullopt, previous);
+
+  const MoveList expected = {capture, killer1, killer2, counter, quiet};
+  ASSERT_EQ(moves.size(), expected.size());
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    EXPECT_EQ(moves[i], expected[i]) << "index " << i;
+  }
+}
+
+TEST(SearchOrdering, RanksQuietMovesByHistory) {
+  const auto proven = make_move(Piece::WR, "d1", "d2");
+  const auto untried = make_move(Piece::WR, "d1", "d3");
+  const auto discredited = make_move(Piece::WR, "d1", "d4");
+
+  MoveList moves = {discredited, untried, proven};
+
+  search::SearchContext ctx;
+  ctx.history.update(proven, 800);
+  ctx.history.update(discredited, -800);
+
+  search::detail::order_moves(moves, ctx, 0);
+
+  const MoveList expected = {proven, untried, discredited};
+  ASSERT_EQ(moves.size(), expected.size());
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    EXPECT_EQ(moves[i], expected[i]) << "index " << i;
+  }
+}
+
+// History heuristic and counter-moves -------------------------------------------
+
+TEST(SearchHistory, GravityMakesScoresSaturateInsteadOfRunningAway) {
+  search::HistoryTable history;
+  const auto mv = make_move(Piece::WN, "g1", "f3");
+
+  int previous = 0;
+  for (int i = 0; i < 1'000; ++i) {
+    history.update(mv, 1'200);
+    const int score = history.probe(mv);
+    EXPECT_GE(score, previous) << "a bonus must never lower a score";
+    EXPECT_LE(score, search::HISTORY_MAX) << "gravity must cap the score";
+    previous = score;
+  }
+
+  EXPECT_GT(previous, search::HISTORY_MAX / 2) << "repeated cutoffs should still add up";
+
+  // A malus is the same update with the sign flipped, so it pulls back down.
+  history.update(mv, -1'200);
+  EXPECT_LT(history.probe(mv), previous);
+
+  // e2-e4 is a white move; the same square pair for Black is a different entry.
+  const auto same_squares_for_black = make_move(Piece::BN, "g1", "f3");
+  EXPECT_EQ(history.probe(same_squares_for_black), 0);
+
+  history.clear();
+  EXPECT_EQ(history.probe(mv), 0);
+}
+
+TEST(SearchHistory, RewardsTheQuietMoveThatCausedACutoff) {
+  // Nothing to capture and nothing to promote, so whichever move causes the
+  // cutoff is certain to be a quiet one.
+  Position pos = parse("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1");
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  // The move the search will try first, ordered by the same empty context the
+  // search itself starts from.
+  MoveList moves = pseudo_legal_moves(pos);
+  search::detail::order_moves(moves, ctx, 0);
+  ASSERT_FALSE(moves.empty());
+  const Move first_searched = moves[0];
+  ASSERT_EQ(ctx.history.probe(first_searched), 0);
+
+  // A beta at the very bottom of the scale means the first move searched fails
+  // high immediately, so the move that causes the cutoff is one we can name.
+  search::detail::alphabeta(pos, 2, CENTIPAWN_MIN, CENTIPAWN_MIN + 1, pv, tt, ctx, report, stopper);
+
+  EXPECT_GT(ctx.history.probe(first_searched), 0);
+}
+
+TEST(SearchHistory, PenalisesQuietMovesTriedBeforeTheCutoff) {
+  // Deep enough that quiet moves are doing the refuting: a shallow search of a
+  // sharp position cuts off almost entirely on captures, which history ignores.
+  Position pos = Position::startpos();
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  // Every quiet cutoff rewards one move and penalises the quiet moves that were
+  // tried before it, so a search of any size leaves both signs in the table.
+  // The exact numbers belong to the shape of the search and are not worth
+  // pinning; that negatives appear at all is what says the malus is applied.
+  int rewarded = 0;
+  int penalised = 0;
+  for (const auto piece : {Piece::WP, Piece::BP}) {
+    for (std::uint8_t from = 0; from < 64; ++from) {
+      for (std::uint8_t to = 0; to < 64; ++to) {
+        const Move probe{
+            .piece = piece,
+            .from = Square::from_index(from),
+            .to = Square::from_index(to),
+        };
+        const int score = ctx.history.probe(probe);
+        if (score > 0) {
+          ++rewarded;
+        } else if (score < 0) {
+          ++penalised;
+        }
+      }
+    }
+  }
+
+  EXPECT_GT(rewarded, 0) << "a quiet cutoff must reward the move that caused it";
+  EXPECT_GT(penalised, 0) << "the quiet moves tried before it must be penalised";
+}
+
+TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
+  search::CounterMoves counters;
+  const auto previous = make_move(Piece::BP, "d7", "d5");
+  const auto refutation = make_move(Piece::WP, "e4", "e5");
+
+  EXPECT_FALSE(counters.probe(previous).has_value());
+
+  counters.store(previous, refutation);
+  EXPECT_EQ(counters.probe(previous), refutation);
+
+  // Only the moved piece and where it landed are the key: the same pawn
+  // arriving on d5 from d6 asks the same question.
+  const auto same_arrival = make_move(Piece::BP, "d6", "d5");
+  EXPECT_EQ(counters.probe(same_arrival), refutation);
+
+  // A different piece landing there does not.
+  const auto other_piece = make_move(Piece::BN, "f6", "d5");
+  EXPECT_FALSE(counters.probe(other_piece).has_value());
+}
+
+TEST(SearchCounterMoves, ASearchFillsTheTable) {
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  int recorded = 0;
+  for (const auto piece : all_pieces()) {
+    for (std::uint8_t to = 0; to < 64; ++to) {
+      const Move probe{
+          .piece = piece,
+          .from = Square::from_index(0),
+          .to = Square::from_index(to),
+      };
+      if (ctx.counters.probe(probe).has_value()) {
+        ++recorded;
+      }
+    }
+  }
+
+  EXPECT_GT(recorded, 0) << "quiet cutoffs should leave counter-moves behind";
 }
 
 // Transposition table layout, move packing and replacement ---------------------
@@ -379,7 +568,7 @@ TEST(NullMove, StoresLowerBoundOnFailHigh) {
   Position pos = parse("6k1/8/8/8/8/8/4Q3/4K3 w - - 0 1");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
@@ -387,7 +576,7 @@ TEST(NullMove, StoresLowerBoundOnFailHigh) {
   const int beta = 50;
   const int alpha = -CENTIPAWN_MAX;
 
-  const int eval = search::detail::alphabeta(pos, 4, alpha, beta, pv, tt, killers, report, stopper);
+  const int eval = search::detail::alphabeta(pos, 4, alpha, beta, pv, tt, ctx, report, stopper);
 
   const auto* const entry = tt.probe(pos.key);
   ASSERT_NE(entry, nullptr);
@@ -406,12 +595,12 @@ TEST(NullMove, DoesNotEraseAnExistingBestMove) {
   const auto known_best = make_move(Piece::WQ, "e2", "e7");
   tt.store(pos.key, 2, 100, search::Bound::Exact, search::encode_tt_move(known_best));
 
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
   MoveList pv;
-  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, 50, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, 50, pv, tt, ctx, report, stopper);
 
   const auto* const entry = tt.probe(pos.key);
   ASSERT_NE(entry, nullptr);
@@ -431,13 +620,13 @@ TEST(NullMove, NeverStoresAMateScoreFromPassing) {
   Position pos = parse("R6k/8/6K1/8/8/8/8/8 w - - 0 1");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
   MoveList pv;
   const int beta = 50;
-  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, beta, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 4, -CENTIPAWN_MAX, beta, pv, tt, ctx, report, stopper);
 
   const auto* const entry = tt.probe(pos.key);
   if (entry != nullptr) {
@@ -468,14 +657,14 @@ TEST(TranspositionTable, NonPvNodesTakeCutoffsFromEveryBoundType) {
 
   for (const auto& scenario : cases) {
     search::TranspositionTable tt;
-    search::KillerMoves killers;
+    search::SearchContext ctx;
     search::Report report;
     search::Stopper stopper;
 
     tt.store(pos.key, 5, scenario.score, scenario.bound, search::TT_NO_MOVE);
 
     MoveList pv;
-    const int eval = search::detail::alphabeta(pos, 3, 0, 1, pv, tt, killers, report, stopper);
+    const int eval = search::detail::alphabeta(pos, 3, 0, 1, pv, tt, ctx, report, stopper);
 
     EXPECT_EQ(eval, scenario.expected) << scenario.name;
     // One node: the cutoff node itself, which we did enter and did decide.
@@ -488,14 +677,14 @@ TEST(TranspositionTable, PvNodesRefuseTheCutoffAndSearchAnyway) {
   Position pos = Position::startpos();
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
   tt.store(pos.key, 5, 123, search::Bound::Exact, search::TT_NO_MOVE);
 
   MoveList pv;
-  search::detail::alphabeta(pos, 3, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 3, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   EXPECT_GT(report.nodes, 0U) << "a PV node must search so that it has a line to report";
   EXPECT_FALSE(pv.empty());
@@ -1010,14 +1199,14 @@ TEST(SearchLimits, StoresNothingFromAnAbortedSearch) {
   Position pos = Position::startpos();
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
 
   search::Stopper stopper;
   stopper.at_nodes(200); // Far fewer nodes than a depth-6 search needs
 
   MoveList pv;
-  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   ASSERT_TRUE(stopper.has_stopped()) << "test needs a search that actually aborts";
   EXPECT_EQ(tt.probe(pos.key), nullptr) << "aborted search wrote a fabricated score for the root";
@@ -1042,7 +1231,7 @@ TEST(SearchNodes, SearchesTheHashMoveExactlyOnce) {
   Position pos = parse("8/8/P7/8/8/8/5k2/7K w - - 0 1");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
@@ -1052,7 +1241,7 @@ TEST(SearchNodes, SearchesTheHashMoveExactlyOnce) {
   tt.store(pos.key, 0, 0, search::Bound::Exact, search::encode_tt_move(hash_move));
 
   MoveList pv;
-  search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   EXPECT_LT(report.nodes, 5U) << "the hash move was searched twice";
   ASSERT_FALSE(pv.empty());
@@ -1068,7 +1257,7 @@ TEST(SearchNodes, CountsANodeAnsweredByTheTable) {
   Position pos = parse("8/8/P7/8/8/8/5k2/7K w - - 0 1");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
@@ -1078,7 +1267,7 @@ TEST(SearchNodes, CountsANodeAnsweredByTheTable) {
   tt.store(pos.key, 10, 42, search::Bound::Exact, search::TT_NO_MOVE);
 
   MoveList pv;
-  const int eval = search::detail::alphabeta(pos, 4, 0, 1, pv, tt, killers, report, stopper);
+  const int eval = search::detail::alphabeta(pos, 4, 0, 1, pv, tt, ctx, report, stopper);
 
   ASSERT_EQ(eval, 42) << "no cutoff happened, so this test measures nothing";
   EXPECT_EQ(report.nodes, 1U) << "a transposition cutoff was counted as zero nodes";
@@ -1090,13 +1279,13 @@ TEST(SearchNodes, CountsADrawTerminal) {
   Position pos = parse("8/8/8/8/8/3k4/8/R3K3 w - - 100 50");
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
   MoveList pv;
-  const int eval = search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers,
-                                             report, stopper);
+  const int eval =
+      search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   ASSERT_EQ(eval, CENTIPAWN_DRAW);
   EXPECT_EQ(report.nodes, 1U) << "a drawn terminal was counted as zero nodes";
@@ -1116,7 +1305,7 @@ TEST(SearchNodes, SkipsAHashMoveThatLeavesTheKingInCheck) {
   const auto fen_before = pos.to_fen();
 
   search::TranspositionTable tt;
-  search::KillerMoves killers;
+  search::SearchContext ctx;
   search::Report report;
   search::Stopper stopper;
 
@@ -1124,7 +1313,7 @@ TEST(SearchNodes, SkipsAHashMoveThatLeavesTheKingInCheck) {
   tt.store(pos.key, 0, 0, search::Bound::Exact, search::encode_tt_move(into_check));
 
   MoveList pv;
-  search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, killers, report, stopper);
+  search::detail::alphabeta(pos, 1, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   EXPECT_LE(report.nodes, 3U) << "an illegal hash move was searched anyway";
   EXPECT_EQ(pos.to_fen(), fen_before) << "an unvalidated hash move corrupted the board";

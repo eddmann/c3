@@ -32,24 +32,32 @@
 //      time re-evaluating identical positions. The table lives longer than a
 //      single search so that knowledge carries over from move to move.
 //
-//   3. KILLER MOVES
-//      Track quiet moves that caused beta cutoffs at each ply. These moves
-//      are likely good in sibling nodes too, so try them early.
+//   3. MOVE ORDERING
+//      Alpha-beta's saving depends almost entirely on searching the best move
+//      first. Moves are scored once—hash move, then captures by MVV-LVA, then
+//      killers, counter-moves and history—and picked one at a time, because a
+//      node that cuts off never looks at the rest of the list.
 //
-//   4. QUIESCENCE SEARCH
+//   4. KILLER MOVES, HISTORY AND COUNTER-MOVES
+//      Three ways of remembering which QUIET moves have been causing beta
+//      cutoffs: killers per ply, history per from/to square pair, and one
+//      counter-move per move the opponent just made. Quiet moves are otherwise
+//      indistinguishable from each other, and these are what tells them apart.
+//
+//   5. QUIESCENCE SEARCH
 //      At leaf nodes, don't just evaluate—keep searching captures until the
 //      position is "quiet". This avoids the "horizon effect" where we stop
 //      searching just before a piece gets captured.
 //
-//   5. NULL-MOVE PRUNING
+//   6. NULL-MOVE PRUNING
 //      If doing nothing (passing) still gives a good score, the position is
 //      probably winning and we can prune aggressively.
 //
-//   6. ASPIRATION WINDOWS
+//   7. ASPIRATION WINDOWS
 //      Use narrow alpha-beta windows based on the previous iteration's score.
 //      If the score is stable, this drastically reduces the search tree.
 //
-//   7. FUTILITY PRUNING
+//   8. FUTILITY PRUNING
 //      At shallow depths, skip quiet moves that can't possibly improve alpha.
 //      If static_eval + margin < alpha, the move won't help—prune it.
 //
@@ -392,6 +400,114 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// History Heuristic
+// ---------------------------------------------------------------------------
+// Killers remember the last two quiet moves that refuted something AT ONE PLY.
+// The history heuristic is the same idea with the ply forgotten: a "butterfly"
+// table scoring, for every from-square/to-square pair, how well that quiet move
+// has been doing at causing beta cutoffs ANYWHERE in the tree. A move like Rd1
+// or h6 that keeps working all over the search floats to the front of the quiet
+// moves, and no chess knowledge goes into it—only the search's own record of
+// what has been working.
+//
+// ONE TABLE PER COLOUR. A from/to pair means something different for each side
+// (e2-e4 is a white move), so the table is indexed by the colour of the piece
+// that moved.
+//
+// BONUS AND MALUS. A cutoff is evidence for the move that caused it and, just
+// as usefully, evidence against the quiet moves that were searched before it
+// and failed. Rewarding only the winner would let a move that happens to be
+// tried early everywhere collect credit for being tried; penalising the losers
+// is what makes the table discriminate rather than just accumulate.
+//
+// GRAVITY. Adding raw bonuses for ever would let a few square pairs run away
+// with scores nothing could catch, and would make ancient evidence weigh as
+// much as fresh evidence. So the update is
+//
+//     score += bonus - score * |bonus| / HISTORY_MAX
+//
+// which is an ordinary addition while a score is small and cancels the bonus
+// out completely as the score approaches HISTORY_MAX. The table saturates
+// instead of overflowing, and every update gently decays what was already
+// there, so recent cutoffs outweigh old ones without anyone running an ageing
+// pass.
+//
+// FAILURE MODE. History is a statistic, not a fact about the position in front
+// of us: a move that is excellent in one pawn structure and dreadful in another
+// gets a single score for both. That is affordable because history only ORDERS
+// moves—it never prunes a branch or scores a position—so when it is wrong it
+// costs time, never correctness.
+// ---------------------------------------------------------------------------
+
+// The magnitude a history score saturates at. Large enough to rank thousands of
+// cutoffs apart, small enough that the gravity term below stays exact in ints.
+inline constexpr int HISTORY_MAX = 16'384;
+
+class HistoryTable {
+public:
+  // The colour is read from the moving piece, so a caller cannot pass one that
+  // disagrees with the move it is talking about.
+  [[nodiscard]] int probe(const Move& mv) const;
+
+  // Positive for the move that caused a cutoff, negative for the quiet moves
+  // that were tried before it and failed. See GRAVITY above.
+  void update(const Move& mv, int bonus);
+
+  void clear();
+
+private:
+  std::array<std::array<std::array<int, 64>, 64>, 2> scores_{};
+};
+
+// ---------------------------------------------------------------------------
+// Counter Moves
+// ---------------------------------------------------------------------------
+// Some refutations answer a MOVE rather than a position: ...Nf6 meets e5, ...c5
+// meets d4, and they meet it wherever in the tree it is played. This table
+// remembers, for each (piece, destination square) the opponent last moved to,
+// the quiet move that refuted it, and the ordering tries that move immediately
+// after the killers.
+//
+// It is one guess per (piece, square) pair for the whole search, overwritten
+// freely and never validated—like the killers it can only reorder moves, and
+// an ordering that names a move this position does not have simply never
+// matches anything.
+// ---------------------------------------------------------------------------
+
+class CounterMoves {
+public:
+  [[nodiscard]] std::optional<Move> probe(const Move& previous) const;
+  void store(const Move& previous, const Move& refutation);
+
+private:
+  std::array<std::array<std::optional<Move>, 64>, 12> moves_{};
+};
+
+// ---------------------------------------------------------------------------
+// What one search remembers
+// ---------------------------------------------------------------------------
+// Killers, history and counter-moves are three versions of the same thing:
+// cheap guesses about which quiet move to try first, learned from the search's
+// own cutoffs and used for nothing but ordering. They are bundled so that they
+// are created, threaded through the recursion and discarded together, instead
+// of arriving as three more parameters at every call.
+//
+// Unlike the transposition table, this context does NOT outlive one search.
+// Killer slots are indexed by ply, and once the opponent has replied the
+// position at a given ply is a different one, so the guesses would be answers
+// to questions nobody asked. Building it fresh is therefore also how it is
+// "cleared between searches", and it is what keeps `bench` reproducible.
+// (Stronger engines do carry history from move to move, halving it each time;
+// that is a refinement, not a correction.)
+// ---------------------------------------------------------------------------
+
+struct SearchContext {
+  KillerMoves killers;
+  HistoryTable history;
+  CounterMoves counters;
+};
+
+// ---------------------------------------------------------------------------
 // Mate Score Normalization
 // ---------------------------------------------------------------------------
 // Mate scores include the distance to mate (e.g., "mate in 3" = 9997).
@@ -511,9 +627,27 @@ namespace detail {
                                              std::optional<std::chrono::milliseconds> soft_time,
                                              std::optional<std::chrono::milliseconds> hard_time);
 
-void order_moves(MoveList& moves, const KillerMoves& killers, std::uint8_t ply,
-                 const std::optional<Move>& hash_move = std::nullopt);
+// Orders the WHOLE list, which the search itself never needs: it asks for one
+// move at a time and usually stops after the first. Kept because "the list, in
+// order" is the only form the ordering can be read in from outside.
+void order_moves(MoveList& moves, const SearchContext& ctx, std::uint8_t ply,
+                 const std::optional<Move>& hash_move = std::nullopt,
+                 const std::optional<Move>& previous_move = std::nullopt);
 void order_quiescence_moves(MoveList& moves);
+
+// `previous_move` is the move that led to this position; it is what the
+// counter-move table is keyed by, and it is empty at the root and immediately
+// after a null move, where there is no move to answer.
+int alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
+              TranspositionTable& tt, SearchContext& ctx, Report& report, const Stopper& stopper,
+              const std::optional<Move>& previous_move = std::nullopt);
+
+// The spelling from before killers, history and counter-moves were bundled into
+// a SearchContext, kept for one cycle so callers written against it still
+// compile. It searches with a context of its own, seeded from `killers` and
+// copied back afterwards, which means the history and counter-move tables that
+// context builds are discarded when the call returns—so this is the slower way
+// to search, and new code should take a SearchContext.
 int alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
               TranspositionTable& tt, KillerMoves& killers, Report& report, const Stopper& stopper);
 } // namespace detail
