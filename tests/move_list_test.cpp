@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdint>
 #include <iterator>
 #include <optional>
 #include <ranges>
@@ -75,6 +76,72 @@ TEST(MoveListCapacity, FillsEveryLastSlot) {
   EXPECT_FALSE(moves.empty());
   expect_holds_first_n(moves, MoveList::CAPACITY);
 }
+
+TEST(MoveListCapacity, SaturatesInsteadOfOverrunning) {
+  // A MoveList sandwiched between two canaries. Writing past the end of the
+  // array would land on `after` (or on the list's own size field first), which
+  // is precisely the corruption saturation exists to prevent and precisely what
+  // ASan cannot see: the overrun stays inside one object, so there is no
+  // redzone between the array and its neighbour to trip.
+  struct Guarded {
+    std::uint64_t before{0xA5A5A5A5A5A5A5A5};
+    MoveList moves;
+    std::uint64_t after{0x5A5A5A5A5A5A5A5A};
+  };
+
+  Guarded guarded;
+  for (std::size_t i = 0; i < MoveList::CAPACITY; ++i) {
+    guarded.moves.push_back(nth_move(i));
+  }
+
+  EXPECT_EQ(guarded.moves.size(), MoveList::CAPACITY);
+  EXPECT_EQ(guarded.before, 0xA5A5A5A5A5A5A5A5);
+  EXPECT_EQ(guarded.after, 0x5A5A5A5A5A5A5A5A);
+
+#ifdef NDEBUG
+  // With asserts compiled out the container is on its own. Pushing well past
+  // capacity has to drop the surplus moves and leave everything else alone.
+  for (std::size_t i = 0; i < 300; ++i) {
+    guarded.moves.push_back(nth_move(i));
+  }
+
+  EXPECT_EQ(guarded.moves.size(), MoveList::CAPACITY);
+  EXPECT_EQ(guarded.before, 0xA5A5A5A5A5A5A5A5);
+  EXPECT_EQ(guarded.after, 0x5A5A5A5A5A5A5A5A);
+  expect_holds_first_n(guarded.moves, MoveList::CAPACITY);
+
+  const MoveList extra = {nth_move(0), nth_move(1)};
+  guarded.moves.insert(guarded.moves.end(), extra.begin(), extra.end());
+
+  EXPECT_EQ(guarded.moves.size(), MoveList::CAPACITY);
+  EXPECT_EQ(guarded.after, 0x5A5A5A5A5A5A5A5A);
+  expect_holds_first_n(guarded.moves, MoveList::CAPACITY);
+#endif
+}
+
+#ifndef NDEBUG
+// In a Debug build the assert is the primary defence and must fire, so that a
+// capacity which turned out to be too small is found by a failing test rather
+// than by a dropped move in a game.
+TEST(MoveListCapacityDeathTest, PushingPastCapacityTripsTheAssert) {
+  MoveList moves = first_n(MoveList::CAPACITY);
+
+  EXPECT_DEATH(moves.push_back(nth_move(0)), "move list overflow");
+}
+
+TEST(MoveListCapacityDeathTest, EmplacingPastCapacityTripsTheAssert) {
+  MoveList moves = first_n(MoveList::CAPACITY);
+
+  EXPECT_DEATH(moves.emplace_back(nth_move(0)), "move list overflow");
+}
+
+TEST(MoveListCapacityDeathTest, InsertingPastCapacityTripsTheAssert) {
+  MoveList moves = first_n(MoveList::CAPACITY - 1);
+  const MoveList extra = {nth_move(0), nth_move(1)};
+
+  EXPECT_DEATH(moves.insert(moves.end(), extra.begin(), extra.end()), "move list overflow");
+}
+#endif
 
 TEST(MoveListCapacity, IsContiguous) {
   const MoveList moves = first_n(8);
@@ -204,6 +271,21 @@ TEST(MoveListInsert, ShiftsTheTailWhenInsertingInTheMiddle) {
 
   EXPECT_EQ(at, moves.begin() + 1);
   expect_holds_first_n(moves, 4);
+}
+
+TEST(MoveListInsert, HandlesAMoveThatAliasesTheList) {
+  MoveList moves = first_n(3);
+
+  // Inserting at the front shifts every element right, moves[2] included. The
+  // inserted move must be the one that was at index 2 when insert was called,
+  // not whatever the shift left there.
+  moves.insert(moves.begin(), moves[2]);
+
+  ASSERT_EQ(moves.size(), 4U);
+  EXPECT_EQ(moves[0], nth_move(2));
+  EXPECT_EQ(moves[1], nth_move(0));
+  EXPECT_EQ(moves[2], nth_move(1));
+  EXPECT_EQ(moves[3], nth_move(2));
 }
 
 TEST(MoveListInsert, InsertsASingleMove) {

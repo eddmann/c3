@@ -26,29 +26,46 @@
 //
 // WHY 256 AND NOT 218
 // The generator produces *pseudo-legal* moves and filters them afterwards, so
-// its lists can be longer than any legal move count. Hill-climbing over piece
-// placements (see MAX_PSEUDO_LEGAL_MOVES below) puts that peak at 248, for
-// material—fifteen queens—that no real game can reach. Rounding to 256 keeps
-// the list a power of two and leaves headroom above the worst case that can be
-// constructed, let alone played.
+// its lists can be longer than any legal move count. The largest anyone has
+// found it producing is 248 (see MAX_PSEUDO_LEGAL_MOVES below), for material—
+// fifteen queens—that no real game can reach. That 248 is the best a search
+// found, not a proof that nothing beats it, so 256 is chosen to keep the list a
+// power of two *and* to keep an eight-move margin over the highest figure
+// anyone has managed to construct. Should even that margin turn out to be
+// wrong, push_back saturates rather than overrunning the array.
 //
-// WHAT IT COSTS
-// sizeof(Move) is 8, so a list is 2 KiB of stack. The search recurses at most
-// MAX_DEPTH = 255 plies and holds a handful of lists per frame, and quiescence
-// below that holds one; a few MiB of stack in the very deepest case, well
-// inside the usual 8 MiB thread limit, and nowhere near it at the depths a real
-// search reaches. That is the trade: a fixed 2 KiB per list, paid up front on
-// the stack, in exchange for never touching the allocator on the hot path.
+// WHAT IT COSTS, AND THE STACK BUDGET THIS IMPOSES
+// sizeof(Move) is 8, so one list is 2 KiB of stack. That is cheap per list and
+// expensive per *frame*, because the cost is multiplied by how deep the search
+// recurses and by how many lists each frame holds.
 //
-// PRINCIPAL VARIATIONS FIT TOO
-// The search reuses this type for principal variations. A PV is built as "the
-// move played here, then the child's PV", and the recursion only ever *reduces*
-// depth—there are no check extensions—so a PV cannot be longer than MAX_DEPTH
-// (255) moves. 256 covers that as well.
+// Thread stacks are smaller than people assume, and the smallest one wins:
+//
+//   Linux (glibc), main and secondary threads   8 MiB
+//   macOS secondary threads                     512 KiB
+//   Windows threads                             1 MiB (default /STACK)
+//
+// The engine searches on a secondary thread, so 512 KiB is the budget to design
+// against, not 8 MiB. At 512 KiB a frame holding one list can afford roughly
+// 250 plies; a frame holding four cannot afford 64. So the rule this container
+// imposes on its callers is: at most one MoveList per ply on the stack, and
+// anything beyond that—per-ply scratch lists, principal-variation storage—
+// belongs in a heap-allocated per-search context indexed by ply rather than in
+// the recursive frame. src/search.cpp does not yet obey that rule; moving its
+// per-ply lists off the stack is a pending search-side change.
+//
+// PRINCIPAL VARIATIONS
+// The search reuses this type for principal variations, built as "the move
+// played here, then the child's PV". Depth normally decreases by one per ply,
+// but alphabeta applies a check extension—at depth 0 while in check it resets
+// depth to 1 and recurses again—so depth alone does not bound the recursion,
+// and today nothing caps the ply either. A PV is therefore only as bounded as
+// the ply cap the search enforces, which is meant to be MAX_DEPTH (255) and is
+// another pending search-side change. Until it lands, and afterwards as a last
+// line of defence, this container saturates rather than overrun: see push_back.
 // =============================================================================
 
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cstddef>
 #include <initializer_list>
@@ -65,15 +82,28 @@ namespace c3 {
 // The most legal moves any legal chess position offers.
 inline constexpr std::size_t MAX_MOVES_IN_A_POSITION = 218;
 
-// The most pseudo-legal moves this generator can ever produce, found by
-// hill-climbing over placements of a full sixteen-piece side. The winning
-// arrangement is fifteen queens plus a king, which is unreachable in a real
-// game, so this is a ceiling over positions the search can never even see.
+// The most pseudo-legal moves anyone has *found* this generator producing, from
+// a hill-climb over placements of a full sixteen-piece side. The best
+// arrangement was fifteen queens plus a king—material no real game can reach—so
+// it is a bound on positions the search will never see. It is a search result,
+// not a proof: no one has shown 248 cannot be beaten, so CAPACITY keeps an
+// eight-move margin over it and push_back saturates if even that is wrong.
+//
+// MoveListCapacity.DISABLED_HillClimbStaysUnderCapacity in
+// tests/movegen_test.cpp re-runs the experiment; the comment there says how.
 inline constexpr std::size_t MAX_PSEUDO_LEGAL_MOVES = 248;
 
 // A vector-shaped container whose storage is a fixed-size array inside the
 // object. The interface is the part of std::vector's that the engine uses, so
-// callers cannot tell the difference—except that it never allocates.
+// callers cannot tell the difference—except for three things worth knowing:
+//
+//   * capacity() and max_size() are static and constant. There is no reserve()
+//     and no growth; the capacity a list has is the capacity it was born with.
+//   * Pointers, references and iterators into a list survive push_back and
+//     emplace_back, because there is no reallocation to move the elements. A
+//     std::vector invalidates all of them on a grow. Only insert and erase move
+//     elements, and then only from the affected position onwards.
+//   * Pushing past CAPACITY drops the move instead of growing. See push_back.
 class MoveList {
 public:
   using value_type = Move;
@@ -141,10 +171,8 @@ public:
   [[nodiscard]] static constexpr size_type capacity() noexcept { return CAPACITY; }
   [[nodiscard]] static constexpr size_type max_size() noexcept { return CAPACITY; }
 
-  [[nodiscard]] Move* data() noexcept { return reinterpret_cast<Move*>(storage_.data()); }
-  [[nodiscard]] const Move* data() const noexcept {
-    return reinterpret_cast<const Move*>(storage_.data());
-  }
+  [[nodiscard]] Move* data() noexcept { return moves_; }
+  [[nodiscard]] const Move* data() const noexcept { return moves_; }
 
   [[nodiscard]] iterator begin() noexcept { return data(); }
   [[nodiscard]] iterator end() noexcept { return data() + size_; }
@@ -178,14 +206,39 @@ public:
 
   void clear() noexcept { size_ = 0; }
 
+  // WHAT HAPPENS WHEN A LIST IS FULL
+  //
+  // Two things, deliberately. In a Debug build the assert fires and the test
+  // that provoked it fails, which is how a capacity that turned out to be too
+  // small gets discovered. In a Release build, where the assert is compiled
+  // away, the push is *dropped*.
+  //
+  // Dropping is not a good outcome—the engine would search a position without
+  // one of its moves and could return the wrong one. But it is a contained
+  // wrong answer: the list stays valid, every invariant holds, and the damage
+  // stops at this list. Writing the 257th move would instead run off the end of
+  // the array and over whatever the compiler put next to it—size_ first, then
+  // neighbouring objects in the caller's stack frame. That is memory
+  // corruption, it is not caught by ASan (the overrun stays inside one object,
+  // so there is no redzone to trip), and it surfaces far from its cause, as a
+  // stack-smashing abort or as nothing at all. A wrong move is recoverable; a
+  // corrupted stack is not.
   void push_back(const Move& move) {
     assert(size_ < CAPACITY && "move list overflow: a position generated more than CAPACITY moves");
+    if (size_ == CAPACITY) {
+      return;
+    }
     std::construct_at(data() + size_, move);
     ++size_;
   }
 
+  // Saturates like push_back. When the list is already full there is no new
+  // element to hand back, so the caller gets the last one that fits.
   template <typename... Args> reference emplace_back(Args&&... args) {
     assert(size_ < CAPACITY && "move list overflow: a position generated more than CAPACITY moves");
+    if (size_ == CAPACITY) {
+      return back();
+    }
     Move* const slot = std::construct_at(data() + size_, std::forward<Args>(args)...);
     ++size_;
     return *slot;
@@ -196,25 +249,32 @@ public:
     --size_;
   }
 
-  iterator insert(const_iterator position, const Move& move) {
-    return insert(position, &move, &move + 1);
-  }
+  // `move` is taken by value on purpose: it may name an element of this very
+  // list, and the shift below would move that element out from under the
+  // reference before it was read. Copying first makes lst.insert(lst.begin(),
+  // lst[2]) mean what it looks like it means.
+  iterator insert(const_iterator position, Move move) { return insert(position, &move, &move + 1); }
 
   // Inserting shifts whatever follows `position` to the right. The search only
   // ever inserts at the end—appending a child's principal variation to the move
   // that leads into it—which is the case where the shift is empty.
+  //
+  // Like push_back, this saturates: a range that would not fit is truncated
+  // from its tail rather than written past the end of the array.
   template <std::forward_iterator ForwardIt>
   iterator insert(const_iterator position, ForwardIt first, ForwardIt last) {
     const difference_type offset = position - cbegin();
-    const auto count = static_cast<size_type>(std::distance(first, last));
+    const auto requested = static_cast<size_type>(std::distance(first, last));
 
     assert(offset >= 0 && static_cast<size_type>(offset) <= size_ &&
            "insert position out of range");
-    assert(size_ + count <= CAPACITY && "move list overflow: insert exceeded CAPACITY");
+    assert(size_ + requested <= CAPACITY && "move list overflow: insert exceeded CAPACITY");
+
+    const size_type count = std::min(requested, CAPACITY - size_);
 
     iterator const at = begin() + offset;
     std::move_backward(at, end(), end() + static_cast<difference_type>(count));
-    std::copy(first, last, at);
+    std::copy_n(first, count, at);
     size_ += count;
 
     return at;
@@ -247,18 +307,39 @@ private:
     insert(cend(), first, last);
   }
 
-  // Move is trivially copyable and trivially destructible, which is what lets
-  // the storage stay raw: a Move object springs into existence where one is
-  // constructed, and none of the unused slots costs anything to skip.
+  // WHY THE STORAGE IS A UNION
   //
-  // Declaring the storage as std::array<Move, CAPACITY> would be tidier to read
-  // but would defeat the whole exercise, because Move has default member
-  // initialisers: every list would default-construct 256 moves—2 KiB of stores
-  // per node—before the generator wrote a single real one.
+  // A plain `Move moves_[CAPACITY]` member would be default-initialised, and
+  // Move has default member initialisers, so every list would construct 256
+  // moves—2 KiB of stores—before the generator wrote a single real one. That is
+  // the cost this whole container exists to avoid, so the array must start out
+  // with no live objects in it at all.
+  //
+  // Wrapping it in an anonymous union is how C++ says that. A variant member is
+  // not initialised unless a constructor names it, and MoveList's constructors
+  // never do, so the array costs nothing to declare. Elements then come to life
+  // one at a time under std::construct_at as moves are pushed.
+  //
+  // The obvious alternative—`std::byte` storage plus a reinterpret_cast to
+  // Move*—is what this used to be, and it is not actually well-formed. Even in
+  // C++23 a byte array does not on its own create the Move objects a cast then
+  // pretends to find; only a listed object-creating operation does, and
+  // declaring an array of bytes is not one of them. The union has no such gap:
+  // Move is an implicit-lifetime type, so the array is one too, and the
+  // language creates it in the union's storage as soon as the program needs it
+  // to exist. It also keeps the pointer arithmetic honest (`moves_ + i` walks a
+  // real Move array, not bytes reinterpreted as one) and makes alignment
+  // automatic, so no alignas is needed.
+  //
+  // This is the standard shape of a fixed-capacity vector, and it works only
+  // because Move is trivially copyable and trivially destructible.
   static_assert(std::is_trivially_copyable_v<Move>);
   static_assert(std::is_trivially_destructible_v<Move>);
 
-  alignas(Move) std::array<std::byte, sizeof(Move) * CAPACITY> storage_;
+  union {
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
+    Move moves_[CAPACITY];
+  };
   size_type size_{0};
 };
 
