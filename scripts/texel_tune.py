@@ -73,20 +73,34 @@ that are common in the wild:
 
 Results may be written `1-0`, `0-1`, `1/2-1/2`, or directly as `1.0`/`0.5`/`0.0`.
 They are always read from WHITE's point of view, and so are the scores this
-script works with: the engine reports from the side to move, so a score for a
-position with Black to move is negated on the way in.
+script works with. Two things happen to each reading on the way in: the engine's
+tempo bonus is subtracted (it is paid to whoever is on move, after the
+side-to-move flip, so it does not negate with the rest of the score), and the
+result is negated for a position with Black to move. See to_white_relative.
 
 A CSV of precomputed evaluations (`fen,score`) can be supplied instead with
---evals, which is how you avoid paying for one engine process invocation per
-position on every pass of the optimiser.
+--evals, for fitting K without an engine to hand. Those numbers are fixed, so
+they cannot be used with --tune: the sweep needs scores that respond to the
+parameters it is changing.
+
+WHAT TO LEAVE OUT OF A TUNING SET. Positions the engine short-circuits carry no
+information about any weight and only dilute the objective. The two to watch for
+are dead draws (the engine returns a flat zero whenever neither side can mate,
+whatever else is on the board) and positions where a capture is hanging—Texel
+tuning conventionally uses QUIET positions, scored by a quiescence search,
+because a static evaluation has nothing sensible to say about a position with a
+queen en prise.
 
 USAGE
 -----
     # Fit K only, using the engine to evaluate each position:
     python3 scripts/texel_tune.py --epd quiet.epd --engine build-release/c3
 
-    # Same, from a CSV of precomputed scores, then run the illustrative sweep:
-    python3 scripts/texel_tune.py --epd quiet.epd --evals scores.csv \\
+    # Fit K from a CSV of precomputed scores, no engine needed:
+    python3 scripts/texel_tune.py --epd quiet.epd --evals scores.csv
+
+    # Fit K and then run the illustrative sweep:
+    python3 scripts/texel_tune.py --epd quiet.epd --engine build-release/c3 \\
         --params params.json --tune
 
 `params.json` is a list of tunable parameters, each with a name, a starting
@@ -114,6 +128,12 @@ ROOT = Path(__file__).resolve().parent.parent
 # interpretable: it is "how many of this engine's centipawns are worth one
 # rating point's worth of expected score".
 ELO_SCALE = 400.0
+
+# TEMPO_BONUS in include/c3/eval.hpp: the engine pays this to whoever is on move,
+# after the side-to-move flip, so it has to come off before a reading can be
+# turned into a White-relative score. Override it with --tempo if the engine's
+# value ever changes; this script has no way to ask the binary what it is.
+TEMPO_BONUS = 10.0
 
 # The result of a finished game, from White's point of view.
 RESULT_TOKENS = {
@@ -184,13 +204,24 @@ def find_best_k(
     high: float = 4.0,
     iterations: int = 12,
 ) -> float:
-  """Fit K by bisecting the interval that must contain the minimum.
+  """Fit K by TERNARY SEARCH: repeatedly discard the third that cannot hold it.
 
-  The error curve in K is smooth and has a single minimum, so a golden-section
-  style search finds it without derivatives. Twelve halvings of a [0, 4]
-  interval leave an uncertainty under 0.001, which is far finer than the tuning
-  that follows can notice.
+  The error curve in K is smooth and has a single minimum, so comparing the
+  error at the two points that cut the interval into thirds is enough to say
+  which outer third the minimum is not in—no derivatives needed. Each pass keeps
+  two thirds of the interval, so `iterations` passes shrink it by (2/3) **
+  iterations: twelve passes take [0, 4] down to a bracket of about 0.031, and
+  the midpoint of that bracket is what comes back. That is coarse next to the
+  0.001 you might assume from bisection, and it is fine—K only has to be roughly
+  right for the tuning that follows, and asking for another decimal place means
+  another six passes over the whole dataset.
+
+  A result that lands against either end of [low, high] means the minimum is
+  probably OUTSIDE the interval and the search has simply run into the wall, so
+  that case gets a warning rather than a silent answer.
   """
+  original_low, original_high = low, high
+
   for _ in range(iterations):
     third = (high - low) / 3.0
     left = low + third
@@ -199,7 +230,20 @@ def find_best_k(
       high = right
     else:
       low = left
-  return (low + high) / 2.0
+
+  best = (low + high) / 2.0
+
+  # The final bracket is the resolution of the answer, so "within one bracket of
+  # an end" is the same statement as "indistinguishable from the boundary".
+  bracket = high - low
+  if best - original_low <= bracket or original_high - best <= bracket:
+    print(
+        f"warning: fitted K = {best:.4f} sits at the edge of the search range "
+        f"[{original_low:g}, {original_high:g}]; the real minimum is probably outside it, "
+        f"so widen the range or check that the scores are White-relative centipawns",
+        file=sys.stderr)
+
+  return best
 
 
 def parse_epd_line(line: str) -> Sample | None:
@@ -266,13 +310,38 @@ def load_eval_csv(path: Path) -> dict[str, float]:
   return scores
 
 
-def engine_scorer(engine: Path) -> Callable[[Iterable[str], Sequence[Parameter]], list[float]]:
+def to_white_relative(score: float, side_to_move: str, tempo: float = TEMPO_BONUS) -> float:
+  """Turn one `eval` reading into a White-relative score.
+
+  Two corrections, in this order, and the order matters.
+
+  FIRST, remove the tempo bonus. The engine pays it to whoever is on move, so it
+  is added AFTER the side-to-move flip and does not negate with the rest of the
+  score. Leaving it in would make every White-to-move position look `tempo`
+  centipawns better than it is and every Black-to-move position `tempo` worse—a
+  constant bias correlated with whose turn it is, which is exactly the sort of
+  thing a fitted K will happily absorb and then quietly distort everything else
+  to accommodate.
+
+  SECOND, flip the sign for Black. `eval` reports from the side to move; EPD
+  results are from White.
+  """
+  white_relative = score - tempo
+  return white_relative if side_to_move == "w" else -white_relative
+
+
+def engine_scorer(
+    engine: Path,
+    tempo: float = TEMPO_BONUS,
+) -> Callable[[Iterable[str], Sequence[Parameter]], list[float]]:
   """Score positions by asking the engine binary, one batch per call.
 
-  The engine's `eval` command prints `eval: <centipawns>` from the SIDE TO
-  MOVE's point of view; the results in an EPD file are from White's. We negate
-  Black-to-move scores so that both sides of the comparison speak the same
-  language.
+  BEWARE OF DEAD DRAWS. The engine short-circuits positions where neither side
+  has enough material to mate and returns a flat zero for them, tempo bonus and
+  all. Those positions carry no information about any evaluation weight—the
+  score does not depend on a single one of them—so they only dilute the
+  objective. A tuning set should have them filtered out before it gets here;
+  this scorer cannot tell them apart from genuinely equal positions.
 
   The `params` argument is accepted and ignored, and that is the honest state of
   affairs today: the evaluation's constants are compiled in, so no parameter
@@ -295,7 +364,8 @@ def engine_scorer(engine: Path) -> Callable[[Iterable[str], Sequence[Parameter]]
       raise RuntimeError(f"engine returned {len(scores)} scores for {len(fen_list)} positions")
 
     return [
-        value if fen.split()[1] == "w" else -value for fen, value in zip(fen_list, scores)
+        to_white_relative(value, fen.split()[1], tempo)
+        for fen, value in zip(fen_list, scores)
     ]
 
   return score
@@ -370,7 +440,19 @@ def main() -> int:
                       help="JSON list of tunable parameters (see the module docstring)")
   parser.add_argument("--tune", action="store_true",
                       help="run the illustrative coordinate-descent sweep after fitting K")
+  parser.add_argument("--tempo", type=float, default=TEMPO_BONUS,
+                      help="the engine's tempo bonus, removed from each reading "
+                           f"(default {TEMPO_BONUS:g}, matching TEMPO_BONUS in eval.hpp)")
   args = parser.parse_args()
+
+  # A CSV of precomputed scores cannot respond to a change in the parameters, so
+  # a sweep over it would try every candidate against identical numbers, find no
+  # improvement anywhere and stop after one pass. That is a confusing way to
+  # report "this combination makes no sense", so refuse it outright.
+  if args.tune and args.evals is not None:
+    print("--tune cannot be used with --evals: precomputed scores cannot respond to a change "
+          "in the parameters", file=sys.stderr)
+    return 1
 
   samples = load_epd(args.epd)
   if not samples:
@@ -391,7 +473,7 @@ def main() -> int:
     if not args.engine.exists():
       print(f"engine binary not found: {args.engine}", file=sys.stderr)
       return 1
-    scorer = engine_scorer(args.engine)
+    scorer = engine_scorer(args.engine, args.tempo)
 
   params = load_params(args.params) if args.params else []
 

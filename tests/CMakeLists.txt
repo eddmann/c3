@@ -89,14 +89,17 @@ if(Python3_Interpreter_FOUND)
             --summarize-only ${PROJECT_SOURCE_DIR}/tests/fixtures/fastchess_sample.pgn
             --summary ${CMAKE_BINARY_DIR}/Testing/fastchess/sample_summary.txt)
 
-  # Unit tests for the Python helpers behind the gauntlet/SPRT scripts.
+  # Unit tests for the Python helpers behind the gauntlet/SPRT scripts. The
+  # pattern is pinned to one file rather than left to discover everything under
+  # tests/scripts, so that each module below gets exactly one ctest entry and a
+  # failure names the script it came from.
   add_test(NAME Scripts.CommonUnitTests
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
-            -s ${PROJECT_SOURCE_DIR}/tests/scripts -t ${PROJECT_SOURCE_DIR}/tests/scripts -v)
+            -s ${PROJECT_SOURCE_DIR}/tests/scripts -t ${PROJECT_SOURCE_DIR}/tests/scripts
+            -p test_common.py -v)
 
   # The Texel tuning skeleton's pure functions (sigmoid, objective, K search,
-  # EPD parsing, coordinate descent). Named separately from the sweep above so a
-  # failure points straight at the tuner.
+  # EPD parsing, coordinate descent).
   add_test(NAME Scripts.TexelTuneUnitTests
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${PROJECT_SOURCE_DIR}/tests/scripts -t ${PROJECT_SOURCE_DIR}/tests/scripts

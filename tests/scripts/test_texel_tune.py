@@ -12,6 +12,8 @@ ctest as the `Scripts.TexelTuneUnitTests` case.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -21,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from texel_tune import (  # noqa: E402 - path setup has to happen first
+    TEMPO_BONUS,
     Parameter,
     Sample,
     find_best_k,
@@ -28,6 +31,7 @@ from texel_tune import (  # noqa: E402 - path setup has to happen first
     mean_squared_error,
     parse_epd_line,
     sigmoid,
+    to_white_relative,
     tune,
 )
 
@@ -49,6 +53,37 @@ class SigmoidTest(unittest.TestCase):
 
   def test_a_crushing_score_predicts_a_near_certain_win(self) -> None:
     self.assertGreater(sigmoid(5000.0, 1.0), 0.999)
+
+
+class ToWhiteRelativeTest(unittest.TestCase):
+
+  def test_strips_the_tempo_bonus_before_flipping(self) -> None:
+    self.assertAlmostEqual(to_white_relative(60.0, "w", tempo=10.0), 50.0)
+    self.assertAlmostEqual(to_white_relative(60.0, "b", tempo=10.0), -50.0)
+
+  def test_a_dead_equal_position_reads_as_zero_from_both_sides(self) -> None:
+    # The engine's own symmetry: a balanced position scores exactly the tempo
+    # bonus for whoever is on move, so stripping it must leave zero either way.
+    self.assertAlmostEqual(to_white_relative(TEMPO_BONUS, "w"), 0.0)
+    self.assertAlmostEqual(to_white_relative(TEMPO_BONUS, "b"), 0.0)
+
+  def test_the_same_position_reads_the_same_from_either_side(self) -> None:
+    # eval(pos) + eval(pos with the other side to move) == 2 * TEMPO_BONUS, so a
+    # White-to-move reading of x and the matching Black-to-move reading of
+    # 2 * TEMPO_BONUS - x have to convert to the same White-relative number.
+    white_reading = 137.0
+    black_reading = (2.0 * TEMPO_BONUS) - white_reading
+
+    self.assertAlmostEqual(
+        to_white_relative(white_reading, "w"), to_white_relative(black_reading, "b"))
+
+  def test_leaving_the_tempo_bonus_in_would_bias_the_side_to_move(self) -> None:
+    # The bug this guards against: without the subtraction the two readings above
+    # disagree by twice the bonus, a constant bias correlated with whose turn it
+    # is rather than with anything on the board.
+    self.assertAlmostEqual(
+        to_white_relative(137.0, "w", tempo=0.0) - to_white_relative(-117.0, "b", tempo=0.0),
+        2.0 * TEMPO_BONUS)
 
 
 class MeanSquaredErrorTest(unittest.TestCase):
@@ -94,6 +129,42 @@ class FindBestKTest(unittest.TestCase):
 
     self.assertLess(at_best, mean_squared_error(results, scores, best + 0.2))
     self.assertLess(at_best, mean_squared_error(results, scores, best - 0.2))
+
+
+class FindBestKBoundsTest(unittest.TestCase):
+
+  @staticmethod
+  def _fit_capturing_stderr(results, scores):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+      best = find_best_k(results, scores)
+    return best, stderr.getvalue()
+
+  def test_warns_when_the_minimum_sits_against_a_bound(self) -> None:
+    # Every game was drawn from a position the engine thought decisive, so the
+    # fit wants K as close to zero as it can get—which is the search's own lower
+    # bound, not a minimum it found.
+    best, warning = self._fit_capturing_stderr([0.5, 0.5], [400.0, -400.0])
+
+    self.assertLess(best, 0.05)
+    self.assertIn("edge of the search range", warning)
+
+  def test_says_nothing_when_the_minimum_is_interior(self) -> None:
+    scores = [float(cp) for cp in range(-600, 601, 25)]
+    results = [sigmoid(score, 0.9) for score in scores]
+
+    best, warning = self._fit_capturing_stderr(results, scores)
+
+    self.assertAlmostEqual(best, 0.9, places=2)
+    self.assertEqual(warning, "")
+
+  def test_the_bracket_matches_what_the_docstring_promises(self) -> None:
+    # Twelve passes keeping two thirds each time: (2/3) ** 12 of [0, 4] is about
+    # 0.031, so the answer is good to roughly half of that.
+    scores = [float(cp) for cp in range(-600, 601, 25)]
+    results = [sigmoid(score, 1.7) for score in scores]
+
+    self.assertAlmostEqual(find_best_k(results, scores), 1.7, delta=0.016)
 
 
 class ParseEpdTest(unittest.TestCase):
