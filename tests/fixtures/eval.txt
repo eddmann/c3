@@ -24,9 +24,10 @@ endgame-central-king|k7/8/8/8/3K4/8/8/7R w - - 0 1|669
 # A pawn nothing can stop from queening, in an endgame where the passed-pawn
 # bonus is at its full (doubled) strength.
 passed-pawn-endgame|4k3/8/8/3P4/8/8/8/4K3 w - - 0 1|215
-# Two pawns on one file: doubled once, and both isolated because no friendly pawn
-# stands on the b- or d-file to defend either of them.
-doubled-isolated-pawns|7k/8/8/8/8/2P5/2P5/7K w - - 0 1|235
+# Two pawns on one file: doubled once, both isolated because no friendly pawn
+# stands on the b- or d-file to defend either of them, and only ONE passer
+# between them—the rear pawn can never get past the one in front.
+doubled-isolated-pawns|7k/8/8/8/8/2P5/2P5/7K w - - 0 1|225
 # The same material and the same pawns, two corners for the king: behind f2/g2/h2
 # it collects the pawn shield, on b1 it has abandoned it and the a/b/c files are
 # wide open. The gap between these two entries is the king-safety term.

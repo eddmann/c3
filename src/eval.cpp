@@ -211,13 +211,19 @@ int game_phase(const Board& board) noexcept {
 //
 // Anything with a pawn (it can promote), a rook or a queen is winnable, so those
 // positions are rejected up front.
+//
+// That rejection is the fast path, and it is worth writing as one test rather
+// than six. Every node of the search asks this question and almost every node
+// answers "no, there is plenty of material": ORing the six bitboards together
+// and comparing against zero settles those in a handful of instructions, and
+// only the genuinely bare boards go on to count anything.
 // =============================================================================
 
 bool has_insufficient_material(const Board& board) noexcept {
-  const int winning_material = count_of(board, Piece::WP) + count_of(board, Piece::BP) +
-                               count_of(board, Piece::WR) + count_of(board, Piece::BR) +
-                               count_of(board, Piece::WQ) + count_of(board, Piece::BQ);
-  if (winning_material > 0) {
+  const Bitboard winning_material = board.pieces(Piece::WP) | board.pieces(Piece::BP) |
+                                    board.pieces(Piece::WR) | board.pieces(Piece::BR) |
+                                    board.pieces(Piece::WQ) | board.pieces(Piece::BQ);
+  if (winning_material != 0) {
     return false;
   }
 
@@ -288,16 +294,24 @@ int eval_psqt(Colour colour, const Board& board, Phase phase) noexcept {
 // One pass over this side's pawns answering three questions per pawn, each of
 // them a single AND against a precomputed mask (see pawns.hpp):
 //
-//   PASSED    is the "no enemy pawn may stand here" zone ahead of it empty?
+//   PASSED    is the "no enemy pawn may stand here" zone ahead of it empty,
+//             AND is this the front pawn of its file?
 //   DOUBLED   is there a friendly pawn further up the same file?
 //   ISOLATED  is there no friendly pawn on either neighbouring file?
 //
-// A pawn can be all three at once, and the scores simply add up: a doubled,
+// A pawn can be several of these at once, and the scores simply add up: an
 // isolated passer really is both a long-term liability and a running threat.
+//
+// The extra clause on PASSED matters. Two white pawns on c4 and c5 with no
+// black pawn in the way are ONE passer, not two: the rear pawn can never
+// overtake the one in front of it, so only the front pawn is a promotion
+// threat. Without the clause a doubled pair would collect the bonus twice and
+// the engine would happily double its pawns to earn it.
 //
 // Charging the doubled penalty to the pawn that has another one AHEAD of it,
 // rather than counting pawns per file, is what makes three pawns on a file cost
-// two penalties without a second loop.
+// two penalties without a second loop—and it is the same test, so the rear pawn
+// pays the penalty and misses the bonus in one go.
 // =============================================================================
 
 PhaseScore eval_pawn_structure(Colour side, const Board& board) noexcept {
@@ -312,13 +326,15 @@ PhaseScore eval_pawn_structure(Colour side, const Board& board) noexcept {
     const Square square = Square::pop_first_occupied(remaining);
     const auto index = square.index();
 
-    if ((PASSED_PAWN_MASKS[side_index][index] & enemy_pawns) == 0) {
+    const bool blocked_by_own_pawn = (FORWARD_FILE_MASKS[side_index][index] & friendly_pawns) != 0;
+
+    if (!blocked_by_own_pawn && (PASSED_PAWN_MASKS[side_index][index] & enemy_pawns) == 0) {
       const auto rank = relative_rank(square, side);
       score.middlegame += PASSED_PAWN_MIDDLEGAME[rank];
       score.endgame += PASSED_PAWN_ENDGAME[rank];
     }
 
-    if ((FORWARD_FILE_MASKS[side_index][index] & friendly_pawns) != 0) {
+    if (blocked_by_own_pawn) {
       score += DOUBLED_PAWN_PENALTY;
     }
 
@@ -394,17 +410,24 @@ PhaseScore eval_rooks(Colour side, const Board& board) noexcept {
 // exclude squares covered by an enemy pawn, because a minor piece standing on
 // one is simply lost—counting them would praise a knight for the squares it
 // dare not use.
+//
+// The attacker count uses the RAW attack set, before any of that filtering. A
+// rook bearing down on g2 is pressure on a king on g1 whether or not g2 is
+// occupied by one of the rook's own pieces: the defender still has to keep
+// something there. That is deliberate, and it is why the two questions read
+// different bitboards from the same lookup.
 // =============================================================================
 
 namespace {
 
 // The colour is a TEMPLATE parameter rather than an ordinary argument, and that
 // is a performance decision rather than a stylistic one. It makes knight(Side),
-// bishop(Side) and the rest compile-time constants, so the compiler can fold
-// attacks_for's switch over the twelve piece types down to the single branch
-// each call can actually reach. Measured on this evaluation it is worth about a
-// fifth of the whole function's running time—which is a lot for something the
-// search calls millions of times a second, and it costs one wrapper below.
+// bishop(Side) and the rest compile-time constants, so that UNDER LTO—where
+// attacks_for, which lives in movegen.cpp, can be inlined here—its switch over
+// the twelve piece types folds down to the single branch each call can actually
+// reach. Measured on the Release build that is worth about a fifth of this
+// function's running time; in a Debug build, with nothing inlined across
+// translation units, it buys nothing and costs nothing but one wrapper below.
 template <Colour Side> PieceActivity piece_activity(const Board& board) noexcept {
   const Bitboard friendly = board.pieces_by_colour(Side);
   const Bitboard enemy_pawn_attacks = pawn_attack_span(board.pieces(pawn(!Side)), !Side);
@@ -488,8 +511,10 @@ PhaseScore eval_king_safety(Colour side, const Board& board, int enemy_attackers
 
   int middlegame = 0;
 
-  // A wall of doubled pawns is not three times as safe as one pawn, so the count
-  // is capped at one pawn per file of the shield.
+  // The count is a single cap on the total, not a cap per file: six pawns
+  // crammed into the shield zone score the same as the three a castled king
+  // actually wants, because the fourth pawn is not more shelter—it is a pawn
+  // standing behind another pawn.
   const Bitboard shield = SHIELD_ZONES[static_cast<std::size_t>(side)][king_square.index()];
   const int shield_pawns = std::min(std::popcount(friendly_pawns & shield), KING_SHIELD_MAX_PAWNS);
   middlegame += shield_pawns * KING_SHIELD_PAWN_MIDDLEGAME;
@@ -514,21 +539,24 @@ PhaseScore eval_king_safety(Colour side, const Board& board, int enemy_attackers
 
 namespace {
 
-// The bishop-pair bonus, as a signed White-minus-Black figure. This is the one
+// The bishop-pair bonus, as a signed White-minus-Black pair. This is the one
 // material term the accumulator cannot carry: it belongs to a side owning two
 // bishops on opposite square colours, not to either bishop individually, so
 // there is no per-piece value to add and subtract.
-int bishop_pair_advantage(const Board& board, Phase phase) noexcept {
-  const int bonus = phase == Phase::Middlegame ? BISHOP_PAIR_MIDDLEGAME : BISHOP_PAIR_ENDGAME;
+//
+// Who owns a pair is a fact about the board, not about the phase, so it is
+// established once and then priced twice. Asking the question per phase would
+// run the same four bitboard tests over again for an answer that cannot have
+// changed in between.
+PhaseScore bishop_pair_advantage(const Board& board) noexcept {
+  const int white = has_bishop_pair(board, Colour::White) ? 1 : 0;
+  const int black = has_bishop_pair(board, Colour::Black) ? 1 : 0;
+  const int pairs = white - black;
 
-  int advantage = 0;
-  if (has_bishop_pair(board, Colour::White)) {
-    advantage += bonus;
-  }
-  if (has_bishop_pair(board, Colour::Black)) {
-    advantage -= bonus;
-  }
-  return advantage;
+  return PhaseScore{
+      .middlegame = pairs * BISHOP_PAIR_MIDDLEGAME,
+      .endgame = pairs * BISHOP_PAIR_ENDGAME,
+  };
 }
 
 // Everything the Board already knows, as a White-minus-Black pair: the running
@@ -537,12 +565,12 @@ int bishop_pair_advantage(const Board& board, Phase phase) noexcept {
 PhaseScore accumulated_advantage(const Board& board) noexcept {
   const auto& accumulator = board.accumulator();
 
-  return PhaseScore{
-      .middlegame = accumulator.middlegame(Colour::White) - accumulator.middlegame(Colour::Black) +
-                    bishop_pair_advantage(board, Phase::Middlegame),
-      .endgame = accumulator.endgame(Colour::White) - accumulator.endgame(Colour::Black) +
-                 bishop_pair_advantage(board, Phase::Endgame),
+  PhaseScore advantage{
+      .middlegame = accumulator.middlegame(Colour::White) - accumulator.middlegame(Colour::Black),
+      .endgame = accumulator.endgame(Colour::White) - accumulator.endgame(Colour::Black),
   };
+  advantage += bishop_pair_advantage(board);
+  return advantage;
 }
 
 // The taper: full armies (phase 24) return the middlegame score, bare kings

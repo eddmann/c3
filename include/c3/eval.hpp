@@ -43,6 +43,15 @@
 // is called a "tapered evaluation" and it is what lets one function give
 // sensible advice in both a queen-filled middlegame and a bare-kings endgame.
 //
+// THE NEXT OPTIMISATION, when this becomes the bottleneck, is a PAWN HASH
+// TABLE. Look at what layer 2 actually reads: the pawn-structure term needs
+// only the two pawn bitboards, and the shield and open-file halves of king
+// safety need only those plus the two king squares. Pawns move rarely—most
+// nodes of a search share the same pawn structure as their parent—so those
+// scores can be computed once, stored under a Zobrist key built from the pawns
+// alone, and looked up for millions of nodes afterwards. Mobility cannot join
+// them, because it changes whenever any piece moves.
+//
 // Still missing, and deliberately so: piece coordination, outposts, trapped
 // pieces, king-pawn race knowledge, and any kind of automatic tuning of the
 // numbers below (scripts/texel_tune.py sketches how that would work). Even a
@@ -165,6 +174,8 @@ inline constexpr int BISHOP_PAIR_ENDGAME = 50;
 // it, and pieces have better things to do. The bonus is indexed by how far the
 // pawn has travelled (see relative_rank in pawns.hpp) because a passer on the
 // second rank is a distant promise while one on the seventh is nearly a queen.
+// Only the FRONT pawn of a file collects it: a pawn stuck behind a friendly
+// pawn is not a second promotion threat, it is the same threat twice.
 //
 // The endgame numbers are roughly double the middlegame ones, and that gap is
 // the single most important thing these tables say. In a middlegame the enemy
@@ -204,14 +215,17 @@ inline constexpr PhaseScore ISOLATED_PAWN_PENALTY{.middlegame = -10, .endgame = 
 // PAWN SHIELD. The pawns on the king's file and its two neighbours, one or two
 // ranks in front of it. Three unmoved pawns in front of a castled king are the
 // classic shelter; every pawn pushed out of that zone is a hole an enemy piece
-// can occupy with check. The count is capped so that a wall of doubled pawns
-// cannot earn more than a healthy one.
+// can occupy with check. KING_SHIELD_MAX_PAWNS caps the TOTAL count, so a wall
+// of doubled pawns cannot earn more than the three a castled king wants.
 //
 // OPEN FILES BESIDE THE KING. A file with no friendly pawn on it is a highway
 // for an enemy rook or queen aimed at the king. If it has no enemy pawn either
 // it is fully open, and worse still, because nothing at all obstructs it.
 //
-// ATTACKING PIECES. Attacks on a king are not additive—they multiply. One
+// ATTACKING PIECES. Any enemy knight, bishop, rook or queen whose attacks touch
+// the eight squares around the king, whether or not those squares are occupied:
+// a piece the defender has to keep guarded is still a piece tied down. Attacks
+// on a king are not additive—they multiply. One
 // piece pointing at the king zone is a nuisance; three are a mating attack. We
 // only model the count, and only linearly (real engines use a lookup table that
 // grows faster than linearly), and we cap it, because this evaluation has no

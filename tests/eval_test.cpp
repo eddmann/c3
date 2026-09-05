@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "c3/attacks.hpp"
 #include "c3/bitboard.hpp"
@@ -82,6 +84,58 @@ std::string mirror_files(std::string_view fen) {
   flush_rank();
 
   return mirrored + std::string(rest);
+}
+
+// Mirror a position through the horizontal axis AND swap the colours: rank 1
+// becomes rank 8, every white piece becomes a black one, and the other side
+// gets the move.
+//
+// The result is the same position seen from the other chair. Chess treats the
+// two colours identically, so the score from the side to move's point of view
+// must come out exactly the same—and that is the single property most at risk
+// when a term is written per colour, because it only holds if EVERY forward
+// direction, rank table, mask and shield zone was flipped consistently. Castling
+// rights and the en passant square are dropped from both sides of the
+// comparison: neither reaches the evaluation, and mirroring them correctly would
+// only add a way for the test itself to be wrong.
+std::string mirror_ranks_and_colours(std::string_view fen) {
+  const auto board_end = fen.find(' ');
+  const std::string_view board = fen.substr(0, board_end);
+  const char side_to_move = fen[board_end + 1];
+
+  std::vector<std::string> ranks;
+  std::string rank;
+  for (const char square : board) {
+    if (square == '/') {
+      ranks.push_back(rank);
+      rank.clear();
+      continue;
+    }
+    // Case identifies the owner, so swapping it swaps the colours.
+    rank.push_back(static_cast<char>(std::islower(static_cast<unsigned char>(square)) != 0
+                                         ? std::toupper(static_cast<unsigned char>(square))
+                                         : std::tolower(static_cast<unsigned char>(square))));
+  }
+  ranks.push_back(rank);
+
+  std::ranges::reverse(ranks);
+
+  std::string mirrored;
+  for (std::size_t index = 0; index < ranks.size(); ++index) {
+    if (index > 0) {
+      mirrored.push_back('/');
+    }
+    mirrored += ranks[index];
+  }
+
+  return mirrored + (side_to_move == 'w' ? " b - - 0 1" : " w - - 0 1");
+}
+
+// The same board with castling rights and the en passant square stripped, so
+// that a position and its mirror are compared on equal footing.
+std::string without_move_state(std::string_view fen) {
+  const auto board_end = fen.find(' ');
+  return std::string(fen.substr(0, board_end)) + ' ' + fen[board_end + 1] + " - - 0 1";
 }
 
 } // namespace
@@ -338,6 +392,132 @@ TEST(TaperedEval, EndgameKingPrefersCentreToShelter) {
 // -----------------------------------------------------------------------------
 // File Symmetry
 // -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Colour Symmetry
+// -----------------------------------------------------------------------------
+
+namespace {
+
+// A board and the same board turned upside down with the colours swapped must
+// score identically from the side to move's point of view.
+void expect_colour_symmetric(std::string_view fen) {
+  const auto pos = parse(without_move_state(fen));
+  const auto mirrored = parse(mirror_ranks_and_colours(fen));
+
+  EXPECT_EQ(eval(pos), eval(mirrored)) << fen << "  vs  " << mirror_ranks_and_colours(fen);
+}
+
+} // namespace
+
+TEST(Eval, TheRankAndColourMirrorIsItsOwnInverse) {
+  // Pins the test helper itself. Without this, a mirror function that quietly
+  // returned its input unchanged would make every symmetry assertion below pass
+  // for no reason at all.
+  constexpr std::string_view fen = "4k3/1p6/8/3P4/8/8/1P6/4K3 w - - 0 1";
+
+  const std::string mirrored = mirror_ranks_and_colours(fen);
+
+  EXPECT_EQ(mirrored, "4k3/1p6/8/8/3p4/8/1P6/4K3 b - - 0 1");
+  EXPECT_NE(mirrored, without_move_state(fen));
+  EXPECT_EQ(mirror_ranks_and_colours(mirrored), without_move_state(fen));
+}
+
+TEST(Eval, MirroringRanksAndColoursKeepsTheSameScore) {
+  // Hand-picked positions covering every term at once: pawn chains and passers,
+  // a castled king with a shield, a king on an open wing, rooks on open and
+  // seventh ranks, and pieces with wildly different amounts of room.
+  constexpr std::array<std::string_view, 10> positions = {
+      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+      "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+      "r2q1rk1/pp1bppbp/2np1np1/8/3NP3/2N1BP2/PPPQB1PP/2KR3R w - - 0 1",
+      "4k3/1p6/8/3P4/8/8/1P6/4K3 w - - 0 1",
+      "3qk3/8/8/8/3Q4/8/5PPP/1K6 w - - 0 1",
+      "4k1r1/8/8/8/5n1q/8/PPP2PPP/6K1 b - - 0 1",
+      "4k3/R7/8/8/8/8/8/7K w - - 0 1",
+      "7k/8/8/8/8/2P5/2P5/7K w - - 0 1",
+      "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 b - - 0 1",
+  };
+
+  for (const auto fen : positions) {
+    expect_colour_symmetric(fen);
+  }
+}
+
+TEST(Eval, RandomPositionsAreColourSymmetric) {
+  // The hand-picked list above covers the cases somebody thought of. This one
+  // does not: several hundred seeded random boards, each with two kings and a
+  // handful of pieces scattered anywhere they are legal. A forward direction
+  // flipped the wrong way for one colour survives a curated list far more easily
+  // than it survives this. Seeded, so any failure is reproducible.
+  constexpr int POSITIONS = 400;
+  constexpr std::string_view PLACEABLE = "PNBRQpnbrq";
+
+  HashRng rng(0xC0FFEE'1234'5678ULL);
+
+  const auto random_index = [&rng](std::size_t bound) {
+    return static_cast<std::size_t>(rng.next() % bound);
+  };
+
+  for (int attempt = 0; attempt < POSITIONS; ++attempt) {
+    std::array<char, 64> squares{};
+    squares.fill('\0');
+
+    // Exactly one king per side: the FEN parser rejects a second one, and a
+    // board with no king at all would skip the king-safety term entirely.
+    for (const char king_char : {'K', 'k'}) {
+      std::size_t square = random_index(64);
+      while (squares[square] != '\0') {
+        square = random_index(64);
+      }
+      squares[square] = king_char;
+    }
+
+    const std::size_t extra_pieces = 1 + random_index(11);
+    for (std::size_t piece = 0; piece < extra_pieces; ++piece) {
+      const char piece_char = PLACEABLE[random_index(PLACEABLE.size())];
+
+      for (int tries = 0; tries < 8; ++tries) {
+        const std::size_t square = random_index(64);
+        const bool back_rank = square < 8 || square >= 56;
+        const bool is_pawn = piece_char == 'P' || piece_char == 'p';
+        if (squares[square] != '\0' || (is_pawn && back_rank)) {
+          continue; // Occupied, or a pawn on a rank it can never stand on.
+        }
+        squares[square] = piece_char;
+        break;
+      }
+    }
+
+    // Squares run A1..H8, but a FEN is written from rank 8 downwards.
+    std::string board;
+    for (int rank = 7; rank >= 0; --rank) {
+      int empty_run = 0;
+      for (int file = 0; file < 8; ++file) {
+        const char square = squares[static_cast<std::size_t>((rank * 8) + file)];
+        if (square == '\0') {
+          ++empty_run;
+          continue;
+        }
+        if (empty_run > 0) {
+          board.push_back(static_cast<char>('0' + empty_run));
+          empty_run = 0;
+        }
+        board.push_back(square);
+      }
+      if (empty_run > 0) {
+        board.push_back(static_cast<char>('0' + empty_run));
+      }
+      if (rank > 0) {
+        board.push_back('/');
+      }
+    }
+
+    const std::string fen = board + (random_index(2) == 0 ? " w - - 0 1" : " b - - 0 1");
+    expect_colour_symmetric(fen);
+  }
+}
 
 TEST(Eval, MirroringFilesKeepsTheSameScore) {
   constexpr std::string_view fen =
@@ -882,10 +1062,12 @@ TEST(PawnStructureTerm, PassedPawnsGrowWithTheRankAndCountDoubleInTheEndgame) {
 
 TEST(PawnStructureTerm, StackedPawnsAreChargedOncePerPawnInFrontOfThem) {
   // Three pawns on the c-file against the same three pawns fanned out over the
-  // b, c and d files at the same ranks. Both sets are equally advanced, so the
-  // passed-pawn bonus is identical and what is left is two doubled penalties
-  // (the c2 and c3 pawns each have a friendly pawn ahead of them) plus three
-  // isolated ones (nothing on the b- or d-file to defend any of them).
+  // b, c and d files at the same ranks. The stack collects two doubled penalties
+  // (c2 and c3 each have a friendly pawn ahead of them) and three isolated ones
+  // (nothing on the b- or d-file to defend any of them). It also collects only
+  // ONE passed-pawn bonus, for the pawn in front, where the healthy trio
+  // collects three—so the ranks the two rear pawns would have been paid for come
+  // off as well.
   const auto tripled = parse("4k3/8/8/8/2P5/2P5/2P5/4K3 w - - 0 1");
   const auto spread = parse("4k3/8/8/8/3P4/2P5/1P6/4K3 w - - 0 1");
 
@@ -893,9 +1075,37 @@ TEST(PawnStructureTerm, StackedPawnsAreChargedOncePerPawnInFrontOfThem) {
   const auto healthy = eval_pawn_structure(Colour::White, spread.board);
 
   EXPECT_EQ(stacked.middlegame - healthy.middlegame,
-            (2 * DOUBLED_PAWN_PENALTY.middlegame) + (3 * ISOLATED_PAWN_PENALTY.middlegame));
-  EXPECT_EQ(stacked.endgame - healthy.endgame,
-            (2 * DOUBLED_PAWN_PENALTY.endgame) + (3 * ISOLATED_PAWN_PENALTY.endgame));
+            (2 * DOUBLED_PAWN_PENALTY.middlegame) + (3 * ISOLATED_PAWN_PENALTY.middlegame) -
+                PASSED_PAWN_MIDDLEGAME[1] - PASSED_PAWN_MIDDLEGAME[2]);
+  EXPECT_EQ(stacked.endgame - healthy.endgame, (2 * DOUBLED_PAWN_PENALTY.endgame) +
+                                                   (3 * ISOLATED_PAWN_PENALTY.endgame) -
+                                                   PASSED_PAWN_ENDGAME[1] - PASSED_PAWN_ENDGAME[2]);
+}
+
+TEST(PawnStructureTerm, OnlyTheFrontPawnOfAFileCountsAsPassed) {
+  // Two white pawns on c4 and c5 with the board otherwise bare of pawns. Both
+  // have an empty road ahead by the letter of the passed-pawn mask, but they are
+  // one promotion threat, not two: c4 can never get past c5. The stack is
+  // therefore worth exactly one passer—the front one—and the rear pawn is
+  // charged the doubled penalty on top.
+  const auto stacked = parse("4k3/8/8/2P5/2P5/8/8/4K3 w - - 0 1");
+  const auto single = parse("4k3/8/8/2P5/8/8/8/4K3 w - - 0 1");
+
+  const auto two_pawns = eval_pawn_structure(Colour::White, stacked.board);
+  const auto one_pawn = eval_pawn_structure(Colour::White, single.board);
+
+  // The extra pawn brings a doubled penalty and an isolated penalty of its own,
+  // and no passed-pawn bonus whatsoever.
+  EXPECT_EQ(two_pawns.middlegame - one_pawn.middlegame,
+            DOUBLED_PAWN_PENALTY.middlegame + ISOLATED_PAWN_PENALTY.middlegame);
+  EXPECT_EQ(two_pawns.endgame - one_pawn.endgame,
+            DOUBLED_PAWN_PENALTY.endgame + ISOLATED_PAWN_PENALTY.endgame);
+
+  // Put the same second pawn on a file of its own instead and it becomes a
+  // passer in its own right. f4 and c4 are worth the same on the pawn table, so
+  // this is the doubled pair's lost bonus made visible.
+  const auto separate = parse("4k3/8/8/2P5/5P2/8/8/4K3 w - - 0 1");
+  EXPECT_GT(eval(separate), eval(stacked));
 }
 
 TEST(RookTerm, OpenFileBeatsSemiOpenBeatsBlocked) {
@@ -947,14 +1157,22 @@ TEST(KingSafetyTerm, AttackersHurtUntilTheCap) {
   EXPECT_EQ(eval_king_safety(Colour::White, pos.board, 3).endgame, 0);
 }
 
-TEST(KingSafetyTerm, ShieldIsCappedAtOnePawnPerFile) {
-  // Doubled pawns in front of the king are not extra shelter: g2 and g3 cover
-  // the same file, so the second one earns nothing.
-  const auto three_files = parse("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1");
-  const auto stacked = parse("4k3/8/8/8/8/6P1/5PPP/6K1 w - - 0 1");
+TEST(KingSafetyTerm, ShieldIsCappedAtThreePawns) {
+  // The cap is on the TOTAL number of pawns in the shield zone, not on how many
+  // may stand on each file. Three pawns in front of a castled king is the most
+  // shelter there is to have; a fourth pawn crammed in behind them is a pawn
+  // standing behind another pawn, and it earns nothing.
+  const auto three_pawns = parse("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1");
+  const auto four_pawns = parse("4k3/8/8/8/8/6P1/5PPP/6K1 w - - 0 1");
 
-  EXPECT_EQ(eval_king_safety(Colour::White, three_files.board, 0),
-            eval_king_safety(Colour::White, stacked.board, 0));
+  EXPECT_EQ(eval_king_safety(Colour::White, three_pawns.board, 0),
+            eval_king_safety(Colour::White, four_pawns.board, 0));
+
+  // Two pawns really are less shelter than three, so the cap is a ceiling rather
+  // than a constant.
+  const auto two_pawns = parse("4k3/8/8/8/8/8/6PP/6K1 w - - 0 1");
+  EXPECT_GT(eval_king_safety(Colour::White, three_pawns.board, 0).middlegame,
+            eval_king_safety(Colour::White, two_pawns.board, 0).middlegame);
 }
 
 TEST(PieceActivityTerm, MinorsIgnoreSquaresEnemyPawnsCover) {
