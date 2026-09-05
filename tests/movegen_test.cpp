@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <ranges>
 #include <string_view>
 
@@ -69,6 +70,29 @@ void assert_attacked_matches_attackers(std::string_view fen) {
 std::size_t moves_from_square(const MoveList& moves, Square from) {
   return static_cast<std::size_t>(
       std::ranges::count_if(moves, [from](const Move& mv) { return mv.from == from; }));
+}
+
+// The deepest fixtures are marked in the fixture file rather than hidden in a
+// second file, so the whole suite stays in one place and one loader.
+bool is_slow_perft_record(const fixtures::PerftRecord& record) {
+  return record.name.starts_with("slow-");
+}
+
+void assert_perft_fixtures_match(bool slow) {
+  const auto records = fixtures::load_perft(fixtures::perft_path());
+  std::size_t checked = 0;
+
+  for (const auto& record : records) {
+    if (is_slow_perft_record(record) != slow) {
+      continue;
+    }
+
+    Position pos = Position::from_fen(record.fen);
+    EXPECT_EQ(record.nodes, perft(pos, static_cast<std::uint8_t>(record.depth))) << record.name;
+    ++checked;
+  }
+
+  EXPECT_GT(checked, 0);
 }
 
 std::size_t castling_move_count(const MoveList& moves) {
@@ -419,11 +443,16 @@ TEST(Movegen, IgnoreFriendlyPieceCaptures) {
 // Perft -------------------------------------------------------------------
 
 TEST(Perft, FixturesMatch) {
-  const auto records = fixtures::load_perft(fixtures::perft_path());
+  assert_perft_fixtures_match(false);
+}
 
-  for (const auto& record : records) {
-    Position pos = Position::from_fen(record.fen);
-    const auto nodes = perft(pos, static_cast<std::uint8_t>(record.depth));
-    EXPECT_EQ(record.nodes, nodes) << record.name;
+// The deepest positions count millions of nodes, which takes a minute or more
+// in this build because every move is checked by ASan and UBSan. They stay
+// opt-in so the everyday suite remains quick.
+TEST(Perft, SlowFixturesMatch) {
+  if (std::getenv("C3_SLOW_PERFT") == nullptr) {
+    GTEST_SKIP() << "set C3_SLOW_PERFT=1 to run the deep perft fixtures";
   }
+
+  assert_perft_fixtures_match(true);
 }
