@@ -248,13 +248,14 @@ printf 'bench\nquit\n' | ./build-release/c3 | tail -2
 ```
 
 ```
-info string bench time <T> ms
-info string bench nodes <N> nps <M>
+info string bench time 301 ms
+info string bench nodes 218288 nps 725209
 ```
 
-No node count is quoted here on purpose: every change to search, evaluation or
-move ordering moves it, which is the whole point of the number. Take the figure
-from the build you are comparing against, not from this file.
+That output is from the commit that wrote this section. Every change to search,
+evaluation or move ordering moves the node count, which is the whole point of
+the number, so take the figure you compare against from the build in front of
+you rather than from this file.
 
 The transposition table is cleared before each position and once more at the
 end, so the node total is reproducible: run it twice on one build and the
