@@ -440,6 +440,61 @@ bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int al
 // contradict it. That is why the count is generous and the depth is small.
 // =============================================================================
 
+// =============================================================================
+// INTERNAL ITERATIVE REDUCTION (IIR)
+// =============================================================================
+// Everything alpha-beta saves depends on searching the best move first, and at
+// most nodes the transposition table supplies it. At a node with nothing in the
+// table there is no such move: ordering falls back to captures by MVV-LVA and
+// quiet moves by history, and if it guesses wrong the node searches its whole
+// list at full depth before finding out.
+//
+// TWO ANSWERS TO THAT, and this engine takes the cheaper one.
+//
+//   INTERNAL ITERATIVE DEEPENING (IID) searches the node first at a much
+//   reduced depth purely to find out which move comes back best, then throws
+//   that search away and searches properly with the answer as the hash move.
+//   It buys good ordering by paying for an extra, smaller search of the same
+//   node—perhaps a fifth of the cost—and the shallow search is often wrong
+//   about a node whose whole problem is that nobody has looked at it yet.
+//
+//   INTERNAL ITERATIVE REDUCTION (IIR) makes the same observation and draws a
+//   blunter conclusion: a node with no hash move is a node we are poorly
+//   equipped to search, so search it one ply shallower and let the
+//   transposition table remember what it found. The next iteration of
+//   iterative deepening arrives at this node WITH a hash move—the one this
+//   reduced search stored—and searches it at full depth with good ordering.
+//   Iterative deepening is already doing IID's job, one iteration at a time;
+//   IIR simply stops paying for the same information twice.
+//
+// It costs one line and no extra search, which is why it is what is here. IID
+// was not measured against it: the case for IIR is that it reuses a mechanism
+// the search already has, and adding IID would mean adding a second, private
+// iterative deepening loop inside the first one.
+//
+// IT APPLIES AT EVERY NODE, NOT ONLY ON THE PRINCIPAL VARIATION, and that is
+// the whole difference between a rule that does something and one that does
+// not. Confined to PV nodes it is nearly dead: by the time iterative deepening
+// reaches depth d, every PV node with four or more plies still to search was
+// already visited by iteration d - 1 and has a hash move waiting, so the
+// condition almost never holds. Measured over the bench, PV-only took the node
+// total from 240,269 to 238,588—seven parts in a thousand—while the same rule
+// at every node took it to 204,377, and `go movetime 1000` from the start
+// position went from depth 12 to depth 15. The nodes that really are unvisited
+// are the zero-window ones out in the width of the tree, and those are exactly
+// the ones the PV-only form refuses to help.
+//
+// FAILURE MODE. The reduction is real depth given up, on a node nobody has
+// looked at yet, so there is no evidence either way about what it contains.
+// When a tactic lives exactly at that node's horizon the shallower search
+// misses it, and the correction only arrives with the next iteration—which is
+// the whole bet: that the iteration is cheap because everything else got
+// cheaper too. The minimum depth of 4 keeps the ply given up a small fraction
+// of what is left, and no reduction is ever taken twice at the same node.
+// =============================================================================
+
+constexpr std::uint8_t IIR_MIN_DEPTH = 4;
+
 constexpr std::uint8_t LATE_MOVE_PRUNING_DEPTH = 4;
 constexpr std::size_t LATE_MOVE_PRUNING_BASE = 3;
 
@@ -1624,6 +1679,19 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // Even if depth is insufficient (or we refused the cutoff), the stored
     // move is worth having: it is the best move a previous search found here.
     hash_move_packed = entry->packed_move;
+  }
+
+  // INTERNAL ITERATIVE REDUCTION
+  // A node with nothing in the table has no move it has any reason to try
+  // first, and a full-depth search with bad ordering is the most expensive
+  // thing this function can do. Search it a ply shallower instead and let the
+  // table keep the best move it finds; the next iteration comes back here with
+  // a hash move and spends the full depth well. See the block above for why
+  // this is preferred to internal iterative deepening, and why it is not
+  // restricted to PV nodes.
+  if (ctx.internal_iterative_reduction_enabled && depth >= IIR_MIN_DEPTH &&
+      hash_move_packed == TT_NO_MOVE) {
+    depth -= 1;
   }
 
   const Colour colour_to_move = pos.colour_to_move;

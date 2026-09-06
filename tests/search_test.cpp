@@ -444,6 +444,30 @@ std::uint64_t nodes_searched(std::string_view fen, std::uint8_t depth, search::S
   return report.nodes;
 }
 
+// The same measurement taken the way a real search takes it: depth 1, then 2,
+// and so on, through ONE table and ONE context. The distinction matters for any
+// mechanism that reads the transposition table. Internal iterative reduction is
+// the extreme case—against a cold table it fires at every node and "saves"
+// nodes simply by searching a shallower tree, which says nothing about the
+// engine—so what it does has to be measured against a table iterative deepening
+// has been filling all along.
+std::uint64_t nodes_searched_iteratively(std::string_view fen, std::uint8_t depth,
+                                         search::SearchContext& ctx) {
+  Position pos = parse(fen);
+  search::TranspositionTable tt(8);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  for (std::uint8_t iteration = 1; iteration <= depth; ++iteration) {
+    pv.clear();
+    search::detail::alphabeta(pos, iteration, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report,
+                              stopper);
+  }
+
+  return report.nodes;
+}
+
 } // namespace
 
 TEST(SearchPruning, ReverseFutilityCutsOffNodesThatAreAlreadyWinning) {
@@ -490,6 +514,24 @@ TEST(SearchPruning, LateMovePruningStopsSearchingQuietMovesNearTheHorizon) {
 
   EXPECT_LT(nodes_searched(FEN, 7, with_pruning), nodes_searched(FEN, 7, without_pruning))
       << "the tail of a node's quiet moves should not be costing a node each";
+}
+
+TEST(SearchPruning, InternalIterativeReductionShrinksTheTreeAgainstAWarmTable) {
+  // Measured through iterative deepening, because that is the only setting in
+  // which the rule means anything: a node the table already knows about keeps
+  // its full depth, and only the ones no earlier iteration reached give a ply
+  // up. Against a cold table this comparison would be a tautology—every node
+  // would qualify and the "saving" would just be a shallower search.
+  constexpr std::string_view FEN =
+      "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R b KQ - 0 9";
+
+  search::SearchContext with_reduction;
+  search::SearchContext without_reduction;
+  without_reduction.internal_iterative_reduction_enabled = false;
+
+  EXPECT_LT(nodes_searched_iteratively(FEN, 8, with_reduction),
+            nodes_searched_iteratively(FEN, 8, without_reduction))
+      << "a node with no hash move should not be costing full depth";
 }
 
 TEST(SearchPruning, LateMovePruningNeverInventsAMateOrAStalemate) {
@@ -553,6 +595,15 @@ TEST(SearchCounterMoves, ASearchFillsTheTable) {
   Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
 
   search::SearchContext ctx;
+  // A ONE-SHOT SEARCH AGAINST AN EMPTY TABLE, which is not what internal
+  // iterative reduction is built for: with nothing in the table every node
+  // qualifies, so the search this test asks for at depth 4 would really be a
+  // depth-3 one and might never produce the quiet cutoff it is looking for. A
+  // real search reaches depth 4 through depths 1, 2 and 3 and arrives with a
+  // hash move. The switch is here so the test measures counter-moves rather
+  // than the interaction of two unrelated mechanisms.
+  ctx.internal_iterative_reduction_enabled = false;
+
   search::TranspositionTable tt(1);
   search::Report report;
   search::Stopper stopper;
@@ -598,6 +649,11 @@ TEST(SearchPlySafety, ResolvesStaticallyAtThePlyCeiling) {
   // 0, 1, 2... — the root's own slots, filled in from 255 plies away.
   const auto killers_stored_by = [&pos](std::uint8_t ply) {
     search::SearchContext ctx;
+    // See the note in ASearchFillsTheTable: a one-shot search against an empty
+    // table would be reduced a ply by internal iterative reduction, and what is
+    // under test here is where the recursion stops, not how deep it went.
+    ctx.internal_iterative_reduction_enabled = false;
+
     search::TranspositionTable tt(1);
     search::Report report;
     report.ply = ply;
@@ -634,6 +690,10 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
 
   search::SearchContext ctx;
+  // Same reason as above: the search has to actually get the depth it was
+  // asked for before "it went past that depth" means anything.
+  ctx.internal_iterative_reduction_enabled = false;
+
   search::TranspositionTable tt(1);
   search::Report report;
   search::Stopper stopper;

@@ -93,6 +93,11 @@
 //      searched at all. Captures, checks and the moves the search has evidence
 //      for are exempt, and the first legal move always is.
 //
+//  14. INTERNAL ITERATIVE REDUCTION
+//      A node the transposition table knows nothing about has no move worth
+//      trying first, so it is searched one ply shallower and the move it finds
+//      is left in the table for the next iteration to order by.
+//
 // WHERE THE SEARCH'S WORKING STORAGE LIVES
 // Not on the stack. The recursion is up to 255 frames deep and each frame
 // would otherwise hold several two-kilobyte move lists, which overflows the
@@ -679,6 +684,12 @@ public:
   // from the back of a node's list, so the only thing that changes is how many
   // of them are searched. Nothing on the UCI path writes it.
   bool late_move_pruning_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. Internal iterative reduction gives
+  // up a ply at a node the transposition table knows nothing about, so what it
+  // changes is where the search spends its depth. Nothing on the UCI path
+  // writes it.
+  bool internal_iterative_reduction_enabled{true};
 
   // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
   // the underpromotion filter in quiescence all change how much work is done
