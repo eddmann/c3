@@ -462,6 +462,22 @@ TEST(SearchPruning, ReverseFutilityCutsOffNodesThatAreAlreadyWinning) {
       << "a node far enough ahead should be failing high without searching";
 }
 
+TEST(SearchPruning, RazoringVerifiesALostPositionWithQuiescenceInsteadOfSearchingIt) {
+  // Black is a piece down with a white pawn on d7 about to promote, so most of
+  // the shallow non-PV nodes below the root are positions whose static
+  // evaluation is far below the window they are searched with. Razoring hands
+  // those to quiescence—which is where the only moves that could rescue them
+  // live—and skips the full-width search when quiescence agrees.
+  constexpr std::string_view FEN = "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R b KQ - 1 8";
+
+  search::SearchContext with_razoring;
+  search::SearchContext without_razoring;
+  without_razoring.razoring_enabled = false;
+
+  EXPECT_LT(nodes_searched(FEN, 7, with_razoring), nodes_searched(FEN, 7, without_razoring))
+      << "a node far enough behind should be resolved by quiescence, not searched";
+}
+
 TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
   search::CounterMoves counters;
   const auto previous = make_move(Piece::BP, "d7", "d5");

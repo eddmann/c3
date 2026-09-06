@@ -82,6 +82,11 @@
 //      a move: if the position is so far ahead that a few plies cannot claw
 //      the margin back, fail high without searching at all.
 //
+//  12. RAZORING
+//      The same question asked from behind: a node whose static evaluation is
+//      far BELOW alpha drops into quiescence, and fails low without a
+//      full-width search only if the capture search agrees with the guess.
+//
 // WHERE THE SEARCH'S WORKING STORAGE LIVES
 // Not on the stack. The recursion is up to 255 frames deep and each frame
 // would otherwise hold several two-kilobyte move lists, which overflows the
@@ -658,6 +663,11 @@ public:
   // off before it searches anything, so what it changes is the size of the tree
   // and nothing else. Nothing on the UCI path writes it.
   bool reverse_futility_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. Razoring replaces a full-width
+  // search with a quiescence search, so what it changes is how the tree is
+  // spent rather than anything reported. Nothing on the UCI path writes it.
+  bool razoring_enabled{true};
 
   // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
   // the underpromotion filter in quiescence all change how much work is done

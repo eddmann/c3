@@ -178,12 +178,64 @@ int reverse_futility_margin(std::uint8_t depth) {
   return REVERSE_FUTILITY_MARGIN_PER_PLY * static_cast<int>(depth);
 }
 
+// =============================================================================
+// RAZORING
+// =============================================================================
+// The other end of the same telescope. Reverse futility asks whether a node is
+// too far ahead to be worth searching; razoring asks whether it is too far
+// behind. If the static evaluation plus a generous margin still does not reach
+// alpha, the position is so bad that a full-width search is unlikely to be
+// spending its time well.
+//
+// THE NAIVE FORM IS A TRAP. "Too far behind, so return alpha" throws away the
+// one thing that could rescue the position: a capture. A node down a rook
+// whose next move wins the queen back evaluates terribly and is perfectly
+// fine, and the static evaluation cannot tell those two apart—that is exactly
+// what quiescence exists for.
+//
+// SO RAZORING VERIFIES. Instead of returning, it drops into quiescence with
+// the node's own window and asks the question again with the captures
+// resolved:
+//
+//     static_eval + margin(depth) <= alpha        the guess
+//     quiescence(alpha, beta)     <= alpha        the verification
+//
+// Only when the capture search agrees does the node fail low without a
+// full-width search. When it disagrees—there was a tactic after all—nothing is
+// pruned and the node searches normally, having paid for one quiescence call
+// it would very likely have made at its leaves anyway.
+//
+// WHY THE MARGIN IS SO LARGE. It stands for everything a full-width search of
+// two plies could add that quiescence cannot see: a fork set up by a quiet
+// move, a passed pawn pushed past its blockader, a piece dropped into an
+// outpost. Two hundred centipawns a ply is deliberately more than a minor
+// piece, because being wrong here costs a whole subtree of search. A smaller
+// margin fires more often: 130 a ply took the bench total slightly lower
+// (386k against 389k) but cost SEVEN PER CENT more nodes on a position where
+// the side to move was behind and had a tactic, which is the shape of mistake
+// this rule is supposed to be careful about. Two hundred is the value that
+// helps every position measured rather than most of them.
+//
+// FAILURE MODE: THE QUIET RESCUE. Quiescence only searches captures, so a
+// position saved by a quiet move—the only defence to a threat, a fortress, a
+// zugzwang—looks as lost to the verification as it did to the static
+// evaluation, and the node fails low anyway. That is the bet, and it is why
+// razoring is confined to non-PV nodes at depth 1 and 2, where the mistake is
+// cheap and a re-search elsewhere usually catches it.
+// =============================================================================
+constexpr std::uint8_t RAZORING_DEPTH = 2;
+constexpr int RAZORING_MARGIN_PER_PLY = 200;
+
+int razoring_margin(std::uint8_t depth) {
+  return RAZORING_MARGIN_PER_PLY * static_cast<int>(depth);
+}
+
 // The deepest node that computes a static evaluation for the shallow-depth
 // rules above. eval() is not free, so it is asked for once per node and only
 // where one of those rules can actually read the answer.
 constexpr std::uint8_t STATIC_EVAL_DEPTH = REVERSE_FUTILITY_DEPTH;
 
-static_assert(STATIC_EVAL_DEPTH >= FUTILITY_DEPTH,
+static_assert(STATIC_EVAL_DEPTH >= FUTILITY_DEPTH && STATIC_EVAL_DEPTH >= RAZORING_DEPTH,
               "every rule that reads the static evaluation must be inside the depth that "
               "computes it");
 
@@ -1549,6 +1601,21 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       depth <= REVERSE_FUTILITY_DEPTH && std::abs(beta) < CENTIPAWN_MATE_THRESHOLD &&
       static_eval - reverse_futility_margin(depth) >= beta) {
     return beta;
+  }
+
+  // RAZORING
+  // Far enough behind that a full-width search looks like a poor use of the
+  // time—but the claim is VERIFIED by quiescence before it is acted on, so a
+  // position that is only losing until its capture is played survives. A
+  // non-PV node's window is already (alpha, alpha + 1), so quiescence is asked
+  // the node's own question and answers it with the captures resolved. See the
+  // block above for why the naive form is a trap.
+  if (ctx.razoring_enabled && has_static_eval && !is_pv_node && depth <= RAZORING_DEPTH &&
+      static_eval + razoring_margin(depth) <= alpha) {
+    const int resolved = quiescence(pos, alpha, beta, ctx, report, stopper);
+    if (resolved <= alpha) {
+      return alpha;
+    }
   }
 
   // NULL-MOVE PRUNING
