@@ -126,6 +126,59 @@
 #include "c3/movegen.hpp"
 #include "c3/position.hpp"
 
+// ---------------------------------------------------------------------------
+// COMPILE-TIME EXPERIMENT HOOK
+// ---------------------------------------------------------------------------
+// Every heuristic below has a test-only switch on SearchContext, and every one
+// of those switches defaults to true. The default is written through
+// C3_HEURISTIC_ENABLED so that a build can flip exactly one of them to false
+// from the command line—`-DC3_DISABLE_LATE_MOVE_PRUNING`, say—without a source
+// change and without any of the others moving. That is what makes an
+// engine-versus-engine match able to price a single heuristic: two binaries
+// from the same commit that differ in one rule.
+//
+// The default build defines none of these macros on the command line, so every
+// switch below is true
+// and the shipped engine is byte-for-byte the engine it was before this hook
+// existed. (The block below then defines all nine to 0, which is the
+// normalisation, not a default anybody wrote.) And the switches are still written by nobody on the
+// UCI path: the only thing that changes a default is the compiler invocation, so a running engine
+// cannot be talked into a different search by anything arriving over stdin.
+//
+// Each name is normalised to 0 when the command line has not defined it, which
+// is what lets one helper macro serve all of them: `-DC3_DISABLE_X` gives the
+// macro the value 1, and the negation below turns that into a false default.
+// ---------------------------------------------------------------------------
+#ifndef C3_DISABLE_REDUCTIONS
+#define C3_DISABLE_REDUCTIONS 0
+#endif
+#ifndef C3_DISABLE_REVERSE_FUTILITY
+#define C3_DISABLE_REVERSE_FUTILITY 0
+#endif
+#ifndef C3_DISABLE_RAZORING
+#define C3_DISABLE_RAZORING 0
+#endif
+#ifndef C3_DISABLE_LATE_MOVE_PRUNING
+#define C3_DISABLE_LATE_MOVE_PRUNING 0
+#endif
+#ifndef C3_DISABLE_INTERNAL_ITERATIVE_REDUCTION
+#define C3_DISABLE_INTERNAL_ITERATIVE_REDUCTION 0
+#endif
+#ifndef C3_DISABLE_CHECK_EXTENSION_CAP
+#define C3_DISABLE_CHECK_EXTENSION_CAP 0
+#endif
+#ifndef C3_DISABLE_QUIESCENCE_PRUNING
+#define C3_DISABLE_QUIESCENCE_PRUNING 0
+#endif
+#ifndef C3_DISABLE_NULL_MOVE
+#define C3_DISABLE_NULL_MOVE 0
+#endif
+#ifndef C3_DISABLE_FUTILITY
+#define C3_DISABLE_FUTILITY 0
+#endif
+
+#define C3_HEURISTIC_ENABLED(NAME) (!(C3_DISABLE_##NAME))
+
 namespace c3::search {
 
 inline constexpr std::uint8_t MAX_DEPTH = 255;
@@ -712,40 +765,57 @@ public:
   // on the UCI path ever writes this; it is here for tests and for bench
   // experiments, and it is why the reduction block in search.cpp asks a
   // question that always answers "yes" in a real game.
-  bool reductions_enabled{true};
+  bool reductions_enabled{C3_HEURISTIC_ENABLED(REDUCTIONS)};
 
   // TEST-ONLY SWITCH, for the same reason. Reverse futility pruning cuts a node
   // off before it searches anything, so what it changes is the size of the tree
   // and nothing else. Nothing on the UCI path writes it.
-  bool reverse_futility_enabled{true};
+  bool reverse_futility_enabled{C3_HEURISTIC_ENABLED(REVERSE_FUTILITY)};
 
   // TEST-ONLY SWITCH, for the same reason. Razoring replaces a full-width
   // search with a quiescence search, so what it changes is how the tree is
   // spent rather than anything reported. Nothing on the UCI path writes it.
-  bool razoring_enabled{true};
+  bool razoring_enabled{C3_HEURISTIC_ENABLED(RAZORING)};
 
   // TEST-ONLY SWITCH, for the same reason. Late move pruning drops quiet moves
   // from the back of a node's list, so the only thing that changes is how many
   // of them are searched. Nothing on the UCI path writes it.
-  bool late_move_pruning_enabled{true};
+  bool late_move_pruning_enabled{C3_HEURISTIC_ENABLED(LATE_MOVE_PRUNING)};
 
   // TEST-ONLY SWITCH, for the same reason. Internal iterative reduction gives
   // up a ply at a node the transposition table knows nothing about, so what it
   // changes is where the search spends its depth. Nothing on the UCI path
   // writes it.
-  bool internal_iterative_reduction_enabled{true};
+  bool internal_iterative_reduction_enabled{C3_HEURISTIC_ENABLED(INTERNAL_ITERATIVE_REDUCTION)};
 
   // TEST-ONLY SWITCH, for the same reason. The cap on check extensions only
   // decides how long a forcing line may keep buying plies, so what it changes
   // is the size of the tree under a position full of checks. Nothing on the UCI
   // path writes it.
-  bool check_extension_cap_enabled{true};
+  bool check_extension_cap_enabled{C3_HEURISTIC_ENABLED(CHECK_EXTENSION_CAP)};
 
   // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
   // the underpromotion filter in quiescence all change how much work is done
   // and (deliberately) a little of what is seen, so the only way to measure
   // them is to run with and without. Nothing on the UCI path writes it.
-  bool quiescence_pruning_enabled{true};
+  bool quiescence_pruning_enabled{C3_HEURISTIC_ENABLED(QUIESCENCE_PRUNING)};
+
+  // TEST-ONLY SWITCH, for the same reason. Null-move pruning spends a reduced
+  // search to buy the right to skip a full-width one, so what it changes is the
+  // shape of the tree and (where the null move lies to it) which lines are
+  // trusted. Nothing on the UCI path writes it.
+  bool null_move_enabled{C3_HEURISTIC_ENABLED(NULL_MOVE)};
+
+  // TEST-ONLY SWITCH, for the same reason. Futility pruning drops quiet moves
+  // at a node too close to the horizon for them to reach alpha, so the only
+  // thing that changes is how many of them are searched. Nothing on the UCI
+  // path writes it.
+  bool futility_enabled{C3_HEURISTIC_ENABLED(FUTILITY)};
+
+// The last of the switches has taken its default, so the helper is retired
+// here rather than left in every translation unit that includes this header: a
+// name that generic has no business outliving the nine uses above.
+#undef C3_HEURISTIC_ENABLED
 
   // The scratch row for a node at `ply`. Rows live for the whole search and are
   // reused by every node that visits that ply, so a reference into one stays
