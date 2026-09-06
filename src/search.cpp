@@ -813,11 +813,12 @@ constexpr int ORDER_COUNTER_MOVE = 700'000;
 // so can never climb into the counter-move band above.
 static_assert(HISTORY_MAX < ORDER_COUNTER_MOVE, "history must not outrank a counter-move");
 
-// The busiest legal position anyone has constructed offers 218 moves, and 256
-// is the round number engines conventionally allow for. Nothing is written past
-// it: a position that somehow offered more would simply have its surplus moves
-// searched in generation order (see select()), never scored out of bounds.
-constexpr std::size_t MAX_SCORED_MOVES = MOVE_LIST_RESERVE;
+// A MoveList never holds more than its fixed capacity (see move_list.hpp for
+// how that number was chosen), so scoring that many slots covers every move
+// the generator can hand us. Nothing is written past it: a position that
+// somehow offered more would simply have its surplus moves searched in
+// generation order (see select()), never scored out of bounds.
+constexpr std::size_t MAX_SCORED_MOVES = MoveList::CAPACITY;
 
 // The scores live in a row the caller owns—a SearchContext's per-ply scratch
 // during a search—rather than in this object. A quarter-kilobyte array of ints

@@ -106,12 +106,15 @@ void assert_lookups_match_oracle(Piece piece, std::span<const Direction> directi
 
     for (std::size_t sample = 0; sample < OCCUPANCY_SAMPLES; ++sample) {
       // The first two samples are the extremes: an empty board and a board
-      // where every other square blocks.
-      const Bitboard random_occupancy = rng.next() & rng.next();
-      const Bitboard occupancy = (sample == 0   ? 0
-                                  : sample == 1 ? ~Bitboard{0}
-                                                : random_occupancy) &
-                                 ~Bitboard(square);
+      // where every other square blocks. The generator is advanced on every
+      // sample so the sequence stays reproducible regardless of the extremes.
+      Bitboard sampled_occupancy = rng.next() & rng.next();
+      if (sample == 0) {
+        sampled_occupancy = 0;
+      } else if (sample == 1) {
+        sampled_occupancy = ~Bitboard{0};
+      }
+      const Bitboard occupancy = sampled_occupancy & ~Bitboard(square);
 
       const Board board = board_with_occupancy(occupancy);
 

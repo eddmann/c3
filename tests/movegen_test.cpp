@@ -1,8 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
+#include <exception>
+#include <iostream>
+#include <random>
 #include <ranges>
+#include <string>
 #include <string_view>
 
 #include "c3/attacks.hpp"
@@ -75,7 +81,7 @@ std::size_t moves_from_square(const MoveList& moves, Square from) {
 
 // The deepest fixtures are marked in the fixture file rather than hidden in a
 // second file, so the whole suite stays in one place and one loader.
-enum class PerftFixtureSet { Everyday, Slow };
+enum class PerftFixtureSet : std::uint8_t { Everyday, Slow };
 
 bool is_slow_perft_record(const fixtures::PerftRecord& record) {
   return record.name.starts_with("slow-");
@@ -106,6 +112,153 @@ std::size_t castling_move_count(const MoveList& moves) {
     }
   }
   return count;
+}
+
+// Support for MoveListCapacity.DISABLED_HillClimbStaysUnderCapacity, which
+// re-derives the pseudo-legal move ceiling MoveList's capacity is sized from.
+// A board is 64 squares of FEN piece letters, 0 meaning empty.
+using CrowdedBoard = std::array<char, 64>;
+
+constexpr std::string_view CROWDING_PIECE_TYPES = "QRBNP";
+
+constexpr bool is_back_rank_index(std::size_t square) {
+  return square < 8 || square >= 56;
+}
+
+std::size_t random_square(std::mt19937_64& rng) {
+  return std::uniform_int_distribution<std::size_t>(0, 63)(rng);
+}
+
+char random_piece_type(std::mt19937_64& rng) {
+  return CROWDING_PIECE_TYPES[rng() % CROWDING_PIECE_TYPES.size()];
+}
+
+std::string crowded_board_to_fen(const CrowdedBoard& board) {
+  std::string fen;
+
+  for (std::size_t rank = 8; rank-- > 0;) {
+    int empty = 0;
+
+    for (std::size_t file = 0; file < 8; ++file) {
+      const char piece = board[(rank * 8) + file];
+      if (piece == 0) {
+        ++empty;
+        continue;
+      }
+      if (empty != 0) {
+        fen += std::to_string(empty);
+        empty = 0;
+      }
+      fen += piece;
+    }
+
+    if (empty != 0) {
+      fen += std::to_string(empty);
+    }
+    if (rank != 0) {
+      fen += '/';
+    }
+  }
+
+  return fen + " w - - 0 1";
+}
+
+// Scores an arrangement, and checks the invariant the experiment exists to
+// test. Returns -1 for an arrangement the FEN parser rejects, so the climb
+// skips it rather than treating it as a dead end.
+int count_pseudo_legal(const CrowdedBoard& board) {
+  const std::string fen = crowded_board_to_fen(board);
+
+  try {
+    Position pos = Position::from_fen(fen);
+    const auto moves = pseudo_legal_moves(pos);
+    EXPECT_LE(moves.size(), MoveList::CAPACITY) << fen;
+    return static_cast<int>(moves.size());
+  } catch (const std::exception&) {
+    return -1;
+  }
+}
+
+// A white king, a black king and fifteen more white pieces of any type: more
+// material than any legal game can produce, which is the point.
+CrowdedBoard random_crowded_board(std::mt19937_64& rng) {
+  CrowdedBoard board{};
+  board[random_square(rng)] = 'K';
+
+  while (true) {
+    const std::size_t square = random_square(rng);
+    if (board[square] == 0) {
+      board[square] = 'k';
+      break;
+    }
+  }
+
+  for (int placed = 0; placed < 15; ++placed) {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      const std::size_t square = random_square(rng);
+      if (board[square] != 0) {
+        continue;
+      }
+      const char type = random_piece_type(rng);
+      board[square] = (type == 'P' && is_back_rank_index(square)) ? 'Q' : type;
+      break;
+    }
+  }
+
+  return board;
+}
+
+// One mutation: either slide a white piece to an empty square or retype it.
+// Returns false when the mutation was not applicable, leaving `board` alone.
+bool mutate_crowded_board(CrowdedBoard& board, std::mt19937_64& rng) {
+  const std::size_t from = random_square(rng);
+  const char piece = board[from];
+
+  if (piece == 0 || piece == 'k') {
+    return false;
+  }
+
+  if (rng() % 2 == 0) {
+    const std::size_t to = random_square(rng);
+    if (board[to] != 0 || (piece == 'P' && is_back_rank_index(to))) {
+      return false;
+    }
+    board[to] = piece;
+    board[from] = 0;
+    return true;
+  }
+
+  if (piece == 'K') {
+    return false;
+  }
+
+  const char type = random_piece_type(rng);
+  if (type == 'P' && is_back_rank_index(from)) {
+    return false;
+  }
+  board[from] = type;
+  return true;
+}
+
+// Accepts equal scores as well as better ones so the climb can walk along
+// plateaux instead of stalling on the first one it reaches.
+int hill_climb(CrowdedBoard& board, std::mt19937_64& rng, int steps) {
+  int best = count_pseudo_legal(board);
+
+  for (int step = 0; step < steps; ++step) {
+    CrowdedBoard candidate = board;
+    if (!mutate_crowded_board(candidate, rng)) {
+      continue;
+    }
+
+    const int score = count_pseudo_legal(candidate);
+    if (score >= best) {
+      best = score;
+      board = candidate;
+    }
+  }
+
+  return best;
 }
 
 } // namespace
@@ -288,14 +441,54 @@ TEST(Movegen, LegalMoveCountInCheckIsLimited) {
   assert_legal_move_count("rnbqkbnr/1pp1p1pp/p2p1p2/1B6/8/4P3/PPPP1PPP/RNBQK1NR b KQq - 0 1", 7);
 }
 
+// The experiment MAX_PSEUDO_LEGAL_MOVES is quoted from, kept runnable so the
+// figure can be re-derived rather than trusted. It is disabled by default
+// because it searches rather than proves, and because it is only quick in an
+// optimised build; run it with
+//
+//   build/tests/c3_tests --gtest_also_run_disabled_tests
+//       --gtest_filter='*HillClimbStaysUnderCapacity*'
+//
+// It hill-climbs over placements of a full sixteen-piece white side—a superset
+// of any material a real game can produce, since it will happily use fifteen
+// queens—and asserts that no arrangement it reaches generates more pseudo-legal
+// moves than a MoveList can hold.
+TEST(MoveListCapacity, DISABLED_HillClimbStaysUnderCapacity) {
+  // The budget the quoted 248 came from: a few seconds in a Release build.
+  constexpr int RESTARTS = 400;
+  constexpr int STEPS = 60000;
+
+  std::mt19937_64 rng(20240905);
+  int best_overall = 0;
+  std::string best_fen;
+
+  for (int restart = 0; restart < RESTARTS; ++restart) {
+    CrowdedBoard board = random_crowded_board(rng);
+    const int best = hill_climb(board, rng, STEPS);
+
+    if (best > best_overall) {
+      best_overall = best;
+      best_fen = crowded_board_to_fen(board);
+    }
+  }
+
+  // Informational: the figure MAX_PSEUDO_LEGAL_MOVES records. Beating it would
+  // not fail here—only exceeding CAPACITY does, which count_pseudo_legal
+  // checks on every arrangement it scores—but it would mean the margin
+  // move_list.hpp keeps needs revisiting.
+  std::cout << "best pseudo-legal count found: " << best_overall << " (" << best_fen << ")\n";
+  EXPECT_GT(best_overall, 0);
+  EXPECT_LE(static_cast<std::size_t>(best_overall), MoveList::CAPACITY);
+}
+
 TEST(Movegen, GeneratesTheMostCrowdedKnownPosition) {
   // 218 legal moves is the highest count found for a legal chess position, and
-  // the figure MOVE_LIST_RESERVE is sized from.
+  // the figure MoveList's fixed capacity is sized from.
   const Position pos = parse_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1");
   const auto moves = legal_moves(pos);
 
-  EXPECT_EQ(moves.size(), 218);
-  EXPECT_LE(moves.size(), MOVE_LIST_RESERVE);
+  EXPECT_EQ(moves.size(), MAX_MOVES_IN_A_POSITION);
+  EXPECT_LE(moves.size(), MoveList::CAPACITY);
 }
 
 TEST(Movegen, LegalMovesRejectMovesByAPinnedPiece) {
@@ -493,7 +686,7 @@ TEST(Movegen, RookCaptureOnCornerRemovesTheDefendersCastlingRight) {
   Position pos = parse_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
   const auto moves = legal_moves(pos);
 
-  const auto capture = std::ranges::find_if(
+  const auto* const capture = std::ranges::find_if(
       moves, [](const Move& mv) { return mv.from == Square::A1 && mv.to == Square::A8; });
   ASSERT_NE(capture, moves.end());
 
@@ -511,7 +704,7 @@ TEST(Movegen, PromotionCaptureOnCornerRemovesTheDefendersCastlingRight) {
   Position pos = parse_fen("r3k2r/1P6/8/8/8/8/8/R3K2R w KQkq - 0 1");
   const auto moves = legal_moves(pos);
 
-  const auto promotion_capture = std::ranges::find_if(moves, [](const Move& mv) {
+  const auto* const promotion_capture = std::ranges::find_if(moves, [](const Move& mv) {
     return mv.from == Square::B7 && mv.to == Square::A8 && mv.promotion_piece == Piece::WQ;
   });
   ASSERT_NE(promotion_capture, moves.end());

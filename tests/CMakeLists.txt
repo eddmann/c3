@@ -64,6 +64,7 @@ add_executable(c3_tests
   position_test.cpp
   primitives_test.cpp
   rng_test.cpp
+  move_list_test.cpp
   movegen_test.cpp
   search_test.cpp
   uci_test.cpp
