@@ -49,6 +49,32 @@ position startpos moves e2e4 e7e5
 go depth 10
 ```
 
+### The `bench` command
+
+`bench` is a c3 extension rather than part of UCI. It searches twelve fixed
+positions - openings, middlegames, tactics and endgames - to a fixed depth
+(8 by default, 12 at most) and reports the total:
+
+```bash
+printf 'bench\nquit\n' | ./build-release/c3 | tail -2
+```
+
+```
+info string bench time 696 ms
+info string bench nodes 1133254 nps 1628238
+```
+
+The transposition table is cleared before each position and once more at the
+end, so the node total is reproducible: run it twice on one build and the
+`nodes` figure is identical, while `nps` moves with whatever else the machine
+is doing. Two builds that print the same total are searching the same tree,
+which makes that number a per-commit signature for the search - quote it before
+and after any change to search, evaluation or move ordering, including
+"unchanged at N" when the change is meant to be behaviour-neutral.
+
+`bench <depth>` runs the same list shallower or deeper (1 to 12). It runs on
+the main thread and cannot be interrupted, which is why the depth is capped.
+
 ## Prerequisites
 
 - CMake 3.20+
@@ -66,10 +92,15 @@ A Makefile wraps common commands. Run `make help` to see all targets:
 make build         # Debug build with sanitizers
 make release       # Release build with LTO
 make profile       # -O2 build with debug info for profilers
+make run           # Build and run the debug binary
 make test          # Run unit tests (debug tree)
 make test-release  # Run unit tests against the optimized build
 make fmt           # Format code
 make lint          # Build with clang-tidy
+make can-release   # Run all CI checks (format, lint, test)
+make gauntlet      # Play a gauntlet vs another engine
+make compare       # SPRT HEAD against origin/main
+make magic         # Regenerate the magic bitboard tables
 make clean         # Clean all build directories
 ```
 
@@ -96,16 +127,28 @@ All options are `-D<name>=ON|OFF` at configure time:
 | ----------------------- | ----------------------------------------------- | ------------------ |
 | `C3_BUILD_TESTS`        | Configure and build the GoogleTest suite        | `ON`               |
 | `C3_WARNINGS_AS_ERRORS` | Add `-Werror` (`/WX` on MSVC); CI turns this on | `OFF`              |
+| `C3_EXPENSIVE_ASSERTS`  | Slow Debug-only consistency checks              | `OFF`              |
 | `C3_ENABLE_ASAN`        | AddressSanitizer in Debug builds                | `ON` (not Windows) |
 | `C3_ENABLE_UBSAN`       | UndefinedBehaviorSanitizer in Debug builds      | `ON` (not Windows) |
 | `C3_ENABLE_CLANG_TIDY`  | Run clang-tidy during the build                 | `OFF`              |
 | `C3_REGENERATE_MAGIC`   | Rebuild `include/c3/magic.hpp`                  | `OFF`              |
 
-GoogleTest is fetched at the commit tagged v1.14.0. An already installed GTest
-is reused instead when CMake finds one, which requires CMake 3.24 or newer
-(older versions always fetch), and
-`-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=/path/to/googletest` points the build at a
-local checkout for fully offline work.
+`C3_EXPENSIVE_ASSERTS` compiles in the Debug checks that are too costly to run
+on every node - chiefly rebuilding the evaluation accumulator from scratch after
+each make/unmake and comparing it against the maintained running total. It
+roughly doubles the runtime of the perft suite, which is why the everyday
+sanitizer build leaves it off; turn it on when hunting a suspected drift in an
+incremental update.
+
+GoogleTest is fetched at the commit tagged v1.14.0 (pinned by sha, since a tag
+can be moved). An already installed GTest is reused instead when CMake finds
+one, which requires CMake 3.24 or newer (older versions always fetch), and
+`-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=/path/to/googletest` always wins over
+both, pointing the build at a local checkout for fully offline work:
+
+```bash
+cmake --preset debug -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=/path/to/googletest
+```
 
 ### Why the engine compiles twice in test builds
 
@@ -145,9 +188,42 @@ make test-release  # same suite against the optimized build
 # or: ctest --preset tests / ctest --preset release-tests
 ```
 
-The suite is GoogleTest plus two Python cases registered with ctest: a summary
-fixture for the gauntlet script and the statistics unit tests in
-`tests/scripts/test_common.py`.
+Each GoogleTest case becomes its own ctest entry via `gtest_discover_tests`, so
+a failure names itself. Alongside them ctest registers three Python cases,
+whenever CMake finds a Python 3 interpreter:
+
+| Test                       | What it covers                                         |
+| -------------------------- | ------------------------------------------------------ |
+| `Fastchess.SummaryFixture` | The gauntlet summariser, over a checked-in sample PGN   |
+| `Scripts.CommonUnitTests`  | The statistics helpers in `scripts/common.py`           |
+| `Scripts.TexelTuneUnitTests` | The pure functions behind `scripts/texel_tune.py`     |
+
+#### The deep perft run
+
+The `slow-` records in `tests/fixtures/perft.txt` count some 15 million nodes
+between them, which takes minutes under ASan/UBSan. They are skipped unless
+`C3_SLOW_PERFT` is set, and one ctest entry - `Perft.SlowOptIn`, labelled
+`slow` - supplies it:
+
+```bash
+ctest --preset slow-tests
+```
+
+`ctest --preset tests` and `ctest --preset release-tests` both exclude that
+label, so the everyday run stays quick. Run the slow one before a release, or
+after any change to move generation.
+
+#### What the fixtures are for
+
+`tests/fixtures/perft.txt` holds ground truth: those node counts come from the
+Chess Programming Wiki and a mismatch means move generation is broken. The
+other fixtures are regression pins rather than oracles - `zobrist.txt` and
+`eval.txt` record what this build currently produces, so an unintended change
+has to be noticed and a deliberate one has to be committed. Retune an
+evaluation weight and every number in `eval.txt` moves; that is the point. The
+chess claims live in the relational assertions in `tests/eval_test.cpp`, which
+say things like "a centralised knight outscores one on the rim" and survive a
+retune untouched.
 
 ## Linting & Formatting
 
@@ -159,10 +235,27 @@ make can-release  # Run all CI checks (format, lint, test)
 
 Style: 2-space indent, 100-column limit (configured in `.clang-format`).
 
+## Scripts
+
+Each of the four entry points below takes `--help`, and three of them share
+their statistics and process handling through `scripts/common.py`:
+
+| Script                      | What it does                                                         |
+| --------------------------- | -------------------------------------------------------------------- |
+| `run_fastchess_gauntlet.py` | Plays a fixed number of games against another engine and summarises them |
+| `compare_branches.py`       | Builds two git revisions and runs a real SPRT between them            |
+| `perft_benchmark.py`        | Compares move generation speed between two revisions                  |
+| `texel_tune.py`             | Texel tuning skeleton for the evaluation; bring your own labelled EPD  |
+| `common.py`                 | Not a CLI: shared Elo/LOS/LLR statistics and subprocess helpers        |
+
+`common.py` and `texel_tune.py` have their own unit tests, run by ctest as
+`Scripts.CommonUnitTests` and `Scripts.TexelTuneUnitTests`.
+
 ## Strength Testing
 
-Both scripts drive [fastchess](https://github.com/Disservin/fastchess) and write
-their PGN, log and summary into `Testing/fastchess/`.
+The gauntlet and SPRT scripts drive
+[fastchess](https://github.com/Disservin/fastchess) and write their PGN, log and
+summary into `Testing/fastchess/`.
 
 Evaluation changes need this more than search changes do, because they buy
 knowledge with speed. Mobility is the expensive term: it asks the magic bitboard
@@ -232,6 +325,29 @@ shared CI runner.
 ```bash
 python3 scripts/perft_benchmark.py --base main --test HEAD
 ```
+
+## Continuous Integration
+
+`.github/workflows/test.yml` runs on every push and pull request:
+
+| Job              | What it checks                                                                     |
+| ---------------- | ---------------------------------------------------------------------------------- |
+| Lint & Format    | clang-tidy via the `lint` preset, then `clang-format --dry-run --Werror` over `src include tests` |
+| Build & test     | Debug build plus `ctest --preset tests` across linux x64/arm64, macOS x64/arm64 and Windows |
+| Release tests    | `release-tests` preset plus `ctest --preset release-tests` on linux x64            |
+
+Warnings are fatal (`C3_WARNINGS_AS_ERRORS=ON`) on the clang legs. The arm64
+leg is cross-compiled with gcc and run under qemu, so its different warning set
+is advisory only and sanitizers are off there.
+
+`.github/workflows/strength-test.yml` adds two advisory jobs to pull requests
+that touch `src/**` or `include/**`: the perft benchmark, and an SPRT run at
+depth 8 with `elo0=0`, `elo1=5` and a 2000-game cap over the 48 openings in
+`tests/fixtures/openings.epd`. Neither blocks a merge; both post their output
+as a PR comment, and the SPRT uploads its PGN as an artifact.
+
+`.github/workflows/release.yml` runs the whole test workflow first, then builds
+and publishes binaries for all five platforms.
 
 ## Lichess Bot
 
