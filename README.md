@@ -199,12 +199,10 @@ block that argues for it.
 
 ## Roadmap
 
-- Engine-versus-engine validation of the mobility term and of the quiescence and
-  pruning set. Both are unit-tested and reasoned about, but **no gauntlet or SPRT
-  run was possible in the environment this work was done in**, so their effect on
-  playing strength is argued from node counts, not measured in games.
-  `scripts/compare_branches.py` against the previous tag is the first thing to
-  run on a machine that can play them.
+- More engine-versus-engine measurement. One SPRT run against the pre-rebuild
+  build exists (see Strength Testing); per-term runs behind the `SearchContext`
+  A/B toggles, and a run against an external engine of known rating, are the
+  next step before trusting any single heuristic's weight.
 - Pawn hash table. The pawn-structure term, and the shield and open-file halves
   of king safety, read only the pawn bitboards and the king squares, so they
   could be computed once per pawn structure rather than once per node (see THE
@@ -458,6 +456,23 @@ alone (measured here at depth 8: 2.15 → 1.65 Mnps on the start position,
 3.14 → 2.04 Mnps on kiwipete, with about half of that down to mobility). A
 release should therefore confirm with a gauntlet that the extra knowledge is
 worth more than the depth it gives up; nodes per second alone cannot answer that.
+
+### Measured so far
+
+One SPRT has been run with this harness: the rebuilt engine against the build
+it started from (`03e993b`), real clock of 10 s + 0.1 s per game, paired games
+from `tests/fixtures/openings.epd`, bounds elo0 = 0 and elo1 = 5, on a single
+four-core container. fastchess accepted H1 after 298 games: 291 wins, 4 draws,
+3 losses for the rebuilt engine, every game ending normally with no time
+forfeits. The point estimate is around +700 Elo, a figure so lopsided that the
+error bar is not meaningful; read it as "a different class of engine", not as a
+precise rating. The PGN and fastchess log are written to `Testing/fastchess/`,
+which is gitignored, so re-run it rather than looking for the file:
+
+```bash
+# build the old binary once, then let fastchess play until a bound is crossed
+python3 scripts/compare_branches.py --base 03e993b --test HEAD --mode movetime --movetime-ms 200
+```
 
 ### Gauntlet
 

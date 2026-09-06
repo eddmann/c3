@@ -81,8 +81,9 @@ def write_summary(
     opponent_name: str,
     elo0: float = 0.0,
     elo1: float = 5.0,
+    engine_name: str = "c3",
 ) -> str:
-  wins_a, wins_b, draws = parse_pgn_results(pgn_path, name_a="c3")
+  wins_a, wins_b, draws = parse_pgn_results(pgn_path, name_a=engine_name)
   games = wins_a + wins_b + draws
   score = (wins_a + 0.5 * draws) / games if games else 0.5
   elo = elo_from_score(score)
@@ -128,6 +129,9 @@ def main() -> None:
   parser.add_argument("--summary", type=Path, default=None,
                       help="summary output path (default: timestamped in Testing/fastchess/)")
   parser.add_argument("--summarize-only", type=Path, help="skip fastchess run, just summarize given PGN")
+  parser.add_argument("--engine-name", type=str, default="c3",
+                      help="PGN player name of the engine being measured (default: c3, "
+                           "which is what the gauntlet itself uses)")
   parser.add_argument("--elo0", type=float, default=0.0,
                       help="SPRT null hypothesis in Elo for the reported LLR (default: 0)")
   parser.add_argument("--elo1", type=float, default=5.0,
@@ -160,7 +164,8 @@ def main() -> None:
       parser.error(f"PGN file not found: {args.summarize_only}")
     opponent_name = args.opponent_name or "opponent"
     print(write_summary(args.summarize_only, args.summary, label="summary",
-                        opponent_name=opponent_name, elo0=args.elo0, elo1=args.elo1))
+                        opponent_name=opponent_name, elo0=args.elo0, elo1=args.elo1,
+                        engine_name=args.engine_name))
     return
 
   if not args.opponent:
