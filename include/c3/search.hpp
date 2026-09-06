@@ -87,6 +87,12 @@
 //      far BELOW alpha drops into quiescence, and fails low without a
 //      full-width search only if the capture search agrees with the guess.
 //
+//  13. LATE MOVE PRUNING
+//      Reductions with the verification removed: near the horizon, once a
+//      non-PV node has searched enough quiet moves, the rest of them are not
+//      searched at all. Captures, checks and the moves the search has evidence
+//      for are exempt, and the first legal move always is.
+//
 // WHERE THE SEARCH'S WORKING STORAGE LIVES
 // Not on the stack. The recursion is up to 255 frames deep and each frame
 // would otherwise hold several two-kilobyte move lists, which overflows the
@@ -668,6 +674,11 @@ public:
   // search with a quiescence search, so what it changes is how the tree is
   // spent rather than anything reported. Nothing on the UCI path writes it.
   bool razoring_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. Late move pruning drops quiet moves
+  // from the back of a node's list, so the only thing that changes is how many
+  // of them are searched. Nothing on the UCI path writes it.
+  bool late_move_pruning_enabled{true};
 
   // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
   // the underpromotion filter in quiescence all change how much work is done

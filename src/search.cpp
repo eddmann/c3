@@ -398,6 +398,56 @@ bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int al
 // ranks last are usually as bad as they look, and it is a bet that pays.
 // =============================================================================
 
+// =============================================================================
+// LATE MOVE PRUNING (move-count pruning)
+// =============================================================================
+// Late move reductions below say "a quiet move ordering ranked near the back
+// gets less depth". Late move pruning says the blunter thing: near the horizon,
+// once a node has searched enough quiet moves, the rest are not searched at
+// all. No reduced search, no verification, no re-search—they are simply gone.
+//
+// WHY THAT IS DEFENSIBLE. It is the same claim ordering already makes,
+// collected into a count instead of a depth. If the hash move, the captures,
+// the killers, the counter-move and a dozen quiet moves with good history have
+// all failed to raise alpha at depth 3, the twentieth quiet move—chosen by
+// history alone, from the bottom of the list—is very unlikely to be the one.
+// And the saving is where saving is worth most: these are the nodes just above
+// the leaves, which is where most of the tree is.
+//
+// THE COUNT GROWS WITH DEPTH, as 3 + depth^2: four quiet moves at depth 1,
+// nineteen at depth 4. Deeper nodes are more expensive to be wrong about, and
+// they are also the ones whose children still have room to reveal something,
+// so they are allowed to look at far more of the list.
+//
+// WHAT IS NEVER PRUNED, and each exemption answers a way of being wrong:
+//   - CAPTURES AND PROMOTIONS. Material swings are not what a move-count
+//     argument is about.
+//   - MOVES MADE OR GIVEN IN CHECK. A forcing line is short and must be seen
+//     to its end. This is the expensive test—it scans the board—so it is asked
+//     last, once the cheap conditions have already agreed.
+//   - KILLERS AND COUNTER-MOVES. The search has specific evidence for these,
+//     and a count is a statement about moves it has no evidence about.
+//   - PV NODES. Their job is the true score and the line behind it.
+//   - THE FIRST LEGAL MOVE. A node that pruned everything would report "no
+//     legal moves"—checkmate or stalemate—for a position that has plenty. That
+//     is not a slightly wrong score, it is a fabricated terminal, so the rule
+//     only starts once something has actually been searched.
+//
+// FAILURE MODE: THE QUIET MOVE ORDERING GOT WRONG. History is a statistic
+// gathered elsewhere in the tree, and the move that wins this position may be
+// one it has never seen work. Reductions survive that mistake—the re-search
+// catches it—and pruning does not: the move is not searched, so nothing can
+// contradict it. That is why the count is generous and the depth is small.
+// =============================================================================
+
+constexpr std::uint8_t LATE_MOVE_PRUNING_DEPTH = 4;
+constexpr std::size_t LATE_MOVE_PRUNING_BASE = 3;
+
+std::size_t late_move_pruning_threshold(std::uint8_t depth) {
+  const std::size_t plies = depth;
+  return LATE_MOVE_PRUNING_BASE + (plies * plies);
+}
+
 constexpr std::uint8_t LMR_MIN_DEPTH = 3;
 
 // How many moves at the front of a node's list are searched at full depth. The
@@ -1696,6 +1746,13 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // statement about that number, and futility pruning has always needed to know
   // whether anything had been searched at all.
   std::size_t moves_searched = 0;
+
+  // The same count restricted to QUIET moves, which is the one late move
+  // pruning is a statement about: captures and promotions are exempt from it,
+  // so counting them would let a node full of captures prune its quiet moves
+  // before it had looked at any of them.
+  std::size_t quiet_moves_searched = 0;
+
   Bound tt_bound = Bound::Upper;
 
   // The best move THIS search finds, kept apart from `hash_move` above.
@@ -1730,7 +1787,24 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       continue;
     }
 
+    // LATE MOVE PRUNING
+    // Enough quiet moves have already been searched here that the ones left,
+    // ranked by history alone, are not worth a node each. The check for whether
+    // the move GIVES check is last because it costs a scan of the board and the
+    // cheap conditions usually decide the question. See the block above for
+    // what is exempt and why the first legal move never is.
+    if (ctx.late_move_pruning_enabled && moves_searched > 0 && !is_pv_node && !in_check &&
+        depth <= LATE_MOVE_PRUNING_DEPTH && is_quiet(mv) &&
+        quiet_moves_searched >= late_move_pruning_threshold(depth) && !ordering.is_refutation(mv) &&
+        !is_in_check(pos.colour_to_move, pos.board)) {
+      pos.unmake_move(mv);
+      continue;
+    }
+
     ++moves_searched;
+    if (is_quiet(mv)) {
+      ++quiet_moves_searched;
+    }
     report.ply += 1;
 
     int eval;

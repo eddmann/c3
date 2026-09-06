@@ -478,6 +478,47 @@ TEST(SearchPruning, RazoringVerifiesALostPositionWithQuiescenceInsteadOfSearchin
       << "a node far enough behind should be resolved by quiescence, not searched";
 }
 
+TEST(SearchPruning, LateMovePruningStopsSearchingQuietMovesNearTheHorizon) {
+  // An ordinary opening middlegame: a wide list of quiet moves at every node,
+  // which is precisely the position a move count is a good argument about.
+  constexpr std::string_view FEN =
+      "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R b KQ - 0 9";
+
+  search::SearchContext with_pruning;
+  search::SearchContext without_pruning;
+  without_pruning.late_move_pruning_enabled = false;
+
+  EXPECT_LT(nodes_searched(FEN, 7, with_pruning), nodes_searched(FEN, 7, without_pruning))
+      << "the tail of a node's quiet moves should not be costing a node each";
+}
+
+TEST(SearchPruning, LateMovePruningNeverInventsAMateOrAStalemate) {
+  // The rule prunes quiet moves, and a node that pruned ALL of them would
+  // report "no legal moves"—checkmate or stalemate—for a position that has
+  // plenty. That is not a slightly wrong score, it is a fabricated terminal, so
+  // these positions are searched with pruning at its default and their scores
+  // must stay ordinary.
+  //
+  // Both have nothing but quiet moves available and a lopsided material count,
+  // which is what would tempt the count to fire early: a king and pawns with
+  // every capture already gone.
+  const std::vector<std::string_view> quiet_positions = {
+      "8/8/4k3/8/8/4K3/4P3/8 w - - 0 60",
+      "8/5ppp/8/8/8/8/5PPP/4K1k1 w - - 0 45",
+      "4k3/8/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
+  };
+
+  for (const auto& fen : quiet_positions) {
+    SCOPED_TRACE(std::string(fen));
+    Position pos = parse(fen);
+    const auto result = search::search(pos, 6);
+
+    EXPECT_LT(std::abs(result.eval), CENTIPAWN_MATE_THRESHOLD)
+        << "a position with legal quiet moves must not be scored as a terminal";
+    EXPECT_FALSE(result.pv.empty()) << "a position with legal moves must produce one";
+  }
+}
+
 TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
   search::CounterMoves counters;
   const auto previous = make_move(Piece::BP, "d7", "d5");
