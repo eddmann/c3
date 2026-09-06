@@ -93,11 +93,27 @@ Edit `config.yml` to customize behavior. Key settings:
 | `challenge.time_controls` | Time controls to accept | bullet, blitz, rapid, classical |
 | `challenge.modes` | casual, rated, or both | both |
 
+`Hash` is paid for once, not once per move. The transposition table belongs to
+the engine and lives across moves, so it is allocated when the bridge sends
+`setoption name Hash` and cleared (not reallocated) at `ucinewgame`. A large
+table therefore costs startup time rather than thinking time, and what it holds
+about the position carries over into the next move's search.
+
 ## Troubleshooting
 
 ### Bot times out
 
-Increase `move_overhead` in config.yml. C3 has a built-in 5ms safety margin but network latency varies.
+Increase `move_overhead` in config.yml — network latency is what this buffer is
+for, and it varies.
+
+C3's own time handling is two limits rather than one. The soft limit is what the
+move is worth and is only checked between search iterations; the hard limit is
+three times that, capped by what is left on the clock, and is the one the search
+polls while it is running. On top of that the search aims to stop 5 ms before the
+hard limit (`TIME_SAFETY_MARGIN`), because it consults the clock only every few
+hundred nodes and still has to write its `bestmove` afterwards. That margin
+covers the engine's own overshoot, not the round trip to Lichess, which is why
+`move_overhead` still has a job to do.
 
 ### Engine not found
 
