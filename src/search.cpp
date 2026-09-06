@@ -278,8 +278,8 @@ constexpr int DELTA_PRUNING_MARGIN = 200;
 // defender of the promotion square—has to be asked properly.
 //
 // This exists purely so that see() is not called for captures whose answer is
-// already known: it copies a whole Board and walks the exchange square by
-// square, and most captures a node looks at are the obvious good ones.
+// already known: it walks the whole exchange, a magic lookup or two per swap,
+// and most captures a node looks at are the obvious good ones.
 bool may_lose_material(const Move& mv) {
   if (!mv.captured_piece.has_value()) {
     return true;
@@ -326,9 +326,8 @@ int optimistic_gain(const Move& mv) {
 //    QxP above every quiet move whether or not the pawn is defended—and this is
 //    the check it is missing. Only STRICTLY losing captures go: an even trade
 //    (SEE == 0) may still be exactly the move that resolves the position, which
-//    is what quiescence is for. may_lose_material() keeps see(), which copies a
-//    Board and walks the exchange, off the captures whose answer is already
-//    known.
+//    is what quiescence is for. may_lose_material() keeps see(), which walks
+//    the whole exchange, off the captures whose answer is already known.
 bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int alpha,
                       bool late_endgame) {
   if (mv.promotion_piece.has_value() && *mv.promotion_piece != queen(pos.colour_to_move)) {
@@ -1299,8 +1298,7 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // The swap list. Capturing on a square starts an argument: I take, you take
 // back with your cheapest piece, I take back with mine, and so on until one
 // side runs out of attackers or decides it would rather stop. see() plays that
-// argument out on a private copy of the board and reports what the side that
-// started it ends up with.
+// argument out and reports what the side that started it ends up with.
 //
 // TWO PASSES. Forward, we record what each capture wins if it happens:
 // gain[d] = value of the piece standing on the square - gain[d - 1]. Backward,
@@ -1314,23 +1312,32 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // with the queen when a pawn could do it hands the opponent a better trade, so
 // the least valuable attacker is always the right one to use.
 //
-// X-RAYS COME FREE. Pieces are physically removed from the board copy as they
-// capture, so a queen sitting behind a rook on the same file simply appears in
-// the next get_attackers() call. That is why this works on a Board rather than
-// on a precomputed set of attackers, and it is what makes a battery score the
-// way a human would read it.
+// NOTHING IS MOVED, AND NO BOARD IS COPIED. The exchange is played entirely in
+// a single 64-bit `occupancy` mask. Each capture clears one bit—the square the
+// capturing piece left—and the loop then asks who attacks the target GIVEN
+// THAT OCCUPANCY. The board itself is only read, never written, and it is only
+// asked two questions: which piece stands where, and which pieces belong to
+// which side.
 //
-// WHAT THE BOARD COPY COSTS, AND THE VERSION THAT WOULD NOT PAY IT. A Board is
-// 272 bytes and every put_piece/remove_piece on it also updates the evaluation
-// accumulator—the running material, piece-square and phase totals—which SEE
-// never reads. So each swap pays for bookkeeping it throws away. The version
-// that does not is a bitboard-only SEE: keep a shrinking occupancy mask instead
-// of a Board, clear the capturing square's bit, and re-detect the slider x-rays
-// by intersecting the target's rook and bishop rays with what is left. It needs
-// attack helpers that take an occupancy rather than a Board, which movegen does
-// not export today; measured against this version it is worth roughly 15-20% of
-// nps, and it is the obvious follow-up rather than something this change should
-// smuggle in.
+// WHICH IS ALSO HOW X-RAYS COME FREE. Sliding attacks are a function of the
+// occupancy, so re-reading bishop_attacks() and rook_attacks() over the mask
+// after every removal is exactly what makes a queen sitting behind a rook on
+// the same file appear in the exchange by itself once the rook has captured.
+// No accumulator, no bookkeeping: the battery is simply what the magic tables
+// say about the squares that are left.
+//
+// THE LEAPERS ARE COMPUTED ONCE, and that is the trick that makes this cheap.
+// A pawn, a knight or a king attacks the target square or it does not; nothing
+// can be in the way, so the set of them never changes as the exchange proceeds.
+// Only "are they still on the board" changes, and that is one AND with the
+// occupancy. So the per-swap cost is two magic lookups and a handful of masks.
+//
+// WHAT THIS REPLACED, AND WHY. The first version played the exchange out on a
+// copy of the Board: 272 bytes copied per call, and every remove_piece and
+// put_piece on the copy also updated the evaluation accumulator—the running
+// material, piece-square and phase totals—which SEE never reads. Each swap
+// therefore paid for bookkeeping it threw away. Quiescence calls see() on most
+// of the captures it looks at, so that cost showed up directly in nps.
 //
 // See the header for what SEE deliberately does not know—pins, most of all.
 // ---------------------------------------------------------------------------
@@ -1349,13 +1356,56 @@ int see_value(Piece piece) {
 // One exchange per piece that can reach the square, and there are 32 pieces.
 constexpr std::size_t SEE_MAX_SWAPS = 32;
 
+// Everything about a position that stays fixed while one exchange is played
+// out, so it is read from the board once instead of at every swap.
+//
+// `leapers` is the interesting one: the pawns, knights and kings that attack
+// the target square. They cannot be blocked, so which of them attack is decided
+// before the exchange starts and never changes—only whether they are still
+// standing, which is what the occupancy says. The slider sets are named by what
+// they attack LIKE rather than by what they are, because a queen is both.
+struct SeeContext {
+  Bitboard leapers{0};
+  Bitboard bishop_like{0};
+  Bitboard rook_like{0};
+};
+
+SeeContext see_context(Square target, const Board& board) {
+  SeeContext context;
+
+  context.bishop_like = board.pieces(Piece::WB) | board.pieces(Piece::BB) |
+                        board.pieces(Piece::WQ) | board.pieces(Piece::BQ);
+  context.rook_like = board.pieces(Piece::WR) | board.pieces(Piece::BR) | board.pieces(Piece::WQ) |
+                      board.pieces(Piece::BQ);
+
+  // Everything that attacks the square right now, minus everything that attacks
+  // it as a slider: what is left is exactly the pieces no removal can unblock.
+  // Reusing get_attackers() rather than re-deriving pawn, knight and king
+  // attacks keeps one definition of "attacks" in the engine.
+  const Bitboard all_attackers =
+      get_attackers(target, Colour::White, board) | get_attackers(target, Colour::Black, board);
+  context.leapers = all_attackers & ~(context.bishop_like | context.rook_like);
+
+  return context;
+}
+
+// Who attacks `target` if the board held only the pieces in `occupancy`. The
+// sliders are re-read over that occupancy, which is where x-rays come from.
+Bitboard see_attackers(Square target, Bitboard occupancy, const SeeContext& context) {
+  return (context.leapers | (bishop_attacks(target, occupancy) & context.bishop_like) |
+          (rook_attacks(target, occupancy) & context.rook_like)) &
+         occupancy;
+}
+
 // pieces_for() lists a colour's pieces in ascending value—pawn, knight, bishop,
 // rook, queen, king—so the first one that appears among the attackers is the
-// cheapest.
-std::optional<Piece> least_valuable_attacker(Bitboard attackers, Colour side, const Board& board) {
+// cheapest. Returns the piece and the square it would come from.
+std::optional<std::pair<Piece, Square>> least_valuable_attacker(Bitboard attackers, Colour side,
+                                                                const Board& board) {
   for (const auto piece : pieces_for(side)) {
-    if ((attackers & board.pieces(piece)) != 0) {
-      return piece;
+    const Bitboard candidates = attackers & board.pieces(piece);
+    if (candidates != 0) {
+      return std::make_pair(piece, Square::first_occupied(candidates));
     }
   }
   return std::nullopt;
@@ -1369,8 +1419,8 @@ int detail::see(const Position& pos, const Move& mv) {
     return 0;
   }
 
+  const Board& board = pos.board;
   const Square target = mv.to;
-  Board board = pos.board;
 
   std::array<int, SEE_MAX_SWAPS> gain{};
 
@@ -1380,31 +1430,42 @@ int detail::see(const Position& pos, const Move& mv) {
       mv.promotion_piece.has_value() ? see_value(*mv.promotion_piece) - see_value(mv.piece) : 0;
   gain[0] = (mv.captured_piece.has_value() ? see_value(*mv.captured_piece) : 0) + promotion_gain;
 
-  // Play the move on the copy. capture_square() is the target for an ordinary
-  // capture and the square behind it for en passant, which is exactly the
-  // distinction that decides which piece leaves the board.
+  // The occupancy as it stands AFTER the move being scored. The mover has left
+  // its square; whatever it captured has left the board—capture_square() is the
+  // target for an ordinary capture and the square behind it for en passant,
+  // which is exactly the distinction that decides which piece goes; and the
+  // target is occupied, by the mover now rather than by its victim.
+  Bitboard occupancy = board.occupancy() & ~mv.from.to_bitboard();
   if (const auto captured_square = mv.capture_square()) {
-    board.remove_piece(*captured_square);
+    occupancy &= ~captured_square->to_bitboard();
   }
-  board.remove_piece(mv.from);
+  occupancy |= target.to_bitboard();
+
+  const SeeContext context = see_context(target, board);
+
+  // What is standing on the target square, and therefore what the next capture
+  // would win. The board still says the victim is there, so this is tracked
+  // separately—it is the one piece of the position the mask cannot express.
   Piece occupier = mv.promotion_piece.value_or(mv.piece);
-  board.put_piece(occupier, target);
 
   Colour side = !colour(mv.piece);
   std::size_t depth = 0;
 
   while (true) {
-    const Bitboard attackers = get_attackers(target, side, board);
-    const auto attacker = least_valuable_attacker(attackers, side, board);
+    const Bitboard attackers = see_attackers(target, occupancy, context);
+    const auto attacker =
+        least_valuable_attacker(attackers & board.pieces_by_colour(side), side, board);
     if (!attacker.has_value()) {
       break;
     }
 
+    const auto [attacking_piece, from] = *attacker;
+
     // A king may only capture on a square the other side no longer defends, so
     // if anything still defends it the exchange stops here rather than ending
-    // in an illegal move. (Read from the board as it stands, which misses the
-    // rare defender that only appears once the king leaves its own square.)
-    if (is_king(*attacker) && get_attackers(target, !side, board) != 0) {
+    // in an illegal move. (Read from the position as it stands, which misses
+    // the rare defender that only appears once the king leaves its own square.)
+    if (is_king(attacking_piece) && (attackers & board.pieces_by_colour(!side)) != 0) {
       break;
     }
 
@@ -1424,11 +1485,11 @@ int detail::see(const Position& pos, const Move& mv) {
       break;
     }
 
-    const Square from = Square::first_occupied(attackers & board.pieces(*attacker));
-    board.remove_piece(target);
-    board.remove_piece(from);
-    board.put_piece(*attacker, target);
-    occupier = *attacker;
+    // The capturing piece leaves its square, and that single cleared bit is the
+    // whole state change: the next call to see_attackers() re-reads the sliders
+    // over what is left, so anything this piece was blocking joins in.
+    occupancy &= ~from.to_bitboard();
+    occupier = attacking_piece;
     side = !side;
   }
 

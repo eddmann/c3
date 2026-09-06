@@ -928,9 +928,12 @@ void order_quiescence_moves(MoveList& moves);
 //     scored as a pawn.
 //   - EVERYTHING THAT IS NOT MATERIAL. A capture that loses a rook to open a
 //     mating net scores badly, and rightly, as far as material goes.
-// X-rays ARE handled: pieces are removed from a private copy of the board as
-// they capture, so a queen behind a rook on the same file joins the exchange by
-// itself, which is the case a naive "count the attackers" version gets wrong.
+// X-rays ARE handled, and for free. The exchange is played out in a 64-bit
+// occupancy mask rather than on a board: each capture clears the bit of the
+// square its piece left, and the sliding attacks are re-read over what is left,
+// so a queen behind a rook on the same file joins the exchange by itself. That
+// is the case a naive "count the attackers once" version gets wrong, and the
+// reason nothing here needs a copy of the Board.
 [[nodiscard]] int see(const Position& pos, const Move& mv);
 
 // The capture-only search alphabeta drops into at its leaves. Exposed so that

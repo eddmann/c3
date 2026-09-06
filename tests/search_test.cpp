@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -877,6 +878,142 @@ TEST(SearchSee, IgnoresQuietMoves) {
   // Nothing changes hands, so there is no exchange to price.
   const Position pos = parse("4k3/8/8/8/8/8/8/4K2R w K - 0 1");
   EXPECT_EQ(search::detail::see(pos, capture(pos, "h1", "h4")), 0);
+}
+
+namespace {
+
+// THE OLD SEE, KEPT HERE ON PURPOSE.
+//
+// The engine's see() used to play the exchange out on a private copy of the
+// Board, physically removing and placing pieces; it now plays it out in a
+// 64-bit occupancy mask and never writes to a board at all. Those are two very
+// different pieces of code that have to agree on every capture in every
+// position, and no set of hand-written positions can promise that.
+//
+// So the old implementation lives on as a REFERENCE. It is slow, and it is
+// deliberately a transcription rather than a tidy-up: the point of a reference
+// is that it was not written by whoever wrote the thing under test.
+constexpr int REFERENCE_KING_VALUE = 10'000;
+
+int reference_value(Piece piece) {
+  return is_king(piece) ? REFERENCE_KING_VALUE : PIECE_VALUES[static_cast<std::size_t>(piece)];
+}
+
+std::optional<Piece> reference_least_valuable_attacker(Bitboard attackers, Colour side,
+                                                       const Board& board) {
+  for (const auto piece : pieces_for(side)) {
+    if ((attackers & board.pieces(piece)) != 0) {
+      return piece;
+    }
+  }
+  return std::nullopt;
+}
+
+int reference_see(const Position& pos, const Move& mv) {
+  if (!mv.captured_piece.has_value() && !mv.promotion_piece.has_value()) {
+    return 0;
+  }
+
+  const Square target = mv.to;
+  Board board = pos.board;
+
+  std::array<int, 32> gain{};
+
+  const int promotion_gain = mv.promotion_piece.has_value()
+                                 ? reference_value(*mv.promotion_piece) - reference_value(mv.piece)
+                                 : 0;
+  gain[0] =
+      (mv.captured_piece.has_value() ? reference_value(*mv.captured_piece) : 0) + promotion_gain;
+
+  if (const auto captured_square = mv.capture_square()) {
+    board.remove_piece(*captured_square);
+  }
+  board.remove_piece(mv.from);
+  Piece occupier = mv.promotion_piece.value_or(mv.piece);
+  board.put_piece(occupier, target);
+
+  Colour side = !colour(mv.piece);
+  std::size_t depth = 0;
+
+  while (true) {
+    const Bitboard attackers = get_attackers(target, side, board);
+    const auto attacker = reference_least_valuable_attacker(attackers, side, board);
+    if (!attacker.has_value()) {
+      break;
+    }
+
+    if (is_king(*attacker) && get_attackers(target, !side, board) != 0) {
+      break;
+    }
+
+    if (depth + 1 >= gain.size()) {
+      break;
+    }
+    ++depth;
+
+    gain[depth] = reference_value(occupier) - gain[depth - 1];
+
+    if (std::max(-gain[depth - 1], gain[depth]) < 0) {
+      break;
+    }
+
+    const Square from = Square::first_occupied(attackers & board.pieces(*attacker));
+    board.remove_piece(target);
+    board.remove_piece(from);
+    board.put_piece(*attacker, target);
+    occupier = *attacker;
+    side = !side;
+  }
+
+  while (depth > 0) {
+    gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
+    --depth;
+  }
+
+  return gain[0];
+}
+
+} // namespace
+
+TEST(SearchSee, AgreesWithTheBoardCopyReferenceOnGeneratedCaptures) {
+  // Random games, and every capture and promotion each position offers. The
+  // seed is fixed, so a failure is reproducible and a run that passes today
+  // passes tomorrow; what the randomness buys is COVERAGE—batteries, pinned
+  // defenders, en passant, capture-promotions, kings that may and may not
+  // recapture—in combinations nobody would think to write down.
+  std::mt19937 rng(20240917);
+
+  int captures_checked = 0;
+  int disagreements = 0;
+
+  for (int game = 0; game < 60 && disagreements == 0; ++game) {
+    Position pos = Position::startpos();
+    const int plies = 4 + static_cast<int>(rng() % 70);
+
+    for (int ply = 0; ply < plies; ++ply) {
+      const auto moves = legal_moves(pos);
+      if (moves.empty()) {
+        break;
+      }
+
+      for (const auto& noisy : pseudo_legal_noisy_moves(pos)) {
+        ++captures_checked;
+        const int actual = search::detail::see(pos, noisy);
+        const int expected = reference_see(pos, noisy);
+        if (actual != expected) {
+          ++disagreements;
+          ADD_FAILURE() << "see disagreed on " << to_uci(noisy) << " in " << pos.to_fen()
+                        << ": got " << actual << ", reference says " << expected;
+          break;
+        }
+      }
+
+      pos.make_move(moves[rng() % moves.size()]);
+    }
+  }
+
+  // A test that checked nothing would also report no disagreements.
+  EXPECT_GT(captures_checked, 2000) << "the generated games must actually contain captures";
 }
 
 // Quiescence -------------------------------------------------------------------

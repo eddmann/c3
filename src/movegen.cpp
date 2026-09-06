@@ -202,18 +202,15 @@ Bitboard king_attacks(Square square) {
 // See magic.hpp for the precomputed tables and magic numbers.
 // =============================================================================
 
+// The board's own occupancy is the usual question, and c3::bishop_attacks /
+// c3::rook_attacks (attacks.hpp) are the general one: the same lookup asked
+// about any occupancy at all, which is what static exchange evaluation needs.
 Bitboard bishop_attacks(Square square, const Board& board) {
-  const Magic& magic = BISHOP_MAGICS[square.index()];
-  const Bitboard occupancy = board.occupancy() & magic.mask;
-  const std::uint64_t index = (occupancy * magic.num) >> magic.shift;
-  return BISHOP_ATTACKS[magic.offset + index];
+  return c3::bishop_attacks(square, board.occupancy());
 }
 
 Bitboard rook_attacks(Square square, const Board& board) {
-  const Magic& magic = ROOK_MAGICS[square.index()];
-  const Bitboard occupancy = board.occupancy() & magic.mask;
-  const std::uint64_t index = (occupancy * magic.num) >> magic.shift;
-  return ROOK_ATTACKS[magic.offset + index];
+  return c3::rook_attacks(square, board.occupancy());
 }
 
 Bitboard pawn_advances(Square square, Colour colour, const Board& board) {
@@ -318,6 +315,20 @@ Bitboard castling_moves(CastlingRights rights, Colour colour, const Board& board
 }
 
 } // namespace
+
+Bitboard bishop_attacks(Square square, Bitboard occupancy) {
+  const Magic& magic = BISHOP_MAGICS[square.index()];
+  const Bitboard blockers = occupancy & magic.mask;
+  const std::uint64_t index = (blockers * magic.num) >> magic.shift;
+  return BISHOP_ATTACKS[magic.offset + index];
+}
+
+Bitboard rook_attacks(Square square, Bitboard occupancy) {
+  const Magic& magic = ROOK_MAGICS[square.index()];
+  const Bitboard blockers = occupancy & magic.mask;
+  const std::uint64_t index = (blockers * magic.num) >> magic.shift;
+  return ROOK_ATTACKS[magic.offset + index];
+}
 
 // Find pawns that can capture en passant to a given square: the pawns attacking
 // the empty square the double-pushed pawn skipped over.
