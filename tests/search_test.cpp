@@ -541,19 +541,44 @@ TEST(SearchPruning, RazoringDoesNotRefuseANodeThatBeatsAMateRangeAlpha) {
 }
 
 TEST(SearchPruning, NullMovePruningCutsOffNodesThatCanAffordToPass) {
-  // A middlegame with every piece still on the board: no side is anywhere near
-  // zugzwang, so "pass and still beat beta" is a question worth asking at most
-  // of the nodes below the root. That is the setting null-move pruning was
-  // written for, and the reduced re-search it pays for is far cheaper than the
-  // full-width subtree it refuses.
+  // THE WINDOW IS THE POINT, which is why this measurement does not use the
+  // full-window helper the other switches share.
+  //
+  // Null move asks one question—"if I pass and you get a free move, do you
+  // still fail to reach beta?"—and it can only ever act on the answer YES. At a
+  // node searched with the full window there is no beta worth failing high
+  // against: every child is inside (-inf, +inf), so the null search comes back
+  // below beta, the rule pays for a reduced search at almost every node it is
+  // allowed at, and buys back almost nothing. That is not what null move does
+  // in a real search. A real search is mostly zero-window scout nodes, and
+  // against a zero window "pass and still beat beta" is a question a great many
+  // positions answer yes to.
+  //
+  // So this searches the way the rule is actually used: one node, one zero
+  // window, the same (alpha, alpha + 1) a scout search hands its children. The
+  // middlegame below has every piece on the board and nothing resembling
+  // zugzwang, so passing is genuinely cheap for whoever is to move.
   constexpr std::string_view FEN =
       "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R b KQ - 0 9";
 
-  search::SearchContext with_null_move;
-  search::SearchContext without_null_move;
-  without_null_move.null_move_enabled = false;
+  constexpr int alpha = 0;
+  constexpr int beta = alpha + 1;
 
-  EXPECT_LT(nodes_searched(FEN, 7, with_null_move), nodes_searched(FEN, 7, without_null_move))
+  const auto nodes_with = [](bool null_move) {
+    Position pos = parse(FEN);
+    search::SearchContext ctx;
+    ctx.null_move_enabled = null_move;
+
+    search::TranspositionTable tt(8);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
+
+    search::detail::alphabeta(pos, 8, alpha, beta, pv, tt, ctx, report, stopper);
+    return report.nodes;
+  };
+
+  EXPECT_LT(nodes_with(true), nodes_with(false))
       << "a node that beats beta after passing should not be searched in full";
 }
 
@@ -563,6 +588,13 @@ TEST(SearchPruning, FutilityPruningSkipsQuietMovesThatCannotRaiseAlpha) {
   // searched with. A quiet move there cannot make up the margin in the one or
   // two plies that remain, which is precisely the claim futility pruning makes
   // before it skips the move.
+  //
+  // Expect the saving to be a small share of the tree—a few per cent—rather
+  // than the large one reductions or quiescence pruning show. Futility only
+  // fires at depth 2 and below, so it can only ever skip moves at the last two
+  // plies; everything above the horizon is searched exactly as it was. The
+  // assertion is therefore directional on purpose, and a pinned percentage
+  // would be pinning the shape of one position rather than the rule.
   constexpr std::string_view FEN = "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R b KQ - 1 8";
 
   search::SearchContext with_futility;
