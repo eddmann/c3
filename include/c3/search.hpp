@@ -560,7 +560,7 @@ private:
 // Three reasons, in order of how badly they bite:
 //
 //   1. THREAD STACKS ARE SMALL, AND THE SEARCH IS 255 FRAMES DEEP. A MoveList
-//      is a fixed-capacity 256-slot array—two kilobytes—so a frame holding
+//      is a fixed-capacity array of 256 moves—two kilobytes—so a frame holding
 //      three of them costs six. Multiply by the ply ceiling and alpha-beta
 //      alone wants a megabyte and a half of stack. The main thread usually has
 //      eight megabytes, but the search does not run there: it runs on a
@@ -568,8 +568,15 @@ private:
 //      std::thread gets 512 KiB on macOS and 1 MiB on Windows. The overflow
 //      that follows is not an exception, it is a dead process mid-game—and it
 //      only shows up on the deep tactical positions the engine most wants to
-//      get right. Moving the lists here leaves a frame small enough that the
-//      whole recursion fits in a fraction of the smallest of those stacks.
+//      get right.
+//
+//      DECLARING THE ROWS HERE IS ONLY HALF OF IT. A generator that RETURNS a
+//      MoveList puts those two kilobytes in the caller's frame on the way to
+//      the row, which costs the same as never having moved it: measured with
+//      -fstack-usage, alphabeta's Release frame was 2528 bytes that way and
+//      464 once generation wrote into the row directly. So the search fills
+//      its rows through pseudo_legal_moves_into() (movegen.hpp), and its
+//      frames hold no move list at all.
 //
 //   2. LOCALITY. A row is allocated once and reused by every node that visits
 //      that ply, so the same cache lines are hit again and again instead of a
@@ -590,9 +597,11 @@ private:
 // of its bookkeeping.
 inline constexpr std::size_t MAX_PENALISED_QUIETS = 32;
 
-// One ordering score per move. Move generation never produces more than 256
-// moves (the busiest legal position anyone has constructed offers 218), so a
-// row this long can score any list it can hand us.
+// One ordering score per move, so a row must be as long as a move list can be.
+// MoveList::CAPACITY is 256; the most pseudo-legal moves anyone has found a
+// position producing is 248, and the most LEGAL moves is 218. A row this long
+// can therefore score anything move generation can hand us, and the
+// static_assert in search.cpp keeps the two numbers tied together.
 inline constexpr std::size_t MAX_ORDERED_MOVES = 256;
 
 // How deep quiescence may recurse before it stops resolving and simply returns

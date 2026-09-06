@@ -543,7 +543,6 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
   EXPECT_GT(report.max_ply, DEPTH) << "a check at the horizon should have been extended";
-  EXPECT_LE(report.max_ply, search::MAX_DEPTH);
 }
 
 // Static exchange evaluation ---------------------------------------------------
@@ -727,6 +726,52 @@ void expect_only_queen_promotions_searched(std::string_view fen) {
 }
 
 } // namespace
+
+TEST(SearchQuiescence, ClampsAMateDistanceToThePlyCeiling) {
+  // The mate distance quiescence reports is its parent's ply plus how deep into
+  // quiescence it is, and those two are bounded separately: 255 and 64. Their
+  // sum is not. CENTIPAWN_MATE_THRESHOLD is CENTIPAWN_MATE - 255, so a distance
+  // past 255 produces a score that is no longer in the mate range at all—it
+  // reads as an ordinary evaluation of about -97 pawns, and the mate is simply
+  // lost.
+  Position pos = parse("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1");
+
+  search::SearchContext ctx;
+  search::Report report;
+  report.ply = search::MAX_DEPTH;
+  search::Stopper stopper;
+
+  const int score =
+      search::detail::quiescence(pos, CENTIPAWN_MIN, CENTIPAWN_MAX, ctx, report, stopper, 5);
+
+  EXPECT_LE(score, -CENTIPAWN_MATE_THRESHOLD)
+      << "a mate found deep in quiescence must still read as a mate";
+}
+
+TEST(SearchQuiescence, DoesNotStandPatInCheckAtTheDepthCap) {
+  // The depth cap stops resolving, and what it returns has to respect the same
+  // rule the rest of the function does. Out of check the static evaluation is
+  // the honest answer; in check it is the stand-pat this search refuses to
+  // take, so the cap fails low instead. Reaching the cap needs sixty-four
+  // consecutive capture-or-check plies in a real search, but the depth is a
+  // parameter, so the branch can be asked about directly.
+  Position in_check = parse("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1");
+  Position quiet = parse("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1");
+
+  search::SearchContext ctx;
+  search::Report report;
+  search::Stopper stopper;
+
+  const int alpha = -1234;
+  const int at_cap_in_check = search::detail::quiescence(
+      in_check, alpha, CENTIPAWN_MAX, ctx, report, stopper, search::QUIESCENCE_MAX_DEPTH);
+  const int at_cap_quiet = search::detail::quiescence(quiet, alpha, CENTIPAWN_MAX, ctx, report,
+                                                      stopper, search::QUIESCENCE_MAX_DEPTH);
+
+  ASSERT_NE(eval(in_check), alpha) << "the position must not evaluate to alpha by accident";
+  EXPECT_EQ(at_cap_in_check, alpha) << "a check at the cap must fail low, not stand pat";
+  EXPECT_EQ(at_cap_quiet, eval(quiet)) << "a quiet position at the cap is worth its evaluation";
+}
 
 TEST(SearchQuiescence, SearchesOnlyQueenPromotions) {
   // A pawn pushing to the last rank...

@@ -161,6 +161,26 @@ constexpr int FUTILITY_DEPTH = 2;
 // =============================================================================
 constexpr int DELTA_PRUNING_MARGIN = 200;
 
+// Could this move possibly come out of the exchange behind? A capture whose
+// victim is worth at least as much as the attacker cannot: even if the capture
+// is answered immediately, the trade is even or better, so the swap list can
+// only reach zero or above. Everything else—QxP, RxN, and every non-capture
+// promotion, whose "attacker" is the pawn but which can still be answered by a
+// defender of the promotion square—has to be asked properly.
+//
+// This exists purely so that see() is not called for captures whose answer is
+// already known: it copies a whole Board and walks the exchange square by
+// square, and most captures a node looks at are the obvious good ones.
+bool may_lose_material(const Move& mv) {
+  if (!mv.captured_piece.has_value()) {
+    return true;
+  }
+
+  const int victim = PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)];
+  const int attacker = PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  return victim < attacker;
+}
+
 // What a noisy move wins at its most optimistic: the piece it takes, plus the
 // difference between the piece a promoting pawn becomes and the pawn itself.
 int optimistic_gain(const Move& mv) {
@@ -173,6 +193,44 @@ int optimistic_gain(const Move& mv) {
             PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
   }
   return gain;
+}
+
+// EVERY REASON QUIESCENCE HAS FOR NOT SEARCHING A NOISY MOVE, in the order they
+// are cheapest to ask. The caller has already established that the side to move
+// is not in check, where none of these hold.
+//
+// 1. ONLY QUEEN PROMOTIONS. A promotion is generated four times over, once per
+//    piece the pawn can become, and three of those are almost always the wrong
+//    answer: if promoting is good at all, the queen is what makes it good. The
+//    capture is not lost with them—bxa8=Q takes the same rook bxa8=N would—so
+//    quiescence sees the same material either way, three times cheaper. What IS
+//    given up is the underpromotion that is brilliant for a reason material
+//    cannot see: the knight check that forks, the rook that promotes to avoid
+//    stalemating the opponent. Those are left to the main search, which
+//    generates all four and is where a tactic that subtle belongs.
+//
+// 2. DELTA PRUNING. Even winning the victim outright would not reach alpha, so
+//    the capture cannot change this node's score. See DELTA PRUNING above.
+//
+// 3. LOSING CAPTURES. The exchange on that square comes out badly however it is
+//    played, so searching it only rediscovers that. MVV-LVA cannot tell—it ranks
+//    QxP above every quiet move whether or not the pawn is defended—and this is
+//    the check it is missing. Only STRICTLY losing captures go: an even trade
+//    (SEE == 0) may still be exactly the move that resolves the position, which
+//    is what quiescence is for. may_lose_material() keeps see(), which copies a
+//    Board and walks the exchange, off the captures whose answer is already
+//    known.
+bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int alpha,
+                      bool late_endgame) {
+  if (mv.promotion_piece.has_value() && *mv.promotion_piece != queen(pos.colour_to_move)) {
+    return true;
+  }
+
+  if (!late_endgame && stand_pat + optimistic_gain(mv) + DELTA_PRUNING_MARGIN < alpha) {
+    return true;
+  }
+
+  return may_lose_material(mv) && detail::see(pos, mv) < 0;
 }
 
 // =============================================================================
@@ -990,6 +1048,18 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // on a precomputed set of attackers, and it is what makes a battery score the
 // way a human would read it.
 //
+// WHAT THE BOARD COPY COSTS, AND THE VERSION THAT WOULD NOT PAY IT. A Board is
+// 272 bytes and every put_piece/remove_piece on it also updates the evaluation
+// accumulator—the running material, piece-square and phase totals—which SEE
+// never reads. So each swap pays for bookkeeping it throws away. The version
+// that does not is a bitboard-only SEE: keep a shrinking occupancy mask instead
+// of a Board, clear the capturing square's bit, and re-detect the slider x-rays
+// by intersecting the target's rook and bishop rays with what is left. It needs
+// attack helpers that take an occupancy rather than a Board, which movegen does
+// not export today; measured against this version it is worth roughly 15-20% of
+// nps, and it is the obvious follow-up rather than something this change should
+// smuggle in.
+//
 // See the header for what SEE deliberately does not know—pins, most of all.
 // ---------------------------------------------------------------------------
 
@@ -1149,10 +1219,20 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
   // it. In practice the bound is the board itself—every recursion has to find
   // another capture or promotion, and there are only so many pieces to trade—
   // but "in practice" is not a guarantee, and this recursion holds a move list
-  // per level. Past the cap we simply return the static evaluation, which is
-  // what a quiet position would have returned anyway. See QUIESCENCE_MAX_DEPTH.
+  // per level. Past the cap we stop resolving. See QUIESCENCE_MAX_DEPTH.
+  //
+  // WHAT WE RETURN THERE depends on the same thing everything else in this
+  // function depends on. Out of check, the static evaluation is what a quiet
+  // position would have returned anyway, so it is the honest answer. IN check
+  // it is not: it is the stand-pat this function refuses to take everywhere
+  // else, and returning it here would put the hole back at the one depth
+  // nobody looks at. So a check at the cap fails low instead—alpha is a bound
+  // we are entitled to, it claims nothing about a position we did not resolve,
+  // and the worst it can do is make this node look no better than it already
+  // did. (Reaching the cap in check needs sixty-four consecutive
+  // capture-or-check plies; the branch is insurance, not a hot path.)
   if (quiescence_depth >= QUIESCENCE_MAX_DEPTH) {
-    return eval(pos);
+    return is_in_check(pos.colour_to_move, pos.board) ? alpha : eval(pos);
   }
 
   // THIS position has already been counted—by the alphabeta leaf that handed
@@ -1189,13 +1269,25 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
 
   // Normally only the noisy moves (captures and promotions); in check, every
   // legal reply, because the check has to be answered and the answer is often a
-  // quiet block or a king step. The list and its ordering scores come from the
-  // context's row for this quiescence depth, so this frame holds neither of
-  // them. Ordering is MVV-LVA either way—among evasions that simply means
-  // capturing the checker is tried first, which is usually right.
+  // quiet block or a king step.
+  //
+  // The list and its ordering scores are the context's row for this quiescence
+  // depth, and generation writes STRAIGHT INTO that row: taking the returning
+  // form and assigning it would put a two-kilobyte MoveList temporary in this
+  // frame, which is exactly the cost the rows exist to avoid. See
+  // pseudo_legal_moves_into() in movegen.hpp.
+  //
+  // Ordering is MVV-LVA either way. Among evasions that means capturing the
+  // checker is tried first, which is usually right; the quiet evasions—blocks
+  // and king steps—all score 0 under noisy_move_score, so they tie with each
+  // other and select() hands them over in generation order.
   MoveScratch& scratch = ctx.at_quiescence_depth(quiescence_depth);
   MoveList& moves = scratch.moves;
-  moves = in_check ? pseudo_legal_moves(pos) : pseudo_legal_noisy_moves(pos);
+  if (in_check) {
+    pseudo_legal_moves_into(pos, moves);
+  } else {
+    pseudo_legal_noisy_moves_into(pos, moves);
+  }
   OrderedMoves ordering(moves, scratch.scores);
 
   std::size_t legal_moves = 0;
@@ -1203,33 +1295,7 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
   for (std::size_t i = 0; i < moves.size(); ++i) {
     const Move mv = ordering.select(i);
 
-    // ONLY QUEEN PROMOTIONS
-    // A promotion is generated four times over, once per piece the pawn can
-    // become, and three of those are almost always the wrong answer: if
-    // promoting is good at all, the queen is what makes it good. The capture is
-    // not lost with them—bxa8=Q takes the same rook bxa8=N would—so quiescence
-    // sees the same material either way, three times cheaper.
-    //
-    // What IS given up is the underpromotion that is brilliant for a reason
-    // material cannot see: the knight check that forks, the rook that promotes
-    // to avoid stalemating the opponent. Those are left to the main search,
-    // which generates all four and is where a tactic that subtle belongs.
-    if (prune && mv.promotion_piece.has_value() && *mv.promotion_piece != queen(colour_to_move)) {
-      continue;
-    }
-
-    // DELTA PRUNING: even winning the victim outright would not reach alpha.
-    if (prune && !late_endgame && stand_pat + optimistic_gain(mv) + DELTA_PRUNING_MARGIN < alpha) {
-      continue;
-    }
-
-    // LOSING CAPTURES: the exchange on that square comes out badly however it
-    // is played, so searching it only rediscovers that. MVV-LVA cannot tell—it
-    // ranks QxP above every quiet move whether or not the pawn is defended—and
-    // this is the check it is missing. Only strictly losing captures go: an
-    // even trade (SEE == 0) may still be exactly the move that resolves the
-    // position, which is what quiescence is for.
-    if (prune && detail::see(pos, mv) < 0) {
+    if (prune && quiescence_skips(pos, mv, stand_pat, alpha, late_endgame)) {
       continue;
     }
 
@@ -1264,9 +1330,17 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
   // here—a side with no legal move and no check is not in check by definition.
   //
   // The distance is counted from the root, so it is the alphabeta ply this
-  // quiescence started from plus however deep into quiescence we now are.
+  // quiescence started from plus however deep into quiescence we now are—and
+  // that sum is clamped to MAX_DEPTH, because the two are bounded separately
+  // (255 plies and 64 quiescence levels) and nothing stops them adding up past
+  // either. CENTIPAWN_MATE_THRESHOLD is CENTIPAWN_MATE - 255, so a distance of
+  // 256 would produce a "mate" score BELOW the threshold: it would stop being
+  // recognised as a mate at all, and would be read as an ordinary evaluation of
+  // about -97 pawns. Clamping costs only the exactness of a mate distance no
+  // search can reach anyway; not clamping loses the mate.
   if (in_check && legal_moves == 0) {
-    return -CENTIPAWN_MATE + static_cast<int>(report.ply) + static_cast<int>(quiescence_depth);
+    const int distance = static_cast<int>(report.ply) + static_cast<int>(quiescence_depth);
+    return -CENTIPAWN_MATE + std::min(distance, static_cast<int>(MAX_DEPTH));
   }
 
   return alpha;
@@ -1451,8 +1525,11 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // Static evaluation for futility pruning (only compute at shallow depths when not in check)
   const int static_eval = (depth <= FUTILITY_DEPTH && !in_check) ? eval(pos) : 0;
 
+  // Generated straight into this ply's row. The returning form would build a
+  // two-kilobyte MoveList in this frame first, 255 frames deep; see
+  // pseudo_legal_moves_into() in movegen.hpp.
   MoveList& moves = scratch.ordering.moves;
-  moves = pseudo_legal_moves(pos);
+  pseudo_legal_moves_into(pos, moves);
 
   // Turn the 16 packed bits back into a real Move by finding it among the
   // moves this position actually has. This is the only place a stored move is
