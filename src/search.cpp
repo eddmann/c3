@@ -1940,7 +1940,8 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   //
   // Reduction (R): How much shallower we search after the null move.
   // Higher R = more aggressive pruning but higher risk of missing tactics.
-  if (depth >= 3 && !in_check && has_non_pawn_material(pos.board, colour_to_move)) {
+  if (ctx.null_move_enabled && depth >= 3 && !in_check &&
+      has_non_pawn_material(pos.board, colour_to_move)) {
     pos.make_null_move();
     report.ply += 1;
 
@@ -2042,8 +2043,8 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // At shallow depths, skip quiet moves that can't possibly raise alpha.
     // Don't prune captures, promotions, or when in check.
     // Only prune after first move to avoid falsely returning stalemate.
-    if (moves_searched > 0 && depth <= FUTILITY_DEPTH && !in_check && is_quiet(mv) &&
-        static_eval + FUTILITY_MARGIN[static_cast<std::size_t>(depth)] <= alpha) {
+    if (ctx.futility_enabled && moves_searched > 0 && depth <= FUTILITY_DEPTH && !in_check &&
+        is_quiet(mv) && static_eval + FUTILITY_MARGIN[static_cast<std::size_t>(depth)] <= alpha) {
       pos.unmake_move(mv);
       continue;
     }

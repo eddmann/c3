@@ -540,6 +540,39 @@ TEST(SearchPruning, RazoringDoesNotRefuseANodeThatBeatsAMateRangeAlpha) {
   EXPECT_GE(score_with(true), beta) << "razoring must not fail low against a mate-range alpha";
 }
 
+TEST(SearchPruning, NullMovePruningCutsOffNodesThatCanAffordToPass) {
+  // A middlegame with every piece still on the board: no side is anywhere near
+  // zugzwang, so "pass and still beat beta" is a question worth asking at most
+  // of the nodes below the root. That is the setting null-move pruning was
+  // written for, and the reduced re-search it pays for is far cheaper than the
+  // full-width subtree it refuses.
+  constexpr std::string_view FEN =
+      "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R b KQ - 0 9";
+
+  search::SearchContext with_null_move;
+  search::SearchContext without_null_move;
+  without_null_move.null_move_enabled = false;
+
+  EXPECT_LT(nodes_searched(FEN, 7, with_null_move), nodes_searched(FEN, 7, without_null_move))
+      << "a node that beats beta after passing should not be searched in full";
+}
+
+TEST(SearchPruning, FutilityPruningSkipsQuietMovesThatCannotRaiseAlpha) {
+  // Black is a piece down, so the shallow nodes below the root are mostly
+  // positions whose static evaluation is already under the window they are
+  // searched with. A quiet move there cannot make up the margin in the one or
+  // two plies that remain, which is precisely the claim futility pruning makes
+  // before it skips the move.
+  constexpr std::string_view FEN = "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R b KQ - 1 8";
+
+  search::SearchContext with_futility;
+  search::SearchContext without_futility;
+  without_futility.futility_enabled = false;
+
+  EXPECT_LT(nodes_searched(FEN, 7, with_futility), nodes_searched(FEN, 7, without_futility))
+      << "a quiet move that cannot reach alpha should not be costing a node";
+}
+
 TEST(SearchPruning, LateMovePruningStopsSearchingQuietMovesNearTheHorizon) {
   // An ordinary opening middlegame: a wide list of quiet moves at every node,
   // which is precisely the position a move count is a good argument about.
