@@ -641,8 +641,39 @@ int eval(const Position& pos) noexcept {
 
   // Mobility and the king-zone attacker counts come out of the same pass, and
   // each side's attackers are what threaten the OTHER side's king.
-  const auto white_activity = eval_piece_activity(Colour::White, board);
-  const auto black_activity = eval_piece_activity(Colour::Black, board);
+  //
+  // COMPILE-TIME EXPERIMENT HOOK, the counterpart of the C3_DISABLE_* switches
+  // in search.hpp: `-DC3_DISABLE_MOBILITY` drops the mobility term from the
+  // score and `-DC3_DISABLE_KING_ATTACKERS` drops the attacker count king
+  // safety reads, so an engine-versus-engine match can price either one on its
+  // own. The default build defines neither macro and is unaffected; nothing on
+  // the UCI path can reach these, because only the compiler invocation sets
+  // them.
+  //
+  // The two terms are separable in the score but NOT in the work: they are read
+  // off the same attack bitboards, and those bitboards are the expensive part
+  // of this function—roughly half of an evaluation. So disabling one of them
+  // buys the term's strength contribution and none of the time back, and only
+  // disabling BOTH skips the pass and buys the time. That is why the pass below
+  // is skipped only when neither answer is wanted.
+  const auto activity_of = [&board]([[maybe_unused]] Colour side) {
+#if defined(C3_DISABLE_MOBILITY) && defined(C3_DISABLE_KING_ATTACKERS)
+    (void)board;
+    return PieceActivity{};
+#else
+    PieceActivity activity = eval_piece_activity(side, board);
+#ifdef C3_DISABLE_MOBILITY
+    activity.mobility = {};
+#endif
+#ifdef C3_DISABLE_KING_ATTACKERS
+    activity.king_zone_attackers = 0;
+#endif
+    return activity;
+#endif
+  };
+
+  const auto white_activity = activity_of(Colour::White);
+  const auto black_activity = activity_of(Colour::Black);
 
   score += white_activity.mobility;
   score -= black_activity.mobility;
