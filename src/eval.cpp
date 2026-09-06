@@ -67,6 +67,25 @@
 #include "c3/piece.hpp"
 #include "c3/square.hpp"
 
+// ---------------------------------------------------------------------------
+// COMPILE-TIME EXPERIMENT HOOK
+// ---------------------------------------------------------------------------
+// The eval half of the hook documented above SearchContext in search.hpp,
+// normalised the same way and for the same reason: a name the command line has
+// not defined is given the value 0 here, so the tests below are `#if` on a
+// VALUE rather than `#ifdef` on a name. The difference is not pedantry.
+// `-DC3_DISABLE_MOBILITY=0` is what somebody writes when they mean "leave
+// mobility on", and under `#ifdef` that would have turned mobility OFF—the
+// macro is defined, whatever its value. With the normalisation `=0` is on, and
+// `=1` or a bare `-DC3_DISABLE_MOBILITY` is off.
+// ---------------------------------------------------------------------------
+#ifndef C3_DISABLE_MOBILITY
+#define C3_DISABLE_MOBILITY 0
+#endif
+#ifndef C3_DISABLE_KING_ATTACKERS
+#define C3_DISABLE_KING_ATTACKERS 0
+#endif
+
 namespace c3 {
 namespace {
 
@@ -646,9 +665,10 @@ int eval(const Position& pos) noexcept {
   // in search.hpp: `-DC3_DISABLE_MOBILITY` drops the mobility term from the
   // score and `-DC3_DISABLE_KING_ATTACKERS` drops the attacker count king
   // safety reads, so an engine-versus-engine match can price either one on its
-  // own. The default build defines neither macro and is unaffected; nothing on
-  // the UCI path can reach these, because only the compiler invocation sets
-  // them.
+  // own. Both are read as VALUES—see the normalisation at the top of this
+  // file—so `=0` means "leave it on". The default build defines neither macro
+  // and is unaffected; nothing on the UCI path can reach these, because only
+  // the compiler invocation sets them.
   //
   // The two terms are separable in the score but NOT in the work: they are read
   // off the same attack bitboards, and those bitboards are the expensive part
@@ -656,16 +676,15 @@ int eval(const Position& pos) noexcept {
   // buys the term's strength contribution and none of the time back, and only
   // disabling BOTH skips the pass and buys the time. That is why the pass below
   // is skipped only when neither answer is wanted.
-  const auto activity_of = [&board]([[maybe_unused]] Colour side) {
-#if defined(C3_DISABLE_MOBILITY) && defined(C3_DISABLE_KING_ATTACKERS)
-    (void)board;
+  const auto activity_of = [&]([[maybe_unused]] Colour side) {
+#if C3_DISABLE_MOBILITY && C3_DISABLE_KING_ATTACKERS
     return PieceActivity{};
 #else
     PieceActivity activity = eval_piece_activity(side, board);
-#ifdef C3_DISABLE_MOBILITY
+#if C3_DISABLE_MOBILITY
     activity.mobility = {};
 #endif
-#ifdef C3_DISABLE_KING_ATTACKERS
+#if C3_DISABLE_KING_ATTACKERS
     activity.king_zone_attackers = 0;
 #endif
     return activity;

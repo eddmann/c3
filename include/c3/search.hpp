@@ -126,6 +126,59 @@
 #include "c3/movegen.hpp"
 #include "c3/position.hpp"
 
+// ---------------------------------------------------------------------------
+// COMPILE-TIME EXPERIMENT HOOK
+// ---------------------------------------------------------------------------
+// Every heuristic below has a test-only switch on SearchContext, and every one
+// of those switches defaults to true. The default is written through
+// C3_HEURISTIC_ENABLED so that a build can flip exactly one of them to false
+// from the command line—`-DC3_DISABLE_LATE_MOVE_PRUNING`, say—without a source
+// change and without any of the others moving. That is what makes an
+// engine-versus-engine match able to price a single heuristic: two binaries
+// from the same commit that differ in one rule.
+//
+// The default build defines none of these macros on the command line, so every
+// switch below is true
+// and the shipped engine is byte-for-byte the engine it was before this hook
+// existed. (The block below then defines all nine to 0, which is the
+// normalisation, not a default anybody wrote.) And the switches are still written by nobody on the
+// UCI path: the only thing that changes a default is the compiler invocation, so a running engine
+// cannot be talked into a different search by anything arriving over stdin.
+//
+// Each name is normalised to 0 when the command line has not defined it, which
+// is what lets one helper macro serve all of them: `-DC3_DISABLE_X` gives the
+// macro the value 1, and the negation below turns that into a false default.
+// ---------------------------------------------------------------------------
+#ifndef C3_DISABLE_REDUCTIONS
+#define C3_DISABLE_REDUCTIONS 0
+#endif
+#ifndef C3_DISABLE_REVERSE_FUTILITY
+#define C3_DISABLE_REVERSE_FUTILITY 0
+#endif
+#ifndef C3_DISABLE_RAZORING
+#define C3_DISABLE_RAZORING 0
+#endif
+#ifndef C3_DISABLE_LATE_MOVE_PRUNING
+#define C3_DISABLE_LATE_MOVE_PRUNING 0
+#endif
+#ifndef C3_DISABLE_INTERNAL_ITERATIVE_REDUCTION
+#define C3_DISABLE_INTERNAL_ITERATIVE_REDUCTION 0
+#endif
+#ifndef C3_DISABLE_CHECK_EXTENSION_CAP
+#define C3_DISABLE_CHECK_EXTENSION_CAP 0
+#endif
+#ifndef C3_DISABLE_QUIESCENCE_PRUNING
+#define C3_DISABLE_QUIESCENCE_PRUNING 0
+#endif
+#ifndef C3_DISABLE_NULL_MOVE
+#define C3_DISABLE_NULL_MOVE 0
+#endif
+#ifndef C3_DISABLE_FUTILITY
+#define C3_DISABLE_FUTILITY 0
+#endif
+
+#define C3_HEURISTIC_ENABLED(NAME) (!(C3_DISABLE_##NAME))
+
 namespace c3::search {
 
 inline constexpr std::uint8_t MAX_DEPTH = 255;
@@ -698,58 +751,6 @@ struct PlyScratch {
   std::uint8_t check_extensions{0};
 };
 
-// ---------------------------------------------------------------------------
-// COMPILE-TIME EXPERIMENT HOOK
-// ---------------------------------------------------------------------------
-// Every heuristic below has a test-only switch on SearchContext, and every one
-// of those switches defaults to true. The default is written through
-// C3_HEURISTIC_ENABLED so that a build can flip exactly one of them to false
-// from the command line—`-DC3_DISABLE_LATE_MOVE_PRUNING`, say—without a source
-// change and without any of the others moving. That is what makes an
-// engine-versus-engine match able to price a single heuristic: two binaries
-// from the same commit that differ in one rule.
-//
-// The default build defines none of these macros, so every switch below is true
-// and the shipped engine is byte-for-byte the engine it was before this hook
-// existed. And the switches are still written by nobody on the UCI path: the
-// only thing that changes a default is the compiler invocation, so a running
-// engine cannot be talked into a different search by anything arriving over
-// stdin.
-//
-// Each name is normalised to 0 when the command line has not defined it, which
-// is what lets one helper macro serve all of them: `-DC3_DISABLE_X` gives the
-// macro the value 1, and the negation below turns that into a false default.
-// ---------------------------------------------------------------------------
-#ifndef C3_DISABLE_REDUCTIONS
-#define C3_DISABLE_REDUCTIONS 0
-#endif
-#ifndef C3_DISABLE_REVERSE_FUTILITY
-#define C3_DISABLE_REVERSE_FUTILITY 0
-#endif
-#ifndef C3_DISABLE_RAZORING
-#define C3_DISABLE_RAZORING 0
-#endif
-#ifndef C3_DISABLE_LATE_MOVE_PRUNING
-#define C3_DISABLE_LATE_MOVE_PRUNING 0
-#endif
-#ifndef C3_DISABLE_INTERNAL_ITERATIVE_REDUCTION
-#define C3_DISABLE_INTERNAL_ITERATIVE_REDUCTION 0
-#endif
-#ifndef C3_DISABLE_CHECK_EXTENSION_CAP
-#define C3_DISABLE_CHECK_EXTENSION_CAP 0
-#endif
-#ifndef C3_DISABLE_QUIESCENCE_PRUNING
-#define C3_DISABLE_QUIESCENCE_PRUNING 0
-#endif
-#ifndef C3_DISABLE_NULL_MOVE
-#define C3_DISABLE_NULL_MOVE 0
-#endif
-#ifndef C3_DISABLE_FUTILITY
-#define C3_DISABLE_FUTILITY 0
-#endif
-
-#define C3_HEURISTIC_ENABLED(NAME) (!(C3_DISABLE_##NAME))
-
 class SearchContext {
 public:
   SearchContext();
@@ -810,6 +811,11 @@ public:
   // thing that changes is how many of them are searched. Nothing on the UCI
   // path writes it.
   bool futility_enabled{C3_HEURISTIC_ENABLED(FUTILITY)};
+
+// The last of the switches has taken its default, so the helper is retired
+// here rather than left in every translation unit that includes this header: a
+// name that generic has no business outliving the nine uses above.
+#undef C3_HEURISTIC_ENABLED
 
   // The scratch row for a node at `ply`. Rows live for the whole search and are
   // reused by every node that visits that ply, so a reference into one stays
