@@ -1486,6 +1486,15 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
     return 0;
   }
 
+  // SELDEPTH COUNTS QUIESCENCE TOO. This node sits at its parent's ply plus how
+  // far into quiescence it is, and that sum is clamped to MAX_DEPTH for the
+  // same reason the mate distance below is: the two are bounded separately, so
+  // nothing stops them adding up past what a byte can hold. See Report::max_ply.
+  report.max_ply =
+      std::max(report.max_ply, static_cast<std::uint8_t>(std::min<std::size_t>(
+                                   static_cast<std::size_t>(report.ply) + quiescence_depth,
+                                   static_cast<std::size_t>(MAX_DEPTH))));
+
   // THE QUIESCENCE DEPTH CAP
   // "Search captures until the position is quiet" is a promise with no bound in
   // it. In practice the bound is the board itself—every recursion has to find

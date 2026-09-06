@@ -37,6 +37,18 @@
 // the search does with the two. `go movetime` is the exception—there the GUI
 // really has named a single deadline, so both limits are that number.
 //
+// WHAT AN `info` LINE CARRIES
+// One line per completed iteration, in a fixed order:
+//
+//     info depth D seldepth S nodes N nps R hashfull H time T score ... pv ...
+//
+// `depth` is the iteration the search completed—the depth it reached on EVERY
+// line. `seldepth` is the deepest ply any single line reached, which is larger
+// because quiescence keeps resolving captures past the horizon and the check
+// extension gives forcing lines their plies back. A GUI shows the two together
+// as "D/S", and the gap between them is a fair summary of how much of the tree
+// this position forced the engine to look at selectively.
+//
 // THE `bench` COMMAND (not part of UCI)
 // `bench [depth]` searches a fixed list of positions to a fixed depth and
 // reports the total node count. Its whole value is that the number is

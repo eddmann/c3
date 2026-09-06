@@ -163,6 +163,7 @@ TEST(UciReporter, PrintsInfoAndTracksBestMove) {
 
   search::Report report;
   report.depth = 3;
+  report.max_ply = 11;
   report.nodes = 200;
   report.tt_stats = {1, 2};
   report.started_at = std::chrono::steady_clock::now() - 1s;
@@ -190,7 +191,9 @@ TEST(UciReporter, PrintsInfoAndTracksBestMove) {
   reporter.send(report);
 
   const auto output = out.str();
-  EXPECT_NE(output.find("info depth 3"), std::string::npos);
+  // seldepth follows depth, which is the pair a GUI shows together. The line's
+  // field order is part of what a front-end parses, so it is pinned here.
+  EXPECT_NE(output.find("info depth 3 seldepth 11 nodes 200"), std::string::npos) << output;
   EXPECT_NE(output.find("score cp 42"), std::string::npos);
   EXPECT_NE(output.find("pv e2e4 e7e5"), std::string::npos);
 
@@ -461,6 +464,39 @@ std::vector<std::string> lines_starting_with(const std::string& text, const std:
 }
 
 } // namespace
+
+TEST(UciSession, SeldepthIsReportedAndNeverBelowDepth) {
+  // The number a GUI shows after the slash. It is what the search reached down
+  // its most interesting line, so it can never be less than the depth it
+  // reached down every line, and on a position full of captures it is more:
+  // quiescence keeps resolving exchanges past the horizon.
+  const std::vector<std::string> script = {
+      "uci",
+      "isready",
+      "position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+      "go depth 4",
+  };
+
+  const auto output = uci::run_script_for_test(script);
+  const auto info = lines_starting_with(output, "info depth ");
+  ASSERT_FALSE(info.empty()) << output;
+
+  bool saw_deeper = false;
+  for (const auto& line : info) {
+    std::istringstream fields(line);
+    std::string tag;
+    unsigned depth = 0;
+    unsigned seldepth = 0;
+    // "info depth D seldepth S ..."
+    fields >> tag >> tag >> depth >> tag >> seldepth;
+    ASSERT_EQ(tag, "seldepth") << line;
+
+    EXPECT_GE(seldepth, depth) << line;
+    saw_deeper = saw_deeper || seldepth > depth;
+  }
+
+  EXPECT_TRUE(saw_deeper) << "quiescence should have looked past the nominal depth\n" << output;
+}
 
 TEST(UciParse, GoAcceptsMovesToGo) {
   EXPECT_NO_THROW((void)uci::parse_command("go wtime 10000 btime 10000 movestogo 40"));

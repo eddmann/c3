@@ -687,6 +687,10 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   // the depth it was given—that is the whole point of it, and the reason the
   // ceiling above has to exist. A position with checks available at the horizon
   // therefore reaches plies the depth limit alone would never reach.
+  //
+  // The witness is the extension COUNT, not max_ply. max_ply is seldepth now
+  // and includes quiescence, which passes the nominal depth on almost every
+  // position and would make this pass without an extension ever firing.
   Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
 
   search::SearchContext ctx;
@@ -702,7 +706,33 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   constexpr std::uint8_t DEPTH = 5;
   search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
-  EXPECT_GT(report.max_ply, DEPTH) << "a check at the horizon should have been extended";
+  EXPECT_GT(report.max_check_extensions, 0) << "a check at the horizon should have been extended";
+  EXPECT_GT(report.max_ply, DEPTH) << "and the search should have looked past its nominal depth";
+}
+
+TEST(SearchPlySafety, SeldepthCountsHowFarQuiescenceLooked) {
+  // seldepth answers "how deep did the engine look down its most interesting
+  // line", and most of the answer is quiescence: `depth` is what was searched
+  // everywhere, and the gap is the exchanges quiescence went on resolving past
+  // the horizon.
+  //
+  // A capture-heavy position at depth 1 makes the point cleanly. One ply of
+  // alpha-beta cannot reach ply 2 by itself, so anything past that is
+  // quiescence saying how far it had to go before the position was quiet.
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  constexpr std::uint8_t DEPTH = 1;
+  search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  EXPECT_GT(report.max_ply, DEPTH) << "quiescence resolved captures past the horizon and the "
+                                      "selective depth should say so";
+  EXPECT_LE(report.max_ply, search::MAX_DEPTH) << "and it stays inside a byte";
 }
 
 TEST(SearchPlySafety, TheCheckExtensionBudgetBoundsHowFarAPathMayRun) {
@@ -746,7 +776,11 @@ TEST(SearchPlySafety, TheCheckExtensionBudgetBoundsHowFarAPathMayRun) {
       << "this position must run past the budget, or the test proves nothing";
   EXPECT_LE(capped.max_check_extensions, search::MAX_CHECK_EXTENSIONS)
       << "no path may take more extensions than the budget allows";
-  EXPECT_LT(capped.max_ply, uncapped.max_ply) << "the cap should be holding the ply down";
+
+  // The witness is the extension count and not max_ply, which is seldepth and
+  // includes quiescence: both searches resolve the same captures past the
+  // horizon and reach the same selective depth whether the main search was
+  // allowed to extend or not.
 
   // ...and it holds the ply down for free. A node that stops extending does not
   // disappear—it is handed to quiescence, which charges for the captures it

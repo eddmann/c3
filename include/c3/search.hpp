@@ -174,9 +174,20 @@ inline constexpr std::uint8_t MAX_CHECK_EXTENSIONS = 4;
 struct Report {
   std::uint8_t depth{0};
   std::uint8_t ply{0};
-  // The deepest ply the main search reached, which is what a UCI `seldepth`
-  // would report and what the ply ceiling is asserted against. It only ever
-  // grows, so it survives the recursion unwinding back to the root.
+  // SELDEPTH: the deepest ply ANY line reached, which is what the `seldepth`
+  // field of a UCI `info` line reports and what the ply ceiling is asserted
+  // against. It only ever grows, so it survives the recursion unwinding back to
+  // the root.
+  //
+  // QUIESCENCE COUNTS TOWARDS IT. `depth` is what the engine committed to
+  // searching everywhere; seldepth is how far it actually looked down the one
+  // line it found most interesting, and most of that difference is quiescence
+  // resolving a long exchange, not the main search. A seldepth that stopped at
+  // the alpha-beta horizon would report a number the engine beat on almost
+  // every line, which is not what a GUI showing "18/34" is telling its user.
+  // A quiescence node's ply is its parent's ply plus how deep into quiescence
+  // it is, clamped to MAX_DEPTH: the two are bounded separately (255 plies and
+  // 64 quiescence levels) and their sum does not have to fit in a byte.
   std::uint8_t max_ply{0};
 
   // The longest run of check extensions any single path took. It exists to be

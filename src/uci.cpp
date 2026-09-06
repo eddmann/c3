@@ -734,12 +734,15 @@ void UciReporter::send(const search::Report& report) {
           ? 0
           : static_cast<std::uint32_t>((report.tt_stats.first * 1000) / report.tt_stats.second);
 
+  // `seldepth` sits immediately after `depth` because that is the pair a GUI
+  // shows together ("18/34"): what the engine searched everywhere, and how far
+  // it looked down the line it cared about. The second number is always at
+  // least the first—quiescence and the check extension only ever push it
+  // further—so a seldepth BELOW the depth would be a bug worth noticing.
   std::vector<std::string> info{
-      "depth " + std::to_string(report.depth),
-      "nodes " + std::to_string(report.nodes),
-      "nps " + std::to_string(nps),
-      "hashfull " + std::to_string(hashfull),
-      "time " + std::to_string(elapsed_ms),
+      "depth " + std::to_string(report.depth), "seldepth " + std::to_string(report.max_ply),
+      "nodes " + std::to_string(report.nodes), "nps " + std::to_string(nps),
+      "hashfull " + std::to_string(hashfull),  "time " + std::to_string(elapsed_ms),
   };
 
   if (report.pv.has_value()) {
