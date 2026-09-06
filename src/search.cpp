@@ -131,6 +131,63 @@ constexpr std::array<int, 3> FUTILITY_MARGIN = {0, 100, 300}; // margins for dep
 constexpr int FUTILITY_DEPTH = 2;
 
 // =============================================================================
+// REVERSE FUTILITY PRUNING (also called "static null move pruning")
+// =============================================================================
+// Futility pruning above asks whether a MOVE can rescue a position that is too
+// far behind. Reverse futility asks the mirror question about the NODE: is the
+// position so far AHEAD that the opponent will never let us have it?
+//
+//     static_eval - margin(depth) >= beta  ->  fail high without searching
+//
+// The reasoning is the null move's, with the null move's cost removed. Null
+// move pruning proves "even if I pass, I still beat beta" by searching a
+// reduced tree; reverse futility makes the weaker claim "I am so far ahead
+// that a few plies of the opponent's best play cannot claw back the margin",
+// and it makes it for the price of one call to eval(). At depth 1-3, where the
+// reduced null-move search is barely cheaper than the real one, that trade is
+// overwhelmingly worth making.
+//
+// THE MARGIN IS THE WHOLE HEURISTIC. It stands for "the most the opponent can
+// win back per ply of the search we are declining to do", so it grows linearly
+// with depth: 80 centipawns a ply, a little under a minor piece over three.
+// Too small and the node fails high on positions the opponent could still
+// rescue; too large and the rule never fires.
+//
+// WHERE IT MAY NOT FIRE
+//   - PV NODES. A PV node's job is to produce a true score and the line behind
+//     it, and this rule produces neither—it returns a bound on a guess.
+//   - IN CHECK. There is no meaningful static evaluation of a position the
+//     side to move may not be allowed to keep; the position may be mate.
+//   - MATE-RANGE BETA. If beta is already a mate score, "static_eval beats
+//     beta" would mean a static evaluation had proved a forced mate, which no
+//     material count can do.
+//
+// FAILURE MODE. The static evaluation is a snapshot of material and structure,
+// and it cannot see that the queen it is counting is trapped, or that the
+// extra rook is about to be lost to a fork. Where it is wrong by more than the
+// margin, this returns a fail-high the position does not deserve, and unlike a
+// reduction there is no re-search to catch it—nothing is searched at all. Two
+// smaller sins come with it: a stalemate can be reported as a fail high (the
+// side to move has no legal move at all, but the material says it is winning),
+// and the bound is stamped with the node's full depth for the table.
+// =============================================================================
+constexpr std::uint8_t REVERSE_FUTILITY_DEPTH = 3;
+constexpr int REVERSE_FUTILITY_MARGIN_PER_PLY = 80;
+
+int reverse_futility_margin(std::uint8_t depth) {
+  return REVERSE_FUTILITY_MARGIN_PER_PLY * static_cast<int>(depth);
+}
+
+// The deepest node that computes a static evaluation for the shallow-depth
+// rules above. eval() is not free, so it is asked for once per node and only
+// where one of those rules can actually read the answer.
+constexpr std::uint8_t STATIC_EVAL_DEPTH = REVERSE_FUTILITY_DEPTH;
+
+static_assert(STATIC_EVAL_DEPTH >= FUTILITY_DEPTH,
+              "every rule that reads the static evaluation must be inside the depth that "
+              "computes it");
+
+// =============================================================================
 // DELTA PRUNING
 // =============================================================================
 // Futility pruning's idea, moved into quiescence. There the moves all capture
@@ -1470,6 +1527,30 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   const Colour colour_to_move = pos.colour_to_move;
   const bool in_check = is_in_check(colour_to_move, pos.board);
 
+  // THE ONE STATIC EVALUATION THIS NODE GETS
+  // Reverse futility, and futility pruning inside the move loop, all ask the
+  // same question—"what is this position worth as it stands?"—and eval() walks
+  // the whole board to answer it. So it is asked once, here, and only where an
+  // answer can be read: in check there is no honest static score, because the
+  // side to move is not allowed to keep the position, and past STATIC_EVAL_DEPTH
+  // no rule below looks at it.
+  const bool has_static_eval = !in_check && depth <= STATIC_EVAL_DEPTH;
+  const int static_eval = has_static_eval ? eval(pos) : 0;
+
+  // REVERSE FUTILITY PRUNING
+  // So far ahead that a few plies of the opponent's best play should not claw
+  // the margin back: fail high without searching anything. See the block above
+  // for the reasoning and for the failure mode this buys into.
+  //
+  // The return is beta rather than static_eval, because this search is
+  // fail-hard everywhere else: every other cutoff in this function hands its
+  // caller the bound it was given, never a score outside the window.
+  if (ctx.reverse_futility_enabled && has_static_eval && !is_pv_node &&
+      depth <= REVERSE_FUTILITY_DEPTH && std::abs(beta) < CENTIPAWN_MATE_THRESHOLD &&
+      static_eval - reverse_futility_margin(depth) >= beta) {
+    return beta;
+  }
+
   // NULL-MOVE PRUNING
   // Idea: if we can "pass" our turn and STILL beat beta, the position is so
   // good we probably don't need to search it fully. This is a big time saver.
@@ -1521,9 +1602,6 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       return beta;
     }
   }
-
-  // Static evaluation for futility pruning (only compute at shallow depths when not in check)
-  const int static_eval = (depth <= FUTILITY_DEPTH && !in_check) ? eval(pos) : 0;
 
   // Generated straight into this ply's row. The returning form would build a
   // two-kilobyte MoveList in this frame first, 255 frames deep; see

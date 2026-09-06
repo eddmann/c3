@@ -419,6 +419,49 @@ TEST(SearchReductions, SearchLateQuietMovesShallower) {
   EXPECT_GE(reduced_pv.size(), 2U);
 }
 
+// Pruning and reduction mechanisms --------------------------------------------
+//
+// Every one of these has the same problem the reductions above have: it changes
+// how much work a search does and nothing else, so the only honest measurement
+// is the same position searched twice, once with the mechanism on and once with
+// it off. The comparison is relational on purpose—an absolute node ceiling would
+// be measuring the evaluation function as much as the mechanism, and would have
+// to be rewritten every time a term was added to it.
+
+namespace {
+
+// The nodes one alpha-beta search of `fen` costs, with the switches the caller
+// has set. A fresh, small table each time, so the two halves of a comparison
+// start from the same (empty) knowledge.
+std::uint64_t nodes_searched(std::string_view fen, std::uint8_t depth, search::SearchContext& ctx) {
+  Position pos = parse(fen);
+  search::TranspositionTable tt(8);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  search::detail::alphabeta(pos, depth, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+  return report.nodes;
+}
+
+} // namespace
+
+TEST(SearchPruning, ReverseFutilityCutsOffNodesThatAreAlreadyWinning) {
+  // White is a rook and a knight up in an otherwise ordinary middlegame, so
+  // most of the shallow non-PV nodes below the root are positions whose static
+  // evaluation is far above any window they are searched with. That is exactly
+  // the shape reverse futility exists for: fail high on the material, and never
+  // generate the moves at all.
+  constexpr std::string_view FEN = "r2qkb1r/ppp2ppp/2n5/3p4/3P4/2N2N2/PPP2PPP/R2QKB1R w KQkq - 0 1";
+
+  search::SearchContext with_pruning;
+  search::SearchContext without_pruning;
+  without_pruning.reverse_futility_enabled = false;
+
+  EXPECT_LT(nodes_searched(FEN, 6, with_pruning), nodes_searched(FEN, 6, without_pruning))
+      << "a node far enough ahead should be failing high without searching";
+}
+
 TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
   search::CounterMoves counters;
   const auto previous = make_move(Piece::BP, "d7", "d5");

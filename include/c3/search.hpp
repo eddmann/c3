@@ -77,6 +77,11 @@
 //      uses it to refuse captures that lose material outright, which is the
 //      one thing MVV-LVA cannot see.
 //
+//  11. REVERSE FUTILITY PRUNING
+//      Futility pruning's mirror image, asked about the node rather than about
+//      a move: if the position is so far ahead that a few plies cannot claw
+//      the margin back, fail high without searching at all.
+//
 // WHERE THE SEARCH'S WORKING STORAGE LIVES
 // Not on the stack. The recursion is up to 255 frames deep and each frame
 // would otherwise hold several two-kilobyte move lists, which overflows the
@@ -648,6 +653,11 @@ public:
   // experiments, and it is why the reduction block in search.cpp asks a
   // question that always answers "yes" in a real game.
   bool reductions_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. Reverse futility pruning cuts a node
+  // off before it searches anything, so what it changes is the size of the tree
+  // and nothing else. Nothing on the UCI path writes it.
+  bool reverse_futility_enabled{true};
 
   // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
   // the underpromotion filter in quiescence all change how much work is done
