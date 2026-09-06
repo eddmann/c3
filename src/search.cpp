@@ -131,6 +131,131 @@ constexpr std::array<int, 3> FUTILITY_MARGIN = {0, 100, 300}; // margins for dep
 constexpr int FUTILITY_DEPTH = 2;
 
 // =============================================================================
+// REVERSE FUTILITY PRUNING (also called "static null move pruning")
+// =============================================================================
+// Futility pruning above asks whether a MOVE can rescue a position that is too
+// far behind. Reverse futility asks the mirror question about the NODE: is the
+// position so far AHEAD that the opponent will never let us have it?
+//
+//     static_eval - margin(depth) >= beta  ->  fail high without searching
+//
+// The reasoning is the null move's, with the null move's cost removed. Null
+// move pruning proves "even if I pass, I still beat beta" by searching a
+// reduced tree; reverse futility makes the weaker claim "I am so far ahead
+// that a few plies of the opponent's best play cannot claw back the margin",
+// and it makes it for the price of one call to eval(). At depth 1-3, where the
+// reduced null-move search is barely cheaper than the real one, that trade is
+// overwhelmingly worth making.
+//
+// THE MARGIN IS THE WHOLE HEURISTIC. It stands for "the most the opponent can
+// win back per ply of the search we are declining to do", so it grows linearly
+// with depth: 80 centipawns a ply, a little under a minor piece over three.
+// Too small and the node fails high on positions the opponent could still
+// rescue; too large and the rule never fires.
+//
+// WHERE IT MAY NOT FIRE
+//   - PV NODES. A PV node's job is to produce a true score and the line behind
+//     it, and this rule produces neither—it returns a bound on a guess.
+//   - IN CHECK. There is no meaningful static evaluation of a position the
+//     side to move may not be allowed to keep; the position may be mate.
+//   - MATE-RANGE BETA. If beta is already a mate score, "static_eval beats
+//     beta" would mean a static evaluation had proved a forced mate, which no
+//     material count can do.
+//
+// FAILURE MODE. The static evaluation is a snapshot of material and structure,
+// and it cannot see that the queen it is counting is trapped, or that the
+// extra rook is about to be lost to a fork. Where it is wrong by more than the
+// margin, this returns a fail-high the position does not deserve, and unlike a
+// reduction there is no re-search to catch it—nothing is searched at all. Two
+// smaller sins come with it: a stalemate can be reported as a fail high (the
+// side to move has no legal move at all, but the material says it is winning),
+// and the bound is stamped with the node's full depth for the table.
+// =============================================================================
+constexpr std::uint8_t REVERSE_FUTILITY_DEPTH = 3;
+constexpr int REVERSE_FUTILITY_MARGIN_PER_PLY = 80;
+
+int reverse_futility_margin(std::uint8_t depth) {
+  return REVERSE_FUTILITY_MARGIN_PER_PLY * static_cast<int>(depth);
+}
+
+// =============================================================================
+// RAZORING
+// =============================================================================
+// The other end of the same telescope. Reverse futility asks whether a node is
+// too far ahead to be worth searching; razoring asks whether it is too far
+// behind. If the static evaluation plus a generous margin still does not reach
+// alpha, the position is so bad that a full-width search is unlikely to be
+// spending its time well.
+//
+// THE NAIVE FORM IS A TRAP. "Too far behind, so return alpha" throws away the
+// one thing that could rescue the position: a capture. A node down a rook
+// whose next move wins the queen back evaluates terribly and is perfectly
+// fine, and the static evaluation cannot tell those two apart—that is exactly
+// what quiescence exists for.
+//
+// SO RAZORING VERIFIES. Instead of returning, it drops into quiescence with
+// the node's own window and asks the question again with the captures
+// resolved:
+//
+//     static_eval + margin(depth) <= alpha        the guess
+//     quiescence(alpha, beta)     <= alpha        the verification
+//
+// Only when the capture search agrees does the node fail low without a
+// full-width search. When it disagrees—there was a tactic after all—nothing is
+// pruned and the node searches normally, having paid for one quiescence call
+// it would very likely have made at its leaves anyway.
+//
+// WHY THE MARGIN IS SO LARGE. It stands for everything a full-width search of
+// two plies could add that quiescence cannot see: a fork set up by a quiet
+// move, a passed pawn pushed past its blockader, a piece dropped into an
+// outpost. Two hundred centipawns a ply is deliberately more than a minor
+// piece, because being wrong here costs a whole subtree of search.
+//
+// A SMALLER MARGIN FIRES MORE OFTEN, and that is not free. Measured, 130 a ply
+// takes the bench total about ten per cent lower than 200 does—but it also cost
+// SEVEN PER CENT more nodes on a position where the side to move was behind and
+// had a tactic, which is exactly the shape of mistake this rule is supposed to
+// be careful about: the position was not lost, it only looked lost until its
+// capture was played. Two hundred helps every position measured rather than
+// most of them, and buying the last tenth of the tree with an occasional
+// missed tactic is the wrong trade for a rule that prunes without a re-search.
+//
+// A MATE-RANGE ALPHA IS NOT A GUESS THIS RULE MAY MAKE. Once alpha is itself a
+// mate score—which is what a node gets once a mate has been found elsewhere in
+// the tree—"static_eval + margin does not reach alpha" is trivially true, since
+// no material count comes within four hundred centipawns of ten thousand. Every
+// such node would hand itself to quiescence and fail low, having proved nothing
+// whatever about the mate it was asked to beat, and a shorter mate sitting one
+// move away would simply never be looked at. So the rule declines to have an
+// opinion there. (Futility pruning inside the move loop is blind in the same
+// way, but it is bounded differently: it only skips individual quiet moves, and
+// only after a move has already been searched, so the node still returns a
+// score it earned rather than one it declined to look for.)
+//
+// FAILURE MODE: THE QUIET RESCUE. Quiescence only searches captures, so a
+// position saved by a quiet move—the only defence to a threat, a fortress, a
+// zugzwang—looks as lost to the verification as it did to the static
+// evaluation, and the node fails low anyway. That is the bet, and it is why
+// razoring is confined to non-PV nodes at depth 1 and 2, where the mistake is
+// cheap and a re-search elsewhere usually catches it.
+// =============================================================================
+constexpr std::uint8_t RAZORING_DEPTH = 2;
+constexpr int RAZORING_MARGIN_PER_PLY = 200;
+
+int razoring_margin(std::uint8_t depth) {
+  return RAZORING_MARGIN_PER_PLY * static_cast<int>(depth);
+}
+
+// The deepest node that computes a static evaluation for the shallow-depth
+// rules above. eval() is not free, so it is asked for once per node and only
+// where one of those rules can actually read the answer.
+constexpr std::uint8_t STATIC_EVAL_DEPTH = REVERSE_FUTILITY_DEPTH;
+
+static_assert(STATIC_EVAL_DEPTH >= FUTILITY_DEPTH && STATIC_EVAL_DEPTH >= RAZORING_DEPTH,
+              "every rule that reads the static evaluation must be inside the depth that "
+              "computes it");
+
+// =============================================================================
 // DELTA PRUNING
 // =============================================================================
 // Futility pruning's idea, moved into quiescence. There the moves all capture
@@ -169,8 +294,8 @@ constexpr int DELTA_PRUNING_MARGIN = 200;
 // defender of the promotion square—has to be asked properly.
 //
 // This exists purely so that see() is not called for captures whose answer is
-// already known: it copies a whole Board and walks the exchange square by
-// square, and most captures a node looks at are the obvious good ones.
+// already known: it walks the whole exchange, a magic lookup or two per swap,
+// and most captures a node looks at are the obvious good ones.
 bool may_lose_material(const Move& mv) {
   if (!mv.captured_piece.has_value()) {
     return true;
@@ -217,9 +342,8 @@ int optimistic_gain(const Move& mv) {
 //    QxP above every quiet move whether or not the pawn is defended—and this is
 //    the check it is missing. Only STRICTLY losing captures go: an even trade
 //    (SEE == 0) may still be exactly the move that resolves the position, which
-//    is what quiescence is for. may_lose_material() keeps see(), which copies a
-//    Board and walks the exchange, off the captures whose answer is already
-//    known.
+//    is what quiescence is for. may_lose_material() keeps see(), which walks
+//    the whole exchange, off the captures whose answer is already known.
 bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int alpha,
                       bool late_endgame) {
   if (mv.promotion_piece.has_value() && *mv.promotion_piece != queen(pos.colour_to_move)) {
@@ -325,6 +449,198 @@ struct LmrTable {
 };
 
 const LmrTable LMR_TABLE;
+
+// =============================================================================
+// LATE MOVE PRUNING (move-count pruning)
+// =============================================================================
+// Late move reductions above say "a quiet move ordering ranked near the back
+// gets less depth". Late move pruning says the blunter thing: near the horizon,
+// once a node has searched enough quiet moves, the rest are not searched at
+// all. No reduced search, no verification, no re-search—they are simply gone.
+//
+// WHY THAT IS DEFENSIBLE. It is the same claim ordering already makes,
+// collected into a count instead of a depth. If the hash move, the captures,
+// the killers, the counter-move and a dozen quiet moves with good history have
+// all failed to raise alpha at depth 3, the twentieth quiet move—chosen by
+// history alone, from the bottom of the list—is very unlikely to be the one.
+// And the saving is where saving is worth most: these are the nodes just above
+// the leaves, which is where most of the tree is.
+//
+// THE COUNT GROWS WITH DEPTH, as 3 + depth^2: four quiet moves at depth 1,
+// nineteen at depth 4. Deeper nodes are more expensive to be wrong about, and
+// they are also the ones whose children still have room to reveal something,
+// so they are allowed to look at far more of the list.
+//
+// WHAT IS NEVER PRUNED, and each exemption answers a way of being wrong:
+//   - CAPTURES AND PROMOTIONS. Material swings are not what a move-count
+//     argument is about.
+//   - MOVES MADE OR GIVEN IN CHECK. A forcing line is short and must be seen
+//     to its end. This is the expensive test—it scans the board—so it is asked
+//     last, once the cheap conditions have already agreed.
+//   - KILLERS AND COUNTER-MOVES. The search has specific evidence for these,
+//     and a count is a statement about moves it has no evidence about.
+//   - PV NODES. Their job is the true score and the line behind it.
+//   - THE FIRST LEGAL MOVE. A node that pruned everything would report "no
+//     legal moves"—checkmate or stalemate—for a position that has plenty. That
+//     is not a slightly wrong score, it is a fabricated terminal, so the rule
+//     only starts once something has actually been searched.
+//
+// FAILURE MODE: THE QUIET MOVE ORDERING GOT WRONG. History is a statistic
+// gathered elsewhere in the tree, and the move that wins this position may be
+// one it has never seen work. Reductions survive that mistake—the re-search
+// catches it—and pruning does not: the move is not searched, so nothing can
+// contradict it. That is why the count is generous and the depth is small.
+// =============================================================================
+
+constexpr std::uint8_t LATE_MOVE_PRUNING_DEPTH = 4;
+constexpr std::size_t LATE_MOVE_PRUNING_BASE = 3;
+
+std::size_t late_move_pruning_threshold(std::uint8_t depth) {
+  const std::size_t plies = depth;
+  return LATE_MOVE_PRUNING_BASE + (plies * plies);
+}
+
+// =============================================================================
+// INTERNAL ITERATIVE REDUCTION (IIR)
+// =============================================================================
+// Everything alpha-beta saves depends on searching the best move first, and at
+// most nodes the transposition table supplies it. At a node with nothing in the
+// table there is no such move: ordering falls back to captures by MVV-LVA and
+// quiet moves by history, and if it guesses wrong the node searches its whole
+// list at full depth before finding out.
+//
+// TWO ANSWERS TO THAT, and this engine takes the cheaper one.
+//
+//   INTERNAL ITERATIVE DEEPENING (IID) searches the node first at a much
+//   reduced depth purely to find out which move comes back best, then throws
+//   that search away and searches properly with the answer as the hash move.
+//   It buys good ordering by paying for an extra, smaller search of the same
+//   node—perhaps a fifth of the cost—and the shallow search is often wrong
+//   about a node whose whole problem is that nobody has looked at it yet.
+//
+//   INTERNAL ITERATIVE REDUCTION (IIR) makes the same observation and draws a
+//   blunter conclusion: a node with no hash move is a node we are poorly
+//   equipped to search, so search it one ply shallower and let the
+//   transposition table remember what it found. The next iteration of
+//   iterative deepening arrives at this node WITH a hash move—the one this
+//   reduced search stored—and searches it at full depth with good ordering.
+//   Iterative deepening is already doing IID's job, one iteration at a time;
+//   IIR simply stops paying for the same information twice.
+//
+// It costs one line and no extra search, which is why it is what is here. IID
+// was not measured against it: the case for IIR is that it reuses a mechanism
+// the search already has, and adding IID would mean adding a second, private
+// iterative deepening loop inside the first one.
+//
+// IT APPLIES AT EVERY NODE, NOT ONLY ON THE PRINCIPAL VARIATION, and that is
+// the whole difference between a rule that does something and one that does
+// not. Confined to PV nodes it is nearly dead: by the time iterative deepening
+// reaches depth d, every PV node with four or more plies still to search was
+// already visited by iteration d - 1 and has a hash move waiting, so the
+// condition almost never holds. Measured over the bench, PV-only took the node
+// total from 240,269 to 238,588—seven parts in a thousand—while the same rule
+// at every node took it to 204,377, and `go movetime 1000` from the start
+// position went from depth 12 to depth 15. The nodes that really are unvisited
+// are the zero-window ones out in the width of the tree, and those are exactly
+// the ones the PV-only form refuses to help.
+//
+// WHERE IT SITS, AND WHY THAT IS NOT AN IMPLEMENTATION DETAIL. It reduces
+// `depth`, and half the rules in this function are conditions ON depth—so
+// wherever it is placed, everything after it sees the smaller number. That
+// matters most for reverse futility and razoring, the two rules that RETURN
+// WITHOUT SEARCHING ANYTHING: reducing first turns a depth-4 node into a
+// depth-3 one, which is exactly the depth at which reverse futility is allowed
+// to fail high on a static evaluation. The node the table knows nothing about
+// would then be the node most eagerly pruned on a guess, which is backwards.
+// So the reduction is taken BELOW both of them. Late move pruning and futility
+// inside the loop still see the reduced depth, and that is accepted: they skip
+// individual quiet moves after something has already been searched, so a node
+// still returns a score it earned.
+//
+// IT COSTS SOMETHING TO BE CAREFUL. Measured over the bench, reducing before
+// reverse futility gives 204,377 nodes and reducing after razoring gives
+// 218,288—about seven per cent more tree for the ordering that does not let an
+// unexamined node talk itself out of being searched. That is the trade, taken
+// deliberately.
+//
+// NOT AT THE ROOT, AND NOT IN CHECK.
+//   - The root is excluded so that a reported `depth D` is always a depth
+//     actually searched. It costs nothing: by the time iterative deepening
+//     reaches depth D the root has a hash move from depth D - 1, so the
+//     condition never held there anyway (bench is identical either way).
+//   - A node in check is excluded because it pulls directly against the check
+//     extension, which exists to give forcing lines their plies BACK. Measured,
+//     this is worth 373 nodes out of 218,288—two parts in a thousand—so the
+//     choice is made on the principle rather than on the number.
+//
+// FAILURE MODE. The reduction is real depth given up, on a node nobody has
+// looked at yet, so there is no evidence either way about what it contains.
+// When a tactic lives exactly at that node's horizon the shallower search
+// misses it, and the correction only arrives with the next iteration—which is
+// the whole bet: that the iteration is cheap because everything else got
+// cheaper too. The minimum depth of 4 keeps the ply given up a small fraction
+// of what is left, and no reduction is ever taken twice at the same node.
+// =============================================================================
+
+constexpr std::uint8_t IIR_MIN_DEPTH = 4;
+
+// =============================================================================
+// CAPPING THE CHECK EXTENSION
+// =============================================================================
+// A node that runs out of depth while in check does not stop: it is given a
+// ply back, because a position where the king is under attack is the last one
+// whose evaluation should be trusted. That is the check extension, and it is
+// the one place in this search where recursing does not cost depth.
+//
+// WHICH MEANS IT HAS NO NATURAL END. Every extension hands the child a fresh
+// depth of 1, so a line of consecutive checks extends once per ply for as long
+// as the checks last—and a perpetual check lasts for ever. What actually
+// stopped it before this cap was the ply ceiling at MAX_DEPTH: two hundred and
+// fifty-five plies of forced checks, each one a real stack frame and a real
+// subtree, spent proving something the first dozen already showed.
+//
+// REPETITION DOES BOUND SOME OF IT, and it is worth being exact about how
+// little. A perpetual check repeats positions, and is_repetition_draw() ends
+// the line at the third occurrence—so the classic queen shuffling between two
+// checking squares is caught quickly. What is NOT caught is the checking
+// sequence that never repeats: a king walked across the board by a series of
+// different checks, a rook chased down a file. Those are finite but long, and
+// they are what this cap is for.
+//
+// SO THE PATH GETS A BUDGET. Each node inherits its parent's count of
+// extensions taken above it and adds its own, and once the budget is spent a
+// node in check resolves with quiescence instead of extending. That is not the
+// same as ignoring the check: quiescence in check refuses to stand pat,
+// generates every legal reply and reports mate when there is none, so the
+// answer is still an honest one—it is simply not given another full ply of
+// width.
+//
+// WHAT THIS DOES NOT BUY: NODES. Measured, the cap changes no node count at
+// all—the bench total is identical with it on and off, and so is the total on
+// every position where it demonstrably bites. That is not a disappointment,
+// it is what the mechanism is: a node that stops extending does not vanish, it
+// hands its position to quiescence instead, and quiescence charges for the
+// captures it resolves. What the cap buys is a BOUND—on ply, and therefore on
+// stack frames and on how far past its nominal depth one line may drag the
+// search. It ships on for the same reason the ply ceiling does, and like the
+// ply ceiling it earns its place in the pathological case, not the average one.
+//
+// WHY FOUR. Because the extension is far more self-limiting than it looks: it
+// only fires when a node runs out of depth WHILE IN CHECK, so a chain of two
+// needs both sides in check on consecutive plies—the side that was checked has
+// to answer with a check of its own. Sampled over thousands of random
+// positions searched to depth 6 and 8, the longest chain seen was four. Four
+// is therefore the edge of ordinary play: past it is the tail this cap exists
+// to cut off, and the value is small enough that the rule can be tested rather
+// than being dead code waiting for a position that never arrives.
+//
+// FAILURE MODE. A forced win that genuinely lies more than four consecutive
+// check extensions deep is seen a little later—found by a later iteration
+// rather than this one—because the tail of the line is resolved by quiescence
+// instead of searched. Quiescence in check refuses to stand pat and reports
+// mate when there is none, so nothing is scored wrongly; the depth simply
+// stops growing where the budget runs out.
+// =============================================================================
 
 } // namespace
 
@@ -1027,8 +1343,7 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // The swap list. Capturing on a square starts an argument: I take, you take
 // back with your cheapest piece, I take back with mine, and so on until one
 // side runs out of attackers or decides it would rather stop. see() plays that
-// argument out on a private copy of the board and reports what the side that
-// started it ends up with.
+// argument out and reports what the side that started it ends up with.
 //
 // TWO PASSES. Forward, we record what each capture wins if it happens:
 // gain[d] = value of the piece standing on the square - gain[d - 1]. Backward,
@@ -1042,23 +1357,32 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // with the queen when a pawn could do it hands the opponent a better trade, so
 // the least valuable attacker is always the right one to use.
 //
-// X-RAYS COME FREE. Pieces are physically removed from the board copy as they
-// capture, so a queen sitting behind a rook on the same file simply appears in
-// the next get_attackers() call. That is why this works on a Board rather than
-// on a precomputed set of attackers, and it is what makes a battery score the
-// way a human would read it.
+// NOTHING IS MOVED, AND NO BOARD IS COPIED. The exchange is played entirely in
+// a single 64-bit `occupancy` mask. Each capture clears one bit—the square the
+// capturing piece left—and the loop then asks who attacks the target GIVEN
+// THAT OCCUPANCY. The board itself is only read, never written, and it is only
+// asked two questions: which piece stands where, and which pieces belong to
+// which side.
 //
-// WHAT THE BOARD COPY COSTS, AND THE VERSION THAT WOULD NOT PAY IT. A Board is
-// 272 bytes and every put_piece/remove_piece on it also updates the evaluation
-// accumulator—the running material, piece-square and phase totals—which SEE
-// never reads. So each swap pays for bookkeeping it throws away. The version
-// that does not is a bitboard-only SEE: keep a shrinking occupancy mask instead
-// of a Board, clear the capturing square's bit, and re-detect the slider x-rays
-// by intersecting the target's rook and bishop rays with what is left. It needs
-// attack helpers that take an occupancy rather than a Board, which movegen does
-// not export today; measured against this version it is worth roughly 15-20% of
-// nps, and it is the obvious follow-up rather than something this change should
-// smuggle in.
+// WHICH IS ALSO HOW X-RAYS COME FREE. Sliding attacks are a function of the
+// occupancy, so re-reading bishop_attacks() and rook_attacks() over the mask
+// after every removal is exactly what makes a queen sitting behind a rook on
+// the same file appear in the exchange by itself once the rook has captured.
+// No accumulator, no bookkeeping: the battery is simply what the magic tables
+// say about the squares that are left.
+//
+// THE LEAPERS ARE COMPUTED ONCE, and that is the trick that makes this cheap.
+// A pawn, a knight or a king attacks the target square or it does not; nothing
+// can be in the way, so the set of them never changes as the exchange proceeds.
+// Only "are they still on the board" changes, and that is one AND with the
+// occupancy. So the per-swap cost is two magic lookups and a handful of masks.
+//
+// WHAT THIS REPLACED, AND WHY. The first version played the exchange out on a
+// copy of the Board: 272 bytes copied per call, and every remove_piece and
+// put_piece on the copy also updated the evaluation accumulator—the running
+// material, piece-square and phase totals—which SEE never reads. Each swap
+// therefore paid for bookkeeping it threw away. Quiescence calls see() on most
+// of the captures it looks at, so that cost showed up directly in nps.
 //
 // See the header for what SEE deliberately does not know—pins, most of all.
 // ---------------------------------------------------------------------------
@@ -1077,13 +1401,56 @@ int see_value(Piece piece) {
 // One exchange per piece that can reach the square, and there are 32 pieces.
 constexpr std::size_t SEE_MAX_SWAPS = 32;
 
+// Everything about a position that stays fixed while one exchange is played
+// out, so it is read from the board once instead of at every swap.
+//
+// `leapers` is the interesting one: the pawns, knights and kings that attack
+// the target square. They cannot be blocked, so which of them attack is decided
+// before the exchange starts and never changes—only whether they are still
+// standing, which is what the occupancy says. The slider sets are named by what
+// they attack LIKE rather than by what they are, because a queen is both.
+struct SeeContext {
+  Bitboard leapers{0};
+  Bitboard bishop_like{0};
+  Bitboard rook_like{0};
+};
+
+SeeContext see_context(Square target, const Board& board) {
+  SeeContext context;
+
+  context.bishop_like = board.pieces(Piece::WB) | board.pieces(Piece::BB) |
+                        board.pieces(Piece::WQ) | board.pieces(Piece::BQ);
+  context.rook_like = board.pieces(Piece::WR) | board.pieces(Piece::BR) | board.pieces(Piece::WQ) |
+                      board.pieces(Piece::BQ);
+
+  // Everything that attacks the square right now, minus everything that attacks
+  // it as a slider: what is left is exactly the pieces no removal can unblock.
+  // Reusing get_attackers() rather than re-deriving pawn, knight and king
+  // attacks keeps one definition of "attacks" in the engine.
+  const Bitboard all_attackers =
+      get_attackers(target, Colour::White, board) | get_attackers(target, Colour::Black, board);
+  context.leapers = all_attackers & ~(context.bishop_like | context.rook_like);
+
+  return context;
+}
+
+// Who attacks `target` if the board held only the pieces in `occupancy`. The
+// sliders are re-read over that occupancy, which is where x-rays come from.
+Bitboard see_attackers(Square target, Bitboard occupancy, const SeeContext& context) {
+  return (context.leapers | (bishop_attacks(target, occupancy) & context.bishop_like) |
+          (rook_attacks(target, occupancy) & context.rook_like)) &
+         occupancy;
+}
+
 // pieces_for() lists a colour's pieces in ascending value—pawn, knight, bishop,
 // rook, queen, king—so the first one that appears among the attackers is the
-// cheapest.
-std::optional<Piece> least_valuable_attacker(Bitboard attackers, Colour side, const Board& board) {
+// cheapest. Returns the piece and the square it would come from.
+std::optional<std::pair<Piece, Square>> least_valuable_attacker(Bitboard attackers, Colour side,
+                                                                const Board& board) {
   for (const auto piece : pieces_for(side)) {
-    if ((attackers & board.pieces(piece)) != 0) {
-      return piece;
+    const Bitboard candidates = attackers & board.pieces(piece);
+    if (candidates != 0) {
+      return std::make_pair(piece, Square::first_occupied(candidates));
     }
   }
   return std::nullopt;
@@ -1097,8 +1464,8 @@ int detail::see(const Position& pos, const Move& mv) {
     return 0;
   }
 
+  const Board& board = pos.board;
   const Square target = mv.to;
-  Board board = pos.board;
 
   std::array<int, SEE_MAX_SWAPS> gain{};
 
@@ -1108,31 +1475,42 @@ int detail::see(const Position& pos, const Move& mv) {
       mv.promotion_piece.has_value() ? see_value(*mv.promotion_piece) - see_value(mv.piece) : 0;
   gain[0] = (mv.captured_piece.has_value() ? see_value(*mv.captured_piece) : 0) + promotion_gain;
 
-  // Play the move on the copy. capture_square() is the target for an ordinary
-  // capture and the square behind it for en passant, which is exactly the
-  // distinction that decides which piece leaves the board.
+  // The occupancy as it stands AFTER the move being scored. The mover has left
+  // its square; whatever it captured has left the board—capture_square() is the
+  // target for an ordinary capture and the square behind it for en passant,
+  // which is exactly the distinction that decides which piece goes; and the
+  // target is occupied, by the mover now rather than by its victim.
+  Bitboard occupancy = board.occupancy() & ~mv.from.to_bitboard();
   if (const auto captured_square = mv.capture_square()) {
-    board.remove_piece(*captured_square);
+    occupancy &= ~captured_square->to_bitboard();
   }
-  board.remove_piece(mv.from);
+  occupancy |= target.to_bitboard();
+
+  const SeeContext context = see_context(target, board);
+
+  // What is standing on the target square, and therefore what the next capture
+  // would win. The board still says the victim is there, so this is tracked
+  // separately—it is the one piece of the position the mask cannot express.
   Piece occupier = mv.promotion_piece.value_or(mv.piece);
-  board.put_piece(occupier, target);
 
   Colour side = !colour(mv.piece);
   std::size_t depth = 0;
 
   while (true) {
-    const Bitboard attackers = get_attackers(target, side, board);
-    const auto attacker = least_valuable_attacker(attackers, side, board);
+    const Bitboard attackers = see_attackers(target, occupancy, context);
+    const auto attacker =
+        least_valuable_attacker(attackers & board.pieces_by_colour(side), side, board);
     if (!attacker.has_value()) {
       break;
     }
 
+    const auto [attacking_piece, from] = *attacker;
+
     // A king may only capture on a square the other side no longer defends, so
     // if anything still defends it the exchange stops here rather than ending
-    // in an illegal move. (Read from the board as it stands, which misses the
-    // rare defender that only appears once the king leaves its own square.)
-    if (is_king(*attacker) && get_attackers(target, !side, board) != 0) {
+    // in an illegal move. (Read from the position as it stands, which misses
+    // the rare defender that only appears once the king leaves its own square.)
+    if (is_king(attacking_piece) && (attackers & board.pieces_by_colour(!side)) != 0) {
       break;
     }
 
@@ -1152,11 +1530,11 @@ int detail::see(const Position& pos, const Move& mv) {
       break;
     }
 
-    const Square from = Square::first_occupied(attackers & board.pieces(*attacker));
-    board.remove_piece(target);
-    board.remove_piece(from);
-    board.put_piece(*attacker, target);
-    occupier = *attacker;
+    // The capturing piece leaves its square, and that single cleared bit is the
+    // whole state change: the next call to see_attackers() re-reads the sliders
+    // over what is left, so anything this piece was blocking joins in.
+    occupancy &= ~from.to_bitboard();
+    occupier = attacking_piece;
     side = !side;
   }
 
@@ -1213,6 +1591,15 @@ int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, R
   if (stopper.should_stop(report)) {
     return 0;
   }
+
+  // SELDEPTH COUNTS QUIESCENCE TOO. This node sits at its parent's ply plus how
+  // far into quiescence it is, and that sum is clamped to MAX_DEPTH for the
+  // same reason the mate distance below is: the two are bounded separately, so
+  // nothing stops them adding up past what a byte can hold. See Report::max_ply.
+  report.max_ply =
+      std::max(report.max_ply, static_cast<std::uint8_t>(std::min<std::size_t>(
+                                   static_cast<std::size_t>(report.ply) + quiescence_depth,
+                                   static_cast<std::size_t>(MAX_DEPTH))));
 
   // THE QUIESCENCE DEPTH CAP
   // "Search captures until the position is quiet" is a promise with no bound in
@@ -1404,18 +1791,37 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     return quiescence(pos, alpha, beta, ctx, report, stopper);
   }
 
+  // HOW MANY CHECK EXTENSIONS THE LINE ABOVE THIS NODE HAS ALREADY SPENT.
+  // Each node leaves its own running total in its scratch row, so a node finds
+  // out what its ancestors did by reading the row one ply up. The root has no
+  // parent and starts from zero. See CAPPING THE CHECK EXTENSION below.
+  const std::uint8_t extensions_above =
+      report.ply > 0 ? ctx.at_ply(static_cast<std::uint8_t>(report.ply - 1)).check_extensions : 0;
+  std::uint8_t extensions_here = extensions_above;
+
   // Leaf node: drop into quiescence search
   if (depth == 0) {
-    if (!is_in_check(pos.colour_to_move, pos.board)) {
-      return quiescence(pos, alpha, beta, ctx, report, stopper);
-    }
     // CHECK EXTENSION: Don't stop search while in check (tactical danger).
     // This is the one place the recursion does not spend a ply of depth, so it
     // is also the only way ply can grow without bound. The ceiling above is
-    // what stops it: we can only get here with report.ply < MAX_DEPTH, so the
-    // child this extension creates still sits inside every per-ply table.
+    // what stops it in the last resort: we can only get here with
+    // report.ply < MAX_DEPTH, so the child this extension creates still sits
+    // inside every per-ply table. The cap is what stops it long before that.
+    const bool may_extend =
+        !ctx.check_extension_cap_enabled || extensions_above < MAX_CHECK_EXTENSIONS;
+
+    if (!may_extend || !is_in_check(pos.colour_to_move, pos.board)) {
+      return quiescence(pos, alpha, beta, ctx, report, stopper);
+    }
+
     depth = 1;
+    extensions_here = static_cast<std::uint8_t>(extensions_above + 1);
+    report.max_check_extensions = std::max(report.max_check_extensions, extensions_here);
   }
+
+  // Published before anything recurses, so every child below reads a total that
+  // includes this node.
+  ctx.at_ply(report.ply).check_extensions = extensions_here;
 
   // PV NODES vs NON-PV NODES
   // A node searched with a full window (beta > alpha + 1) is a "PV node": it
@@ -1470,6 +1876,59 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   const Colour colour_to_move = pos.colour_to_move;
   const bool in_check = is_in_check(colour_to_move, pos.board);
 
+  // THE ONE STATIC EVALUATION THIS NODE GETS
+  // Reverse futility, and futility pruning inside the move loop, all ask the
+  // same question—"what is this position worth as it stands?"—and eval() walks
+  // the whole board to answer it. So it is asked once, here, and only where an
+  // answer can be read: in check there is no honest static score, because the
+  // side to move is not allowed to keep the position, and past STATIC_EVAL_DEPTH
+  // no rule below looks at it.
+  const bool has_static_eval = !in_check && depth <= STATIC_EVAL_DEPTH;
+  const int static_eval = has_static_eval ? eval(pos) : 0;
+
+  // REVERSE FUTILITY PRUNING
+  // So far ahead that a few plies of the opponent's best play should not claw
+  // the margin back: fail high without searching anything. See the block above
+  // for the reasoning and for the failure mode this buys into.
+  //
+  // The return is beta rather than static_eval, because this search is
+  // fail-hard everywhere else: every other cutoff in this function hands its
+  // caller the bound it was given, never a score outside the window.
+  if (ctx.reverse_futility_enabled && has_static_eval && !is_pv_node &&
+      depth <= REVERSE_FUTILITY_DEPTH && std::abs(beta) < CENTIPAWN_MATE_THRESHOLD &&
+      static_eval - reverse_futility_margin(depth) >= beta) {
+    return beta;
+  }
+
+  // RAZORING
+  // Far enough behind that a full-width search looks like a poor use of the
+  // time—but the claim is VERIFIED by quiescence before it is acted on, so a
+  // position that is only losing until its capture is played survives. A
+  // non-PV node's window is already (alpha, alpha + 1), so quiescence is asked
+  // the node's own question and answers it with the captures resolved. See the
+  // block above for why the naive form is a trap.
+  if (ctx.razoring_enabled && has_static_eval && !is_pv_node && depth <= RAZORING_DEPTH &&
+      std::abs(alpha) < CENTIPAWN_MATE_THRESHOLD && static_eval + razoring_margin(depth) <= alpha) {
+    const int resolved = quiescence(pos, alpha, beta, ctx, report, stopper);
+    if (resolved <= alpha) {
+      return alpha;
+    }
+  }
+
+  // INTERNAL ITERATIVE REDUCTION
+  // A node with nothing in the table has no move it has any reason to try
+  // first, and a full-depth search with bad ordering is the most expensive
+  // thing this function can do. Search it a ply shallower instead and let the
+  // table keep the best move it finds; the next iteration comes back here with
+  // a hash move and spends the full depth well. See the block above for why
+  // this is preferred to internal iterative deepening, why it is not restricted
+  // to PV nodes, why it sits BELOW the two rules that can return without
+  // searching a move, and why it leaves the root and nodes in check alone.
+  if (ctx.internal_iterative_reduction_enabled && ply > 0 && !in_check && depth >= IIR_MIN_DEPTH &&
+      hash_move_packed == TT_NO_MOVE) {
+    depth -= 1;
+  }
+
   // NULL-MOVE PRUNING
   // Idea: if we can "pass" our turn and STILL beat beta, the position is so
   // good we probably don't need to search it fully. This is a big time saver.
@@ -1522,9 +1981,6 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     }
   }
 
-  // Static evaluation for futility pruning (only compute at shallow depths when not in check)
-  const int static_eval = (depth <= FUTILITY_DEPTH && !in_check) ? eval(pos) : 0;
-
   // Generated straight into this ply's row. The returning form would build a
   // two-kilobyte MoveList in this frame first, 255 frames deep; see
   // pseudo_legal_moves_into() in movegen.hpp.
@@ -1551,6 +2007,13 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // statement about that number, and futility pruning has always needed to know
   // whether anything had been searched at all.
   std::size_t moves_searched = 0;
+
+  // The same count restricted to QUIET moves, which is the one late move
+  // pruning is a statement about: captures and promotions are exempt from it,
+  // so counting them would let a node full of captures prune its quiet moves
+  // before it had looked at any of them.
+  std::size_t quiet_moves_searched = 0;
+
   Bound tt_bound = Bound::Upper;
 
   // The best move THIS search finds, kept apart from `hash_move` above.
@@ -1585,7 +2048,24 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       continue;
     }
 
+    // LATE MOVE PRUNING
+    // Enough quiet moves have already been searched here that the ones left,
+    // ranked by history alone, are not worth a node each. The check for whether
+    // the move GIVES check is last because it costs a scan of the board and the
+    // cheap conditions usually decide the question. See the block above for
+    // what is exempt and why the first legal move never is.
+    if (ctx.late_move_pruning_enabled && moves_searched > 0 && !is_pv_node && !in_check &&
+        depth <= LATE_MOVE_PRUNING_DEPTH && is_quiet(mv) &&
+        quiet_moves_searched >= late_move_pruning_threshold(depth) && !ordering.is_refutation(mv) &&
+        !is_in_check(pos.colour_to_move, pos.board)) {
+      pos.unmake_move(mv);
+      continue;
+    }
+
     ++moves_searched;
+    if (is_quiet(mv)) {
+      ++quiet_moves_searched;
+    }
     report.ply += 1;
 
     int eval;
@@ -1792,6 +2272,17 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
   for (std::uint8_t depth = 1; depth <= max_depth; ++depth) {
     const auto iteration_started = std::chrono::steady_clock::now();
     MoveList pv;
+
+    // SELDEPTH IS PER ITERATION, NOT PER `go`. An `info` line describes the
+    // iteration that has just finished, so "how deep did this search look"
+    // has to be reset with it—otherwise every line after the first would be
+    // reporting a high-water mark set several iterations ago, and the number
+    // would only ever go up whatever the current iteration actually did. Nodes
+    // and the clock are cumulative on purpose: those really are totals for the
+    // whole move. The same argument applies to the check-extension counter,
+    // which is the same kind of high-water mark.
+    report.max_ply = 0;
+    report.max_check_extensions = 0;
 
     const bool do_aspiration =
         depth >= ASPIRATION_WINDOW_MIN_DEPTH && std::abs(searched_eval) < CENTIPAWN_MATE_THRESHOLD;

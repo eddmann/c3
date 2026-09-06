@@ -77,6 +77,33 @@
 //      uses it to refuse captures that lose material outright, which is the
 //      one thing MVV-LVA cannot see.
 //
+//  11. REVERSE FUTILITY PRUNING
+//      Futility pruning's mirror image, asked about the node rather than about
+//      a move: if the position is so far ahead that a few plies cannot claw
+//      the margin back, fail high without searching at all.
+//
+//  12. RAZORING
+//      The same question asked from behind: a node whose static evaluation is
+//      far BELOW alpha drops into quiescence, and fails low without a
+//      full-width search only if the capture search agrees with the guess.
+//
+//  13. LATE MOVE PRUNING
+//      Reductions with the verification removed: near the horizon, once a
+//      non-PV node has searched enough quiet moves, the rest of them are not
+//      searched at all. Captures, checks and the moves the search has evidence
+//      for are exempt, and the first legal move always is.
+//
+//  14. INTERNAL ITERATIVE REDUCTION
+//      A node the transposition table knows nothing about has no move worth
+//      trying first, so it is searched one ply shallower and the move it finds
+//      is left in the table for the next iteration to order by.
+//
+//  15. CHECK EXTENSIONS, WITH A BUDGET
+//      A node that runs out of depth while in check is given a ply back, so a
+//      forcing line is seen to its end rather than evaluated in the middle. A
+//      per-path budget stops a perpetual check from buying plies for ever;
+//      past it, quiescence answers the check instead.
+//
 // WHERE THE SEARCH'S WORKING STORAGE LIVES
 // Not on the stack. The recursion is up to 255 frames deep and each frame
 // would otherwise hold several two-kilobyte move lists, which overflows the
@@ -130,15 +157,45 @@ inline constexpr std::size_t TT_DEFAULT_SIZE_MB = 64;
 // check extension, which resets depth to 1 and can therefore go on for as long
 // as the checks do. So the ceiling is checked explicitly, in alphabeta(), and
 // a node that has reached it answers with quiescence instead of recursing.
+//
+// The ceiling is the last line of defence, not the working limit: a separate
+// budget caps how many check extensions any one PATH may take (see CAPPING THE
+// CHECK EXTENSION in search.cpp), so a perpetual check stops buying plies long
+// before it could reach ply 255.
 // ---------------------------------------------------------------------------
+
+// How many check extensions ONE PATH may take before a node in check resolves
+// with quiescence instead of buying another ply. The extension is the only
+// place the recursion does not spend depth, so without a bound a line of checks
+// can grow until the ply ceiling stops it. See CAPPING THE CHECK EXTENSION in
+// search.cpp for why four, and for what the cap deliberately does not buy.
+inline constexpr std::uint8_t MAX_CHECK_EXTENSIONS = 4;
 
 struct Report {
   std::uint8_t depth{0};
   std::uint8_t ply{0};
-  // The deepest ply the main search reached, which is what a UCI `seldepth`
-  // would report and what the ply ceiling is asserted against. It only ever
-  // grows, so it survives the recursion unwinding back to the root.
+  // SELDEPTH: the deepest ply ANY line reached, which is what the `seldepth`
+  // field of a UCI `info` line reports and what the ply ceiling is asserted
+  // against. It only ever grows, so it survives the recursion unwinding back to
+  // the root.
+  //
+  // QUIESCENCE COUNTS TOWARDS IT. `depth` is what the engine committed to
+  // searching everywhere; seldepth is how far it actually looked down the one
+  // line it found most interesting, and most of that difference is quiescence
+  // resolving a long exchange, not the main search. A seldepth that stopped at
+  // the alpha-beta horizon would report a number the engine beat on almost
+  // every line, which is not what a GUI showing "18/34" is telling its user.
+  // A quiescence node's ply is its parent's ply plus how deep into quiescence
+  // it is, clamped to MAX_DEPTH: the two are bounded separately (255 plies and
+  // 64 quiescence levels) and their sum does not have to fit in a byte.
   std::uint8_t max_ply{0};
+
+  // The longest run of check extensions any single path took. It exists to be
+  // asserted against MAX_CHECK_EXTENSIONS—the cap has no other visible effect,
+  // since a node that stops extending hands its position to quiescence rather
+  // than disappearing—and it says how close a search came to the bound.
+  std::uint8_t max_check_extensions{0};
+
   std::uint64_t nodes{0};
   std::optional<std::pair<MoveList, int>> pv{};
   std::pair<std::size_t, std::size_t> tt_stats{0, 0};
@@ -631,6 +688,14 @@ struct PlyScratch {
   MoveScratch ordering;
   MoveList pv;
   std::array<Move, MAX_PENALISED_QUIETS> searched_quiets{};
+
+  // How many check extensions the line from the root down to and including a
+  // node at this ply has taken. A node writes its own total here before it
+  // recurses, and its children read the row one ply up to find out what the
+  // path above them has already spent. Being per-ply is what makes it a
+  // property of the PATH rather than of the search: two sibling lines each get
+  // their own count, and a line that unwinds gives its extensions back.
+  std::uint8_t check_extensions{0};
 };
 
 class SearchContext {
@@ -648,6 +713,33 @@ public:
   // experiments, and it is why the reduction block in search.cpp asks a
   // question that always answers "yes" in a real game.
   bool reductions_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. Reverse futility pruning cuts a node
+  // off before it searches anything, so what it changes is the size of the tree
+  // and nothing else. Nothing on the UCI path writes it.
+  bool reverse_futility_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. Razoring replaces a full-width
+  // search with a quiescence search, so what it changes is how the tree is
+  // spent rather than anything reported. Nothing on the UCI path writes it.
+  bool razoring_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. Late move pruning drops quiet moves
+  // from the back of a node's list, so the only thing that changes is how many
+  // of them are searched. Nothing on the UCI path writes it.
+  bool late_move_pruning_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. Internal iterative reduction gives
+  // up a ply at a node the transposition table knows nothing about, so what it
+  // changes is where the search spends its depth. Nothing on the UCI path
+  // writes it.
+  bool internal_iterative_reduction_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. The cap on check extensions only
+  // decides how long a forcing line may keep buying plies, so what it changes
+  // is the size of the tree under a position full of checks. Nothing on the UCI
+  // path writes it.
+  bool check_extension_cap_enabled{true};
 
   // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
   // the underpromotion filter in quiescence all change how much work is done
@@ -836,9 +928,12 @@ void order_quiescence_moves(MoveList& moves);
 //     scored as a pawn.
 //   - EVERYTHING THAT IS NOT MATERIAL. A capture that loses a rook to open a
 //     mating net scores badly, and rightly, as far as material goes.
-// X-rays ARE handled: pieces are removed from a private copy of the board as
-// they capture, so a queen behind a rook on the same file joins the exchange by
-// itself, which is the case a naive "count the attackers" version gets wrong.
+// X-rays ARE handled, and for free. The exchange is played out in a 64-bit
+// occupancy mask rather than on a board: each capture clears the bit of the
+// square its piece left, and the sliding attacks are re-read over what is left,
+// so a queen behind a rook on the same file joins the exchange by itself. That
+// is the case a naive "count the attackers once" version gets wrong, and the
+// reason nothing here needs a copy of the Board.
 [[nodiscard]] int see(const Position& pos, const Move& mv);
 
 // The capture-only search alphabeta drops into at its leaves. Exposed so that

@@ -202,18 +202,15 @@ Bitboard king_attacks(Square square) {
 // See magic.hpp for the precomputed tables and magic numbers.
 // =============================================================================
 
+// The board's own occupancy is the usual question; c3::bishop_attacks and
+// c3::rook_attacks, defined below and declared in attacks.hpp, are the general
+// one—the same lookup asked about any occupancy at all.
 Bitboard bishop_attacks(Square square, const Board& board) {
-  const Magic& magic = BISHOP_MAGICS[square.index()];
-  const Bitboard occupancy = board.occupancy() & magic.mask;
-  const std::uint64_t index = (occupancy * magic.num) >> magic.shift;
-  return BISHOP_ATTACKS[magic.offset + index];
+  return c3::bishop_attacks(square, board.occupancy());
 }
 
 Bitboard rook_attacks(Square square, const Board& board) {
-  const Magic& magic = ROOK_MAGICS[square.index()];
-  const Bitboard occupancy = board.occupancy() & magic.mask;
-  const std::uint64_t index = (occupancy * magic.num) >> magic.shift;
-  return ROOK_ATTACKS[magic.offset + index];
+  return c3::rook_attacks(square, board.occupancy());
 }
 
 Bitboard pawn_advances(Square square, Colour colour, const Board& board) {
@@ -323,6 +320,33 @@ Bitboard castling_moves(CastlingRights rights, Colour colour, const Board& board
 // the empty square the double-pushed pawn skipped over.
 Bitboard en_passant_sources(Square en_passant_square, Colour colour, const Board& board) {
   return pawn_attackers_of(en_passant_square, colour, board);
+}
+
+// =============================================================================
+// SLIDING ATTACKS OVER AN OCCUPANCY THE CALLER CHOOSES
+// =============================================================================
+// The magic lookup itself (see MAGIC BITBOARD LOOKUPS above for how it works),
+// exported because the board's occupancy is not the only interesting answer to
+// "which squares are blocked". Static exchange evaluation plays an exchange out
+// in an occupancy mask of its own, clearing a bit per capture and asking again,
+// which is how it sees the queen behind the rook without copying a board.
+//
+// The Board-taking helpers inside the anonymous namespace above are these two,
+// asked about board.occupancy().
+// =============================================================================
+
+Bitboard bishop_attacks(Square square, Bitboard occupancy) {
+  const Magic& magic = BISHOP_MAGICS[square.index()];
+  const Bitboard blockers = occupancy & magic.mask;
+  const std::uint64_t index = (blockers * magic.num) >> magic.shift;
+  return BISHOP_ATTACKS[magic.offset + index];
+}
+
+Bitboard rook_attacks(Square square, Bitboard occupancy) {
+  const Magic& magic = ROOK_MAGICS[square.index()];
+  const Bitboard blockers = occupancy & magic.mask;
+  const std::uint64_t index = (blockers * magic.num) >> magic.shift;
+  return ROOK_ATTACKS[magic.offset + index];
 }
 
 Bitboard attacks_for(Piece piece, Square square, const Board& board) {

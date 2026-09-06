@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -419,6 +420,214 @@ TEST(SearchReductions, SearchLateQuietMovesShallower) {
   EXPECT_GE(reduced_pv.size(), 2U);
 }
 
+// Pruning and reduction mechanisms --------------------------------------------
+//
+// Every one of these has the same problem the reductions above have: it changes
+// how much work a search does and nothing else, so the only honest measurement
+// is the same position searched twice, once with the mechanism on and once with
+// it off. The comparison is relational on purpose—an absolute node ceiling would
+// be measuring the evaluation function as much as the mechanism, and would have
+// to be rewritten every time a term was added to it.
+
+namespace {
+
+// The nodes one alpha-beta search of `fen` costs, with the switches the caller
+// has set. A fresh, small table each time, so the two halves of a comparison
+// start from the same (empty) knowledge.
+std::uint64_t nodes_searched(std::string_view fen, std::uint8_t depth, search::SearchContext& ctx) {
+  Position pos = parse(fen);
+  search::TranspositionTable tt(8);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  search::detail::alphabeta(pos, depth, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+  return report.nodes;
+}
+
+// The same measurement taken the way a real search takes it: depth 1, then 2,
+// and so on, through ONE table and ONE context. The distinction matters for any
+// mechanism that reads the transposition table. Internal iterative reduction is
+// the extreme case—against a cold table it fires at every node and "saves"
+// nodes simply by searching a shallower tree, which says nothing about the
+// engine—so what it does has to be measured against a table iterative deepening
+// has been filling all along.
+std::uint64_t nodes_searched_iteratively(std::string_view fen, std::uint8_t depth,
+                                         search::SearchContext& ctx) {
+  Position pos = parse(fen);
+  search::TranspositionTable tt(8);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  for (std::uint8_t iteration = 1; iteration <= depth; ++iteration) {
+    pv.clear();
+    search::detail::alphabeta(pos, iteration, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report,
+                              stopper);
+  }
+
+  return report.nodes;
+}
+
+} // namespace
+
+TEST(SearchPruning, ReverseFutilityCutsOffNodesThatAreAlreadyWinning) {
+  // White is a rook and a knight up in an otherwise ordinary middlegame, so
+  // most of the shallow non-PV nodes below the root are positions whose static
+  // evaluation is far above any window they are searched with. That is exactly
+  // the shape reverse futility exists for: fail high on the material, and never
+  // generate the moves at all.
+  constexpr std::string_view FEN = "r2qkb1r/ppp2ppp/2n5/3p4/3P4/2N2N2/PPP2PPP/R2QKB1R w KQkq - 0 1";
+
+  search::SearchContext with_pruning;
+  search::SearchContext without_pruning;
+  without_pruning.reverse_futility_enabled = false;
+
+  EXPECT_LT(nodes_searched(FEN, 6, with_pruning), nodes_searched(FEN, 6, without_pruning))
+      << "a node far enough ahead should be failing high without searching";
+}
+
+TEST(SearchPruning, RazoringVerifiesALostPositionWithQuiescenceInsteadOfSearchingIt) {
+  // Black is a piece down with a white pawn on d7 about to promote, so most of
+  // the shallow non-PV nodes below the root are positions whose static
+  // evaluation is far below the window they are searched with. Razoring hands
+  // those to quiescence—which is where the only moves that could rescue them
+  // live—and skips the full-width search when quiescence agrees.
+  constexpr std::string_view FEN = "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R b KQ - 1 8";
+
+  search::SearchContext with_razoring;
+  search::SearchContext without_razoring;
+  without_razoring.razoring_enabled = false;
+
+  EXPECT_LT(nodes_searched(FEN, 7, with_razoring), nodes_searched(FEN, 7, without_razoring))
+      << "a node far enough behind should be resolved by quiescence, not searched";
+}
+
+TEST(SearchPruning, RazoringDoesNotRefuseANodeThatBeatsAMateRangeAlpha) {
+  // Razoring's guess is "static_eval + margin does not reach alpha". Once alpha
+  // is itself a mate score that comparison is trivially true—no material count
+  // is within four hundred centipawns of ten thousand—so every such node would
+  // hand itself to quiescence and fail low, having proved nothing at all about
+  // the mate it was being asked to beat.
+  //
+  // Scholar's mate, searched with the zero window a node would get once a mate
+  // five plies away had already been found elsewhere. The position beats that
+  // window—mate in one is better than mate in five—and the node has to say so.
+  //
+  // The mating move is a CAPTURE on purpose. Futility pruning and late move
+  // pruning are just as blind to a mate-range alpha, but both exempt captures
+  // and both only fire once a move has been searched, so a capture mate isolates
+  // razoring: it is the only rule here that can refuse the node outright.
+  Position pos = parse("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1");
+
+  const int alpha = CENTIPAWN_MATE - 5;
+  const int beta = alpha + 1;
+
+  const auto score_with = [&pos](bool razoring) {
+    Position local = pos;
+    search::SearchContext ctx;
+    ctx.razoring_enabled = razoring;
+
+    search::TranspositionTable tt(1);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
+
+    return search::detail::alphabeta(local, 2, alpha, beta, pv, tt, ctx, report, stopper);
+  };
+
+  EXPECT_GE(score_with(false), beta) << "the position really does beat this alpha";
+  EXPECT_GE(score_with(true), beta) << "razoring must not fail low against a mate-range alpha";
+}
+
+TEST(SearchPruning, LateMovePruningStopsSearchingQuietMovesNearTheHorizon) {
+  // An ordinary opening middlegame: a wide list of quiet moves at every node,
+  // which is precisely the position a move count is a good argument about.
+  constexpr std::string_view FEN =
+      "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R b KQ - 0 9";
+
+  search::SearchContext with_pruning;
+  search::SearchContext without_pruning;
+  without_pruning.late_move_pruning_enabled = false;
+
+  EXPECT_LT(nodes_searched(FEN, 7, with_pruning), nodes_searched(FEN, 7, without_pruning))
+      << "the tail of a node's quiet moves should not be costing a node each";
+}
+
+TEST(SearchPruning, InternalIterativeReductionShrinksTheTreeAgainstAWarmTable) {
+  // Measured through iterative deepening, because that is the only setting in
+  // which the rule means anything: a node the table already knows about keeps
+  // its full depth, and only the ones no earlier iteration reached give a ply
+  // up. Against a cold table this comparison would be a tautology—every node
+  // would qualify and the "saving" would just be a shallower search.
+  constexpr std::string_view FEN =
+      "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R b KQ - 0 9";
+
+  search::SearchContext with_reduction;
+  search::SearchContext without_reduction;
+  without_reduction.internal_iterative_reduction_enabled = false;
+
+  EXPECT_LT(nodes_searched_iteratively(FEN, 8, with_reduction),
+            nodes_searched_iteratively(FEN, 8, without_reduction))
+      << "a node with no hash move should not be costing full depth";
+}
+
+TEST(SearchPruning, LateMovePruningNeverInventsAMateOrAStalemate) {
+  // The rule prunes quiet moves, and a node that pruned ALL of them would
+  // report "no legal moves"—checkmate or stalemate—for a position that has
+  // plenty. That is not a slightly wrong score, it is a fabricated terminal.
+  //
+  // Two conditions already make that impossible by construction: nothing is
+  // pruned until a move has been searched, and the smallest threshold the count
+  // ever takes is four. So this cannot catch the bug as the code stands—what it
+  // can catch is a future change that loosens either condition, and the witness
+  // is chosen to make that failure loud rather than subtle: the SAME positions
+  // searched with the rule on and off must not disagree by a mate score. A
+  // fabricated terminal is a swing of ten thousand centipawns; nothing else this
+  // rule can do to a score comes close.
+  //
+  // The positions have nothing but quiet moves and a lopsided material count,
+  // which is what would tempt the count to fire early: kings and pawns with
+  // every capture already gone, and one with a wide-open board where a single
+  // side has more quiet moves than the threshold at any depth.
+  const std::vector<std::string_view> quiet_positions = {
+      "8/8/4k3/8/8/4K3/4P3/8 w - - 0 60",
+      "8/5ppp/8/8/8/8/5PPP/4K1k1 w - - 0 45",
+      "4k3/8/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
+      "3qkbnr/8/8/8/8/8/8/RNBQK2R w KQk - 0 1",
+  };
+
+  const auto score_with = [](std::string_view fen, bool pruning) {
+    Position pos = parse(fen);
+    search::SearchContext ctx;
+    ctx.late_move_pruning_enabled = pruning;
+
+    search::TranspositionTable tt(8);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
+
+    return search::detail::alphabeta(pos, 5, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report,
+                                     stopper);
+  };
+
+  for (const auto& fen : quiet_positions) {
+    SCOPED_TRACE(std::string(fen));
+
+    const int pruned = score_with(fen, true);
+    const int unpruned = score_with(fen, false);
+
+    EXPECT_LT(std::abs(pruned), CENTIPAWN_MATE_THRESHOLD)
+        << "a position with legal quiet moves must not be scored as a terminal";
+    EXPECT_LT(std::abs(pruned - unpruned), CENTIPAWN_MATE_THRESHOLD)
+        << "pruning quiet moves must not change a score by a mate";
+
+    Position pos = parse(fen);
+    const auto result = search::search(pos, 6);
+    EXPECT_FALSE(result.pv.empty()) << "a position with legal moves must produce one";
+  }
+}
+
 TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
   search::CounterMoves counters;
   const auto previous = make_move(Piece::BP, "d7", "d5");
@@ -531,6 +740,10 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   // the depth it was given—that is the whole point of it, and the reason the
   // ceiling above has to exist. A position with checks available at the horizon
   // therefore reaches plies the depth limit alone would never reach.
+  //
+  // The witness is the extension COUNT, not max_ply. max_ply is seldepth now
+  // and includes quiescence, which passes the nominal depth on almost every
+  // position and would make this pass without an extension ever firing.
   Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
 
   search::SearchContext ctx;
@@ -542,7 +755,95 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   constexpr std::uint8_t DEPTH = 5;
   search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
 
-  EXPECT_GT(report.max_ply, DEPTH) << "a check at the horizon should have been extended";
+  EXPECT_GT(report.max_check_extensions, 0) << "a check at the horizon should have been extended";
+  EXPECT_GT(report.max_ply, DEPTH) << "and the search should have looked past its nominal depth";
+}
+
+TEST(SearchPlySafety, SeldepthCountsHowFarQuiescenceLooked) {
+  // seldepth answers "how deep did the engine look down its most interesting
+  // line", and most of the answer is quiescence: `depth` is what was searched
+  // everywhere, and the gap is the exchanges quiescence went on resolving past
+  // the horizon.
+  //
+  // A capture-heavy position at depth 1 makes the point cleanly. One ply of
+  // alpha-beta cannot reach ply 2 by itself, so anything past that is
+  // quiescence saying how far it had to go before the position was quiet.
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  constexpr std::uint8_t DEPTH = 1;
+  search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  EXPECT_GT(report.max_ply, DEPTH) << "quiescence resolved captures past the horizon and the "
+                                      "selective depth should say so";
+  EXPECT_LE(report.max_ply, search::MAX_DEPTH) << "and it stays inside a byte";
+}
+
+namespace {
+
+// Found by searching random games for the longest chain of consecutive check
+// extensions: uncapped it takes six, which is what makes it the position the
+// budget is about. File-scope rather than local to the test because the helper
+// below is a lambda, and a lambda may not reach for a local without capturing
+// it—which clang is right to insist on.
+constexpr std::string_view CHECK_CHAIN_FEN =
+    "r1b3k1/1p1p2p1/p4r2/4K2p/PbPP1P1q/1B6/1P1B1n2/RN1Q2NR w - - 3 24";
+constexpr std::uint8_t CHECK_CHAIN_DEPTH = 8;
+
+} // namespace
+
+TEST(SearchPlySafety, TheCheckExtensionBudgetBoundsHowFarAPathMayRun) {
+  // The extension is the one place the recursion does not spend depth, so a
+  // line of checks can go on buying plies for as long as the checks last. It is
+  // more self-limiting than that sounds—a second extension needs the side that
+  // was just checked to answer with a check of its own—but "more self-limiting"
+  // is not a bound, and the only thing that used to stop it was the ply ceiling
+  // at 255.
+  //
+  // The position is CHECK_CHAIN_FEN above.
+  const auto search_with_cap = [](bool capped) {
+    Position pos = parse(CHECK_CHAIN_FEN);
+    search::SearchContext ctx;
+    ctx.check_extension_cap_enabled = capped;
+    // A chain this long only forms if the search really reaches the plies where
+    // the checks are, and a one-shot search against an empty table gives a ply
+    // back at every node to internal iterative reduction.
+    ctx.internal_iterative_reduction_enabled = false;
+
+    search::TranspositionTable tt(8);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
+
+    search::detail::alphabeta(pos, CHECK_CHAIN_DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx,
+                              report, stopper);
+    return report;
+  };
+
+  const auto capped = search_with_cap(true);
+  const auto uncapped = search_with_cap(false);
+
+  EXPECT_GT(uncapped.max_check_extensions, search::MAX_CHECK_EXTENSIONS)
+      << "this position must run past the budget, or the test proves nothing";
+  EXPECT_LE(capped.max_check_extensions, search::MAX_CHECK_EXTENSIONS)
+      << "no path may take more extensions than the budget allows";
+
+  // The witness is the extension count and not max_ply, which is seldepth and
+  // includes quiescence: both searches resolve the same captures past the
+  // horizon and reach the same selective depth whether the main search was
+  // allowed to extend or not.
+
+  // ...and it holds the ply down for free. A node that stops extending does not
+  // disappear—it is handed to quiescence, which charges for the captures it
+  // resolves—so the bound is bought with a bound, not with nodes. This is the
+  // one mechanism here that is not a saving, and pinning that keeps a later
+  // reader from "fixing" it into one.
+  EXPECT_EQ(capped.nodes, uncapped.nodes) << "capping the extension is not a node saving";
 }
 
 // Static exchange evaluation ---------------------------------------------------
@@ -573,7 +874,15 @@ int see_of(std::string_view fen, std::string_view from, std::string_view to) {
   return search::detail::see(pos, capture(pos, from, to));
 }
 
+// The same, for a promotion, which needs the promotion piece to name the move.
+int see_of_promotion(std::string_view fen, std::string_view from, std::string_view to,
+                     Piece promotion) {
+  const Position pos = parse(fen);
+  return search::detail::see(pos, capture(pos, from, to, promotion));
+}
+
 constexpr int PAWN = PIECE_VALUES[static_cast<std::size_t>(Piece::WP)];
+constexpr int KNIGHT = PIECE_VALUES[static_cast<std::size_t>(Piece::WN)];
 constexpr int ROOK = PIECE_VALUES[static_cast<std::size_t>(Piece::WR)];
 constexpr int QUEEN = PIECE_VALUES[static_cast<std::size_t>(Piece::WQ)];
 
@@ -614,6 +923,46 @@ TEST(SearchSee, SeesTheQueenBehindTheRook) {
   EXPECT_EQ(with_battery, ROOK);
 }
 
+TEST(SearchSee, PricesAnEnPassantCaptureOnTheSquareThePawnLeft) {
+  // En passant is the one capture where the piece that leaves the board is not
+  // standing on the square being captured to, and a swap list played out in an
+  // occupancy mask has to clear the right bit. Two positions, identical except
+  // for whether black can recapture on the empty square white lands on.
+  //
+  // White d5 pawn takes the black pawn that has just double-pushed to e5,
+  // landing on e6. Undefended, that is a clean pawn; with a black pawn on f7
+  // covering e6, it is a pawn for a pawn.
+  const int undefended = see_of("4k3/8/8/3Pp3/8/8/8/4K3 w - e6 0 1", "d5", "e6");
+  const int defended = see_of("4k3/5p2/8/3Pp3/8/8/8/4K3 w - e6 0 1", "d5", "e6");
+
+  EXPECT_EQ(undefended, PAWN) << "nothing recaptures, so the pawn is simply won";
+  EXPECT_EQ(defended, 0) << "a pawn for a pawn is an even trade";
+  EXPECT_GT(undefended, defended);
+}
+
+TEST(SearchSee, CountsWhatThePawnBecomesAndWhatTheDefenderTakesBack) {
+  // A promotion is a capture of sorts: the pawn is traded for the piece it
+  // becomes. A capture-promotion is both at once, and the swap list has to see
+  // the promoted piece standing on the square afterwards—not the pawn—or the
+  // recapture is priced wrongly.
+  //
+  // b7 takes the rook on a8 and promotes. Undefended that is the rook plus the
+  // difference between a queen and a pawn; defended by the knight on b6 it is
+  // that, less the new queen.
+  const int undefended = see_of_promotion("r6k/1P6/8/8/8/8/8/6K1 w - - 0 1", "b7", "a8", Piece::WQ);
+  const int defended = see_of_promotion("r6k/1P6/1n6/8/8/8/8/6K1 w - - 0 1", "b7", "a8", Piece::WQ);
+
+  EXPECT_EQ(undefended, ROOK + QUEEN - PAWN);
+  EXPECT_EQ(defended, ROOK + QUEEN - PAWN - QUEEN);
+  EXPECT_LT(defended, undefended) << "the knight takes the new queen back";
+
+  // Promoting to a knight instead wins less, because the piece the pawn becomes
+  // is what it is worth—and it is also what the defender then captures.
+  const int to_knight = see_of_promotion("r6k/1P6/8/8/8/8/8/6K1 w - - 0 1", "b7", "a8", Piece::WN);
+  EXPECT_EQ(to_knight, ROOK + KNIGHT - PAWN);
+  EXPECT_LT(to_knight, undefended);
+}
+
 TEST(SearchSee, RefusesToLetTheKingCaptureIntoADefendedSquare) {
   // Black's rook on d8 is defended only by its king. Whether the king may
   // actually recapture depends on whether white still attacks d8 afterwards,
@@ -632,6 +981,216 @@ TEST(SearchSee, IgnoresQuietMoves) {
   // Nothing changes hands, so there is no exchange to price.
   const Position pos = parse("4k3/8/8/8/8/8/8/4K2R w K - 0 1");
   EXPECT_EQ(search::detail::see(pos, capture(pos, "h1", "h4")), 0);
+}
+
+namespace {
+
+// THE OLD SEE, KEPT HERE ON PURPOSE.
+//
+// The engine's see() used to play the exchange out on a private copy of the
+// Board, physically removing and placing pieces; it now plays it out in a
+// 64-bit occupancy mask and never writes to a board at all. Those are two very
+// different pieces of code that have to agree on every capture in every
+// position, and no set of hand-written positions can promise that.
+//
+// So the old implementation lives on as a REFERENCE. It is slow, and it is
+// deliberately a transcription rather than a tidy-up: the point of a reference
+// is that it was not written by whoever wrote the thing under test.
+constexpr int REFERENCE_KING_VALUE = 10'000;
+
+int reference_value(Piece piece) {
+  return is_king(piece) ? REFERENCE_KING_VALUE : PIECE_VALUES[static_cast<std::size_t>(piece)];
+}
+
+std::optional<Piece> reference_least_valuable_attacker(Bitboard attackers, Colour side,
+                                                       const Board& board) {
+  for (const auto piece : pieces_for(side)) {
+    if ((attackers & board.pieces(piece)) != 0) {
+      return piece;
+    }
+  }
+  return std::nullopt;
+}
+
+int reference_see(const Position& pos, const Move& mv) {
+  if (!mv.captured_piece.has_value() && !mv.promotion_piece.has_value()) {
+    return 0;
+  }
+
+  const Square target = mv.to;
+  Board board = pos.board;
+
+  std::array<int, 32> gain{};
+
+  const int promotion_gain = mv.promotion_piece.has_value()
+                                 ? reference_value(*mv.promotion_piece) - reference_value(mv.piece)
+                                 : 0;
+  gain[0] =
+      (mv.captured_piece.has_value() ? reference_value(*mv.captured_piece) : 0) + promotion_gain;
+
+  if (const auto captured_square = mv.capture_square()) {
+    board.remove_piece(*captured_square);
+  }
+  board.remove_piece(mv.from);
+  Piece occupier = mv.promotion_piece.value_or(mv.piece);
+  board.put_piece(occupier, target);
+
+  Colour side = !colour(mv.piece);
+  std::size_t depth = 0;
+
+  while (true) {
+    const Bitboard attackers = get_attackers(target, side, board);
+    const auto attacker = reference_least_valuable_attacker(attackers, side, board);
+    if (!attacker.has_value()) {
+      break;
+    }
+
+    if (is_king(*attacker) && get_attackers(target, !side, board) != 0) {
+      break;
+    }
+
+    if (depth + 1 >= gain.size()) {
+      break;
+    }
+    ++depth;
+
+    gain[depth] = reference_value(occupier) - gain[depth - 1];
+
+    if (std::max(-gain[depth - 1], gain[depth]) < 0) {
+      break;
+    }
+
+    const Square from = Square::first_occupied(attackers & board.pieces(*attacker));
+    board.remove_piece(target);
+    board.remove_piece(from);
+    board.put_piece(*attacker, target);
+    occupier = *attacker;
+    side = !side;
+  }
+
+  while (depth > 0) {
+    gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
+    --depth;
+  }
+
+  return gain[0];
+}
+
+// What one position contributed to the cross-check below: how many noisy moves
+// were priced, how many of them were the two awkward kinds, and whether the two
+// implementations still agree.
+struct SeeAgreement {
+  int captures{0};
+  int en_passant{0};
+  int promotions{0};
+  bool agreed{true};
+
+  void add(const SeeAgreement& other) {
+    captures += other.captures;
+    en_passant += other.en_passant;
+    promotions += other.promotions;
+    agreed = agreed && other.agreed;
+  }
+};
+
+SeeAgreement compare_see_against_reference(const Position& pos) {
+  SeeAgreement tally;
+
+  for (const auto& noisy : pseudo_legal_noisy_moves(pos)) {
+    ++tally.captures;
+    tally.en_passant += static_cast<int>(noisy.is_en_passant);
+    tally.promotions += static_cast<int>(noisy.promotion_piece.has_value());
+
+    const int actual = search::detail::see(pos, noisy);
+    const int expected = reference_see(pos, noisy);
+    if (actual != expected) {
+      tally.agreed = false;
+      ADD_FAILURE() << "see disagreed on " << to_uci(noisy) << " in " << pos.to_fen() << ": got "
+                    << actual << ", reference says " << expected;
+      break;
+    }
+  }
+
+  return tally;
+}
+
+// One random game from `seed`, pricing every noisy move of every position it
+// passes through. It stops early once the two implementations disagree, so the
+// first failure is reported against the position that produced it.
+SeeAgreement compare_see_over_one_random_game(std::string_view seed, std::mt19937& rng) {
+  SeeAgreement tally;
+
+  Position pos = parse(seed);
+  const int plies = 4 + static_cast<int>(rng() % 70);
+
+  for (int ply = 0; ply < plies; ++ply) {
+    const auto moves = legal_moves(pos);
+    if (moves.empty()) {
+      break;
+    }
+
+    tally.add(compare_see_against_reference(pos));
+    if (!tally.agreed) {
+      break;
+    }
+
+    pos.make_move(moves[rng() % moves.size()]);
+  }
+
+  return tally;
+}
+
+} // namespace
+
+TEST(SearchSee, AgreesWithTheBoardCopyReferenceOnGeneratedCaptures) {
+  // Random games, and every capture and promotion each position offers. The
+  // seed is fixed, so a failure is reproducible and a run that passes today
+  // passes tomorrow; what the randomness buys is COVERAGE—batteries, pinned
+  // defenders, en passant, capture-promotions, kings that may and may not
+  // recapture—in combinations nobody would think to write down.
+  //
+  // SEEDING FROM MORE THAN THE START POSITION. Random play from startpos spends
+  // most of its plies in an opening where the pawns have barely moved, and the
+  // two cases the bitboard rewrite is most delicate about—en passant, where the
+  // piece that leaves the board is not on the square captured to, and
+  // capture-promotions, where what stands on the square afterwards is not what
+  // moved—barely occur. So the games also start from late-middlegame positions
+  // with pawns already deep and files already open, and the counts below insist
+  // that both cases were actually reached.
+  const std::vector<std::string_view> seeds = {
+      std::string_view(Position::START_POS_FEN),
+      "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+      "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+      "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+      "4k3/1pP1p1P1/8/pP1p1p2/P1p1P1p1/2P5/5P1P/4K3 w - - 0 1",
+      // Pawns and kings only: nearly every noisy move is a pawn capture, every
+      // pawn can still double-push past an enemy pawn, and the files run all the
+      // way to the last rank. This is the seed that supplies most of the en
+      // passant captures and most of the promotions.
+      "4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
+      "4k3/1p1p1p1p/8/p1p1p1p1/P1P1P1P1/8/1P1P1P1P/4K3 w - - 0 1",
+  };
+
+  std::mt19937 rng(20240917);
+
+  SeeAgreement totals;
+
+  for (const auto& seed : seeds) {
+    for (int game = 0; game < 45 && totals.agreed; ++game) {
+      totals.add(compare_see_over_one_random_game(seed, rng));
+    }
+  }
+
+  const int captures_checked = totals.captures;
+  const int en_passant_checked = totals.en_passant;
+  const int promotions_checked = totals.promotions;
+
+  // A test that checked nothing would also report no disagreements.
+  EXPECT_GT(captures_checked, 5000) << "the generated games must actually contain captures";
+  EXPECT_GT(en_passant_checked, 50) << "en passant is the case the occupancy mask is subtlest "
+                                       "about, and it has to be reached often enough to matter";
+  EXPECT_GT(promotions_checked, 200) << "promotions change what stands on the square, which is the "
+                                        "other thing the mask has to get right";
 }
 
 // Quiescence -------------------------------------------------------------------
