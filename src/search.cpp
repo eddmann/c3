@@ -209,12 +209,28 @@ int reverse_futility_margin(std::uint8_t depth) {
 // two plies could add that quiescence cannot see: a fork set up by a quiet
 // move, a passed pawn pushed past its blockader, a piece dropped into an
 // outpost. Two hundred centipawns a ply is deliberately more than a minor
-// piece, because being wrong here costs a whole subtree of search. A smaller
-// margin fires more often: 130 a ply took the bench total slightly lower
-// (386k against 389k) but cost SEVEN PER CENT more nodes on a position where
-// the side to move was behind and had a tactic, which is the shape of mistake
-// this rule is supposed to be careful about. Two hundred is the value that
-// helps every position measured rather than most of them.
+// piece, because being wrong here costs a whole subtree of search.
+//
+// A SMALLER MARGIN FIRES MORE OFTEN, and that is not free. Measured, 130 a ply
+// takes the bench total about ten per cent lower than 200 does—but it also cost
+// SEVEN PER CENT more nodes on a position where the side to move was behind and
+// had a tactic, which is exactly the shape of mistake this rule is supposed to
+// be careful about: the position was not lost, it only looked lost until its
+// capture was played. Two hundred helps every position measured rather than
+// most of them, and buying the last tenth of the tree with an occasional
+// missed tactic is the wrong trade for a rule that prunes without a re-search.
+//
+// A MATE-RANGE ALPHA IS NOT A GUESS THIS RULE MAY MAKE. Once alpha is itself a
+// mate score—which is what a node gets once a mate has been found elsewhere in
+// the tree—"static_eval + margin does not reach alpha" is trivially true, since
+// no material count comes within four hundred centipawns of ten thousand. Every
+// such node would hand itself to quiescence and fail low, having proved nothing
+// whatever about the mate it was asked to beat, and a shorter mate sitting one
+// move away would simply never be looked at. So the rule declines to have an
+// opinion there. (Futility pruning inside the move loop is blind in the same
+// way, but it is bounded differently: it only skips individual quiet moves, and
+// only after a move has already been searched, so the node still returns a
+// score it earned rather than one it declined to look for.)
 //
 // FAILURE MODE: THE QUIET RESCUE. Quiescence only searches captures, so a
 // position saved by a quiet move—the only defence to a threat, a fortress, a
@@ -527,6 +543,35 @@ std::size_t late_move_pruning_threshold(std::uint8_t depth) {
 // position went from depth 12 to depth 15. The nodes that really are unvisited
 // are the zero-window ones out in the width of the tree, and those are exactly
 // the ones the PV-only form refuses to help.
+//
+// WHERE IT SITS, AND WHY THAT IS NOT AN IMPLEMENTATION DETAIL. It reduces
+// `depth`, and half the rules in this function are conditions ON depth—so
+// wherever it is placed, everything after it sees the smaller number. That
+// matters most for reverse futility and razoring, the two rules that RETURN
+// WITHOUT SEARCHING ANYTHING: reducing first turns a depth-4 node into a
+// depth-3 one, which is exactly the depth at which reverse futility is allowed
+// to fail high on a static evaluation. The node the table knows nothing about
+// would then be the node most eagerly pruned on a guess, which is backwards.
+// So the reduction is taken BELOW both of them. Late move pruning and futility
+// inside the loop still see the reduced depth, and that is accepted: they skip
+// individual quiet moves after something has already been searched, so a node
+// still returns a score it earned.
+//
+// IT COSTS SOMETHING TO BE CAREFUL. Measured over the bench, reducing before
+// reverse futility gives 204,377 nodes and reducing after razoring gives
+// 218,288—about seven per cent more tree for the ordering that does not let an
+// unexamined node talk itself out of being searched. That is the trade, taken
+// deliberately.
+//
+// NOT AT THE ROOT, AND NOT IN CHECK.
+//   - The root is excluded so that a reported `depth D` is always a depth
+//     actually searched. It costs nothing: by the time iterative deepening
+//     reaches depth D the root has a hash move from depth D - 1, so the
+//     condition never held there anyway (bench is identical either way).
+//   - A node in check is excluded because it pulls directly against the check
+//     extension, which exists to give forcing lines their plies BACK. Measured,
+//     this is worth 373 nodes out of 218,288—two parts in a thousand—so the
+//     choice is made on the principle rather than on the number.
 //
 // FAILURE MODE. The reduction is real depth given up, on a node nobody has
 // looked at yet, so there is no evidence either way about what it contains.
@@ -1828,19 +1873,6 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     hash_move_packed = entry->packed_move;
   }
 
-  // INTERNAL ITERATIVE REDUCTION
-  // A node with nothing in the table has no move it has any reason to try
-  // first, and a full-depth search with bad ordering is the most expensive
-  // thing this function can do. Search it a ply shallower instead and let the
-  // table keep the best move it finds; the next iteration comes back here with
-  // a hash move and spends the full depth well. See the block above for why
-  // this is preferred to internal iterative deepening, and why it is not
-  // restricted to PV nodes.
-  if (ctx.internal_iterative_reduction_enabled && depth >= IIR_MIN_DEPTH &&
-      hash_move_packed == TT_NO_MOVE) {
-    depth -= 1;
-  }
-
   const Colour colour_to_move = pos.colour_to_move;
   const bool in_check = is_in_check(colour_to_move, pos.board);
 
@@ -1876,11 +1908,25 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // the node's own question and answers it with the captures resolved. See the
   // block above for why the naive form is a trap.
   if (ctx.razoring_enabled && has_static_eval && !is_pv_node && depth <= RAZORING_DEPTH &&
-      static_eval + razoring_margin(depth) <= alpha) {
+      std::abs(alpha) < CENTIPAWN_MATE_THRESHOLD && static_eval + razoring_margin(depth) <= alpha) {
     const int resolved = quiescence(pos, alpha, beta, ctx, report, stopper);
     if (resolved <= alpha) {
       return alpha;
     }
+  }
+
+  // INTERNAL ITERATIVE REDUCTION
+  // A node with nothing in the table has no move it has any reason to try
+  // first, and a full-depth search with bad ordering is the most expensive
+  // thing this function can do. Search it a ply shallower instead and let the
+  // table keep the best move it finds; the next iteration comes back here with
+  // a hash move and spends the full depth well. See the block above for why
+  // this is preferred to internal iterative deepening, why it is not restricted
+  // to PV nodes, why it sits BELOW the two rules that can return without
+  // searching a move, and why it leaves the root and nodes in check alone.
+  if (ctx.internal_iterative_reduction_enabled && ply > 0 && !in_check && depth >= IIR_MIN_DEPTH &&
+      hash_move_packed == TT_NO_MOVE) {
+    depth -= 1;
   }
 
   // NULL-MOVE PRUNING
@@ -2226,6 +2272,17 @@ SearchResult search(Position& pos, TranspositionTable& tt, const Limits& limits,
   for (std::uint8_t depth = 1; depth <= max_depth; ++depth) {
     const auto iteration_started = std::chrono::steady_clock::now();
     MoveList pv;
+
+    // SELDEPTH IS PER ITERATION, NOT PER `go`. An `info` line describes the
+    // iteration that has just finished, so "how deep did this search look"
+    // has to be reset with it—otherwise every line after the first would be
+    // reporting a high-water mark set several iterations ago, and the number
+    // would only ever go up whatever the current iteration actually did. Nodes
+    // and the clock are cumulative on purpose: those really are totals for the
+    // whole move. The same argument applies to the check-extension counter,
+    // which is the same kind of high-water mark.
+    report.max_ply = 0;
+    report.max_check_extensions = 0;
 
     const bool do_aspiration =
         depth >= ASPIRATION_WINDOW_MIN_DEPTH && std::abs(searched_eval) < CENTIPAWN_MATE_THRESHOLD;

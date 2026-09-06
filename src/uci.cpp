@@ -736,9 +736,12 @@ void UciReporter::send(const search::Report& report) {
 
   // `seldepth` sits immediately after `depth` because that is the pair a GUI
   // shows together ("18/34"): what the engine searched everywhere, and how far
-  // it looked down the line it cared about. The second number is always at
-  // least the first—quiescence and the check extension only ever push it
-  // further—so a seldepth BELOW the depth would be a bug worth noticing.
+  // it looked down the line it cared about. It describes THIS iteration—the
+  // search resets it at the top of each one—so it is not monotone across the
+  // info lines of a single `go`, and it is usually but not always the larger of
+  // the two: a line that ends in a repetition or the fifty-move rule stops
+  // before it reaches the horizon, so a position full of forced draws can
+  // report a selective depth below the nominal one.
   std::vector<std::string> info{
       "depth " + std::to_string(report.depth), "seldepth " + std::to_string(report.max_ply),
       "nodes " + std::to_string(report.nodes), "nps " + std::to_string(nps),

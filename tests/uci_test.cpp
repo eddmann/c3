@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <istream>
@@ -464,39 +465,6 @@ std::vector<std::string> lines_starting_with(const std::string& text, const std:
 }
 
 } // namespace
-
-TEST(UciSession, SeldepthIsReportedAndNeverBelowDepth) {
-  // The number a GUI shows after the slash. It is what the search reached down
-  // its most interesting line, so it can never be less than the depth it
-  // reached down every line, and on a position full of captures it is more:
-  // quiescence keeps resolving exchanges past the horizon.
-  const std::vector<std::string> script = {
-      "uci",
-      "isready",
-      "position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-      "go depth 4",
-  };
-
-  const auto output = uci::run_script_for_test(script);
-  const auto info = lines_starting_with(output, "info depth ");
-  ASSERT_FALSE(info.empty()) << output;
-
-  bool saw_deeper = false;
-  for (const auto& line : info) {
-    std::istringstream fields(line);
-    std::string tag;
-    unsigned depth = 0;
-    unsigned seldepth = 0;
-    // "info depth D seldepth S ..."
-    fields >> tag >> tag >> depth >> tag >> seldepth;
-    ASSERT_EQ(tag, "seldepth") << line;
-
-    EXPECT_GE(seldepth, depth) << line;
-    saw_deeper = saw_deeper || seldepth > depth;
-  }
-
-  EXPECT_TRUE(saw_deeper) << "quiescence should have looked past the nominal depth\n" << output;
-}
 
 TEST(UciParse, GoAcceptsMovesToGo) {
   EXPECT_NO_THROW((void)uci::parse_command("go wtime 10000 btime 10000 movestogo 40"));
@@ -980,6 +948,53 @@ std::vector<std::uint64_t> node_counts_per_search(const std::string& output) {
 constexpr auto WARM_TABLE_GO = "go depth 6";
 
 } // namespace
+
+TEST(UciLoop, SeldepthIsReportedAndDescribesItsOwnIteration) {
+  // The number a GUI shows after the slash. Two claims, and neither is a
+  // property of `seldepth` in general:
+  //
+  //   1. ON THIS POSITION it is never below the depth. Kiwipete is a dense
+  //      middlegame full of captures, so every line runs into quiescence and
+  //      past the horizon. That is not universal—a line that ends in a
+  //      repetition or the fifty-move rule stops early, so a position full of
+  //      forced draws can legitimately report less—which is why the claim is
+  //      scoped to the position rather than made about the field.
+  //
+  //   2. It is not monotone across the iterations of one `go`. That is the
+  //      witness that it is reset per iteration: a running high-water mark for
+  //      the whole search could only ever go up, so a single decrease proves
+  //      each line is reporting its own iteration.
+  // Through the real loop, paced so the search actually finishes: the legacy
+  // in-process harness calls alpha-beta once at the target depth and reports a
+  // single line, so it has no iterations to compare.
+  const auto output = run_uci_paced({
+      "uci",
+      "isready",
+      "position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+      "go depth 6",
+      "quit",
+  });
+  const auto info = lines_starting_with(output, "info depth ");
+  ASSERT_GE(info.size(), 2U) << output;
+
+  std::vector<unsigned> seldepths;
+  for (const auto& line : info) {
+    std::istringstream fields(line);
+    std::string tag;
+    unsigned depth = 0;
+    unsigned seldepth = 0;
+    // "info depth D seldepth S ..."
+    fields >> tag >> tag >> depth >> tag >> seldepth;
+    ASSERT_EQ(tag, "seldepth") << line;
+
+    EXPECT_GE(seldepth, depth) << "every line of THIS position runs past its horizon\n" << line;
+    seldepths.push_back(seldepth);
+  }
+
+  const bool monotone = std::ranges::is_sorted(seldepths);
+  EXPECT_FALSE(monotone) << "seldepth should describe its own iteration, not the whole search\n"
+                         << output;
+}
 
 TEST(UciLoop, SecondGoReusesTheTableTheFirstOneFilled) {
   // The loop must search through the Engine's table rather than build a

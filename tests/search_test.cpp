@@ -503,6 +503,43 @@ TEST(SearchPruning, RazoringVerifiesALostPositionWithQuiescenceInsteadOfSearchin
       << "a node far enough behind should be resolved by quiescence, not searched";
 }
 
+TEST(SearchPruning, RazoringDoesNotRefuseANodeThatBeatsAMateRangeAlpha) {
+  // Razoring's guess is "static_eval + margin does not reach alpha". Once alpha
+  // is itself a mate score that comparison is trivially true—no material count
+  // is within four hundred centipawns of ten thousand—so every such node would
+  // hand itself to quiescence and fail low, having proved nothing at all about
+  // the mate it was being asked to beat.
+  //
+  // Scholar's mate, searched with the zero window a node would get once a mate
+  // five plies away had already been found elsewhere. The position beats that
+  // window—mate in one is better than mate in five—and the node has to say so.
+  //
+  // The mating move is a CAPTURE on purpose. Futility pruning and late move
+  // pruning are just as blind to a mate-range alpha, but both exempt captures
+  // and both only fire once a move has been searched, so a capture mate isolates
+  // razoring: it is the only rule here that can refuse the node outright.
+  Position pos = parse("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1");
+
+  const int alpha = CENTIPAWN_MATE - 5;
+  const int beta = alpha + 1;
+
+  const auto score_with = [&pos](bool razoring) {
+    Position local = pos;
+    search::SearchContext ctx;
+    ctx.razoring_enabled = razoring;
+
+    search::TranspositionTable tt(1);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
+
+    return search::detail::alphabeta(local, 2, alpha, beta, pv, tt, ctx, report, stopper);
+  };
+
+  EXPECT_GE(score_with(false), beta) << "the position really does beat this alpha";
+  EXPECT_GE(score_with(true), beta) << "razoring must not fail low against a mate-range alpha";
+}
+
 TEST(SearchPruning, LateMovePruningStopsSearchingQuietMovesNearTheHorizon) {
   // An ordinary opening middlegame: a wide list of quiet moves at every node,
   // which is precisely the position a move count is a good argument about.
@@ -538,26 +575,55 @@ TEST(SearchPruning, InternalIterativeReductionShrinksTheTreeAgainstAWarmTable) {
 TEST(SearchPruning, LateMovePruningNeverInventsAMateOrAStalemate) {
   // The rule prunes quiet moves, and a node that pruned ALL of them would
   // report "no legal moves"—checkmate or stalemate—for a position that has
-  // plenty. That is not a slightly wrong score, it is a fabricated terminal, so
-  // these positions are searched with pruning at its default and their scores
-  // must stay ordinary.
+  // plenty. That is not a slightly wrong score, it is a fabricated terminal.
   //
-  // Both have nothing but quiet moves available and a lopsided material count,
-  // which is what would tempt the count to fire early: a king and pawns with
-  // every capture already gone.
+  // Two conditions already make that impossible by construction: nothing is
+  // pruned until a move has been searched, and the smallest threshold the count
+  // ever takes is four. So this cannot catch the bug as the code stands—what it
+  // can catch is a future change that loosens either condition, and the witness
+  // is chosen to make that failure loud rather than subtle: the SAME positions
+  // searched with the rule on and off must not disagree by a mate score. A
+  // fabricated terminal is a swing of ten thousand centipawns; nothing else this
+  // rule can do to a score comes close.
+  //
+  // The positions have nothing but quiet moves and a lopsided material count,
+  // which is what would tempt the count to fire early: kings and pawns with
+  // every capture already gone, and one with a wide-open board where a single
+  // side has more quiet moves than the threshold at any depth.
   const std::vector<std::string_view> quiet_positions = {
       "8/8/4k3/8/8/4K3/4P3/8 w - - 0 60",
       "8/5ppp/8/8/8/8/5PPP/4K1k1 w - - 0 45",
       "4k3/8/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
+      "3qkbnr/8/8/8/8/8/8/RNBQK2R w KQk - 0 1",
+  };
+
+  const auto score_with = [](std::string_view fen, bool pruning) {
+    Position pos = parse(fen);
+    search::SearchContext ctx;
+    ctx.late_move_pruning_enabled = pruning;
+
+    search::TranspositionTable tt(8);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
+
+    return search::detail::alphabeta(pos, 5, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report,
+                                     stopper);
   };
 
   for (const auto& fen : quiet_positions) {
     SCOPED_TRACE(std::string(fen));
+
+    const int pruned = score_with(fen, true);
+    const int unpruned = score_with(fen, false);
+
+    EXPECT_LT(std::abs(pruned), CENTIPAWN_MATE_THRESHOLD)
+        << "a position with legal quiet moves must not be scored as a terminal";
+    EXPECT_LT(std::abs(pruned - unpruned), CENTIPAWN_MATE_THRESHOLD)
+        << "pruning quiet moves must not change a score by a mate";
+
     Position pos = parse(fen);
     const auto result = search::search(pos, 6);
-
-    EXPECT_LT(std::abs(result.eval), CENTIPAWN_MATE_THRESHOLD)
-        << "a position with legal quiet moves must not be scored as a terminal";
     EXPECT_FALSE(result.pv.empty()) << "a position with legal moves must produce one";
   }
 }
@@ -596,15 +662,6 @@ TEST(SearchCounterMoves, ASearchFillsTheTable) {
   Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
 
   search::SearchContext ctx;
-  // A ONE-SHOT SEARCH AGAINST AN EMPTY TABLE, which is not what internal
-  // iterative reduction is built for: with nothing in the table every node
-  // qualifies, so the search this test asks for at depth 4 would really be a
-  // depth-3 one and might never produce the quiet cutoff it is looking for. A
-  // real search reaches depth 4 through depths 1, 2 and 3 and arrives with a
-  // hash move. The switch is here so the test measures counter-moves rather
-  // than the interaction of two unrelated mechanisms.
-  ctx.internal_iterative_reduction_enabled = false;
-
   search::TranspositionTable tt(1);
   search::Report report;
   search::Stopper stopper;
@@ -650,11 +707,6 @@ TEST(SearchPlySafety, ResolvesStaticallyAtThePlyCeiling) {
   // 0, 1, 2... — the root's own slots, filled in from 255 plies away.
   const auto killers_stored_by = [&pos](std::uint8_t ply) {
     search::SearchContext ctx;
-    // See the note in ASearchFillsTheTable: a one-shot search against an empty
-    // table would be reduced a ply by internal iterative reduction, and what is
-    // under test here is where the recursion stops, not how deep it went.
-    ctx.internal_iterative_reduction_enabled = false;
-
     search::TranspositionTable tt(1);
     search::Report report;
     report.ply = ply;
@@ -695,10 +747,6 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
 
   search::SearchContext ctx;
-  // Same reason as above: the search has to actually get the depth it was
-  // asked for before "it went past that depth" means anything.
-  ctx.internal_iterative_reduction_enabled = false;
-
   search::TranspositionTable tt(1);
   search::Report report;
   search::Stopper stopper;
@@ -736,6 +784,19 @@ TEST(SearchPlySafety, SeldepthCountsHowFarQuiescenceLooked) {
   EXPECT_LE(report.max_ply, search::MAX_DEPTH) << "and it stays inside a byte";
 }
 
+namespace {
+
+// Found by searching random games for the longest chain of consecutive check
+// extensions: uncapped it takes six, which is what makes it the position the
+// budget is about. File-scope rather than local to the test because the helper
+// below is a lambda, and a lambda may not reach for a local without capturing
+// it—which clang is right to insist on.
+constexpr std::string_view CHECK_CHAIN_FEN =
+    "r1b3k1/1p1p2p1/p4r2/4K2p/PbPP1P1q/1B6/1P1B1n2/RN1Q2NR w - - 3 24";
+constexpr std::uint8_t CHECK_CHAIN_DEPTH = 8;
+
+} // namespace
+
 TEST(SearchPlySafety, TheCheckExtensionBudgetBoundsHowFarAPathMayRun) {
   // The extension is the one place the recursion does not spend depth, so a
   // line of checks can go on buying plies for as long as the checks last. It is
@@ -744,20 +805,14 @@ TEST(SearchPlySafety, TheCheckExtensionBudgetBoundsHowFarAPathMayRun) {
   // is not a bound, and the only thing that used to stop it was the ply ceiling
   // at 255.
   //
-  // This position was found by searching random games for the longest chain of
-  // consecutive check extensions, and it runs past the budget: uncapped it
-  // takes six, which is what makes it the position this rule is about.
-  //
-  // Internal iterative reduction is switched off so the search really reaches
-  // the depth it was given; the extension is measured against that depth.
-  constexpr std::string_view FEN =
-      "r1b3k1/1p1p2p1/p4r2/4K2p/PbPP1P1q/1B6/1P1B1n2/RN1Q2NR w - - 3 24";
-  constexpr std::uint8_t DEPTH = 8;
-
+  // The position is CHECK_CHAIN_FEN above.
   const auto search_with_cap = [](bool capped) {
-    Position pos = parse(FEN);
+    Position pos = parse(CHECK_CHAIN_FEN);
     search::SearchContext ctx;
     ctx.check_extension_cap_enabled = capped;
+    // A chain this long only forms if the search really reaches the plies where
+    // the checks are, and a one-shot search against an empty table gives a ply
+    // back at every node to internal iterative reduction.
     ctx.internal_iterative_reduction_enabled = false;
 
     search::TranspositionTable tt(8);
@@ -765,8 +820,8 @@ TEST(SearchPlySafety, TheCheckExtensionBudgetBoundsHowFarAPathMayRun) {
     search::Stopper stopper;
     MoveList pv;
 
-    search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report,
-                              stopper);
+    search::detail::alphabeta(pos, CHECK_CHAIN_DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx,
+                              report, stopper);
     return report;
   };
 
@@ -819,7 +874,15 @@ int see_of(std::string_view fen, std::string_view from, std::string_view to) {
   return search::detail::see(pos, capture(pos, from, to));
 }
 
+// The same, for a promotion, which needs the promotion piece to name the move.
+int see_of_promotion(std::string_view fen, std::string_view from, std::string_view to,
+                     Piece promotion) {
+  const Position pos = parse(fen);
+  return search::detail::see(pos, capture(pos, from, to, promotion));
+}
+
 constexpr int PAWN = PIECE_VALUES[static_cast<std::size_t>(Piece::WP)];
+constexpr int KNIGHT = PIECE_VALUES[static_cast<std::size_t>(Piece::WN)];
 constexpr int ROOK = PIECE_VALUES[static_cast<std::size_t>(Piece::WR)];
 constexpr int QUEEN = PIECE_VALUES[static_cast<std::size_t>(Piece::WQ)];
 
@@ -858,6 +921,46 @@ TEST(SearchSee, SeesTheQueenBehindTheRook) {
   EXPECT_EQ(without_battery, 0);
   EXPECT_GT(with_battery, without_battery);
   EXPECT_EQ(with_battery, ROOK);
+}
+
+TEST(SearchSee, PricesAnEnPassantCaptureOnTheSquareThePawnLeft) {
+  // En passant is the one capture where the piece that leaves the board is not
+  // standing on the square being captured to, and a swap list played out in an
+  // occupancy mask has to clear the right bit. Two positions, identical except
+  // for whether black can recapture on the empty square white lands on.
+  //
+  // White d5 pawn takes the black pawn that has just double-pushed to e5,
+  // landing on e6. Undefended, that is a clean pawn; with a black pawn on f7
+  // covering e6, it is a pawn for a pawn.
+  const int undefended = see_of("4k3/8/8/3Pp3/8/8/8/4K3 w - e6 0 1", "d5", "e6");
+  const int defended = see_of("4k3/5p2/8/3Pp3/8/8/8/4K3 w - e6 0 1", "d5", "e6");
+
+  EXPECT_EQ(undefended, PAWN) << "nothing recaptures, so the pawn is simply won";
+  EXPECT_EQ(defended, 0) << "a pawn for a pawn is an even trade";
+  EXPECT_GT(undefended, defended);
+}
+
+TEST(SearchSee, CountsWhatThePawnBecomesAndWhatTheDefenderTakesBack) {
+  // A promotion is a capture of sorts: the pawn is traded for the piece it
+  // becomes. A capture-promotion is both at once, and the swap list has to see
+  // the promoted piece standing on the square afterwards—not the pawn—or the
+  // recapture is priced wrongly.
+  //
+  // b7 takes the rook on a8 and promotes. Undefended that is the rook plus the
+  // difference between a queen and a pawn; defended by the knight on b6 it is
+  // that, less the new queen.
+  const int undefended = see_of_promotion("r6k/1P6/8/8/8/8/8/6K1 w - - 0 1", "b7", "a8", Piece::WQ);
+  const int defended = see_of_promotion("r6k/1P6/1n6/8/8/8/8/6K1 w - - 0 1", "b7", "a8", Piece::WQ);
+
+  EXPECT_EQ(undefended, ROOK + QUEEN - PAWN);
+  EXPECT_EQ(defended, ROOK + QUEEN - PAWN - QUEEN);
+  EXPECT_LT(defended, undefended) << "the knight takes the new queen back";
+
+  // Promoting to a knight instead wins less, because the piece the pawn becomes
+  // is what it is worth—and it is also what the defender then captures.
+  const int to_knight = see_of_promotion("r6k/1P6/8/8/8/8/8/6K1 w - - 0 1", "b7", "a8", Piece::WN);
+  EXPECT_EQ(to_knight, ROOK + KNIGHT - PAWN);
+  EXPECT_LT(to_knight, undefended);
 }
 
 TEST(SearchSee, RefusesToLetTheKingCaptureIntoADefendedSquare) {
@@ -973,6 +1076,70 @@ int reference_see(const Position& pos, const Move& mv) {
   return gain[0];
 }
 
+// What one position contributed to the cross-check below: how many noisy moves
+// were priced, how many of them were the two awkward kinds, and whether the two
+// implementations still agree.
+struct SeeAgreement {
+  int captures{0};
+  int en_passant{0};
+  int promotions{0};
+  bool agreed{true};
+
+  void add(const SeeAgreement& other) {
+    captures += other.captures;
+    en_passant += other.en_passant;
+    promotions += other.promotions;
+    agreed = agreed && other.agreed;
+  }
+};
+
+SeeAgreement compare_see_against_reference(const Position& pos) {
+  SeeAgreement tally;
+
+  for (const auto& noisy : pseudo_legal_noisy_moves(pos)) {
+    ++tally.captures;
+    tally.en_passant += static_cast<int>(noisy.is_en_passant);
+    tally.promotions += static_cast<int>(noisy.promotion_piece.has_value());
+
+    const int actual = search::detail::see(pos, noisy);
+    const int expected = reference_see(pos, noisy);
+    if (actual != expected) {
+      tally.agreed = false;
+      ADD_FAILURE() << "see disagreed on " << to_uci(noisy) << " in " << pos.to_fen() << ": got "
+                    << actual << ", reference says " << expected;
+      break;
+    }
+  }
+
+  return tally;
+}
+
+// One random game from `seed`, pricing every noisy move of every position it
+// passes through. It stops early once the two implementations disagree, so the
+// first failure is reported against the position that produced it.
+SeeAgreement compare_see_over_one_random_game(std::string_view seed, std::mt19937& rng) {
+  SeeAgreement tally;
+
+  Position pos = parse(seed);
+  const int plies = 4 + static_cast<int>(rng() % 70);
+
+  for (int ply = 0; ply < plies; ++ply) {
+    const auto moves = legal_moves(pos);
+    if (moves.empty()) {
+      break;
+    }
+
+    tally.add(compare_see_against_reference(pos));
+    if (!tally.agreed) {
+      break;
+    }
+
+    pos.make_move(moves[rng() % moves.size()]);
+  }
+
+  return tally;
+}
+
 } // namespace
 
 TEST(SearchSee, AgreesWithTheBoardCopyReferenceOnGeneratedCaptures) {
@@ -981,39 +1148,49 @@ TEST(SearchSee, AgreesWithTheBoardCopyReferenceOnGeneratedCaptures) {
   // passes tomorrow; what the randomness buys is COVERAGE—batteries, pinned
   // defenders, en passant, capture-promotions, kings that may and may not
   // recapture—in combinations nobody would think to write down.
+  //
+  // SEEDING FROM MORE THAN THE START POSITION. Random play from startpos spends
+  // most of its plies in an opening where the pawns have barely moved, and the
+  // two cases the bitboard rewrite is most delicate about—en passant, where the
+  // piece that leaves the board is not on the square captured to, and
+  // capture-promotions, where what stands on the square afterwards is not what
+  // moved—barely occur. So the games also start from late-middlegame positions
+  // with pawns already deep and files already open, and the counts below insist
+  // that both cases were actually reached.
+  const std::vector<std::string_view> seeds = {
+      std::string_view(Position::START_POS_FEN),
+      "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+      "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+      "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+      "4k3/1pP1p1P1/8/pP1p1p2/P1p1P1p1/2P5/5P1P/4K3 w - - 0 1",
+      // Pawns and kings only: nearly every noisy move is a pawn capture, every
+      // pawn can still double-push past an enemy pawn, and the files run all the
+      // way to the last rank. This is the seed that supplies most of the en
+      // passant captures and most of the promotions.
+      "4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
+      "4k3/1p1p1p1p/8/p1p1p1p1/P1P1P1P1/8/1P1P1P1P/4K3 w - - 0 1",
+  };
+
   std::mt19937 rng(20240917);
 
-  int captures_checked = 0;
-  int disagreements = 0;
+  SeeAgreement totals;
 
-  for (int game = 0; game < 60 && disagreements == 0; ++game) {
-    Position pos = Position::startpos();
-    const int plies = 4 + static_cast<int>(rng() % 70);
-
-    for (int ply = 0; ply < plies; ++ply) {
-      const auto moves = legal_moves(pos);
-      if (moves.empty()) {
-        break;
-      }
-
-      for (const auto& noisy : pseudo_legal_noisy_moves(pos)) {
-        ++captures_checked;
-        const int actual = search::detail::see(pos, noisy);
-        const int expected = reference_see(pos, noisy);
-        if (actual != expected) {
-          ++disagreements;
-          ADD_FAILURE() << "see disagreed on " << to_uci(noisy) << " in " << pos.to_fen()
-                        << ": got " << actual << ", reference says " << expected;
-          break;
-        }
-      }
-
-      pos.make_move(moves[rng() % moves.size()]);
+  for (const auto& seed : seeds) {
+    for (int game = 0; game < 45 && totals.agreed; ++game) {
+      totals.add(compare_see_over_one_random_game(seed, rng));
     }
   }
 
+  const int captures_checked = totals.captures;
+  const int en_passant_checked = totals.en_passant;
+  const int promotions_checked = totals.promotions;
+
   // A test that checked nothing would also report no disagreements.
-  EXPECT_GT(captures_checked, 2000) << "the generated games must actually contain captures";
+  EXPECT_GT(captures_checked, 5000) << "the generated games must actually contain captures";
+  EXPECT_GT(en_passant_checked, 50) << "en passant is the case the occupancy mask is subtlest "
+                                       "about, and it has to be reached often enough to matter";
+  EXPECT_GT(promotions_checked, 200) << "promotions change what stands on the square, which is the "
+                                        "other thing the mask has to get right";
 }
 
 // Quiescence -------------------------------------------------------------------
