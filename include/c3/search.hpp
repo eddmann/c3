@@ -98,6 +98,12 @@
 //      trying first, so it is searched one ply shallower and the move it finds
 //      is left in the table for the next iteration to order by.
 //
+//  15. CHECK EXTENSIONS, WITH A BUDGET
+//      A node that runs out of depth while in check is given a ply back, so a
+//      forcing line is seen to its end rather than evaluated in the middle. A
+//      per-path budget stops a perpetual check from buying plies for ever;
+//      past it, quiescence answers the check instead.
+//
 // WHERE THE SEARCH'S WORKING STORAGE LIVES
 // Not on the stack. The recursion is up to 255 frames deep and each frame
 // would otherwise hold several two-kilobyte move lists, which overflows the
@@ -151,7 +157,19 @@ inline constexpr std::size_t TT_DEFAULT_SIZE_MB = 64;
 // check extension, which resets depth to 1 and can therefore go on for as long
 // as the checks do. So the ceiling is checked explicitly, in alphabeta(), and
 // a node that has reached it answers with quiescence instead of recursing.
+//
+// The ceiling is the last line of defence, not the working limit: a separate
+// budget caps how many check extensions any one PATH may take (see CAPPING THE
+// CHECK EXTENSION in search.cpp), so a perpetual check stops buying plies long
+// before it could reach ply 255.
 // ---------------------------------------------------------------------------
+
+// How many check extensions ONE PATH may take before a node in check resolves
+// with quiescence instead of buying another ply. The extension is the only
+// place the recursion does not spend depth, so without a bound a line of checks
+// can grow until the ply ceiling stops it. See CAPPING THE CHECK EXTENSION in
+// search.cpp for why four, and for what the cap deliberately does not buy.
+inline constexpr std::uint8_t MAX_CHECK_EXTENSIONS = 4;
 
 struct Report {
   std::uint8_t depth{0};
@@ -160,6 +178,13 @@ struct Report {
   // would report and what the ply ceiling is asserted against. It only ever
   // grows, so it survives the recursion unwinding back to the root.
   std::uint8_t max_ply{0};
+
+  // The longest run of check extensions any single path took. It exists to be
+  // asserted against MAX_CHECK_EXTENSIONS—the cap has no other visible effect,
+  // since a node that stops extending hands its position to quiescence rather
+  // than disappearing—and it says how close a search came to the bound.
+  std::uint8_t max_check_extensions{0};
+
   std::uint64_t nodes{0};
   std::optional<std::pair<MoveList, int>> pv{};
   std::pair<std::size_t, std::size_t> tt_stats{0, 0};
@@ -652,6 +677,14 @@ struct PlyScratch {
   MoveScratch ordering;
   MoveList pv;
   std::array<Move, MAX_PENALISED_QUIETS> searched_quiets{};
+
+  // How many check extensions the line from the root down to and including a
+  // node at this ply has taken. A node writes its own total here before it
+  // recurses, and its children read the row one ply up to find out what the
+  // path above them has already spent. Being per-ply is what makes it a
+  // property of the PATH rather than of the search: two sibling lines each get
+  // their own count, and a line that unwinds gives its extensions back.
+  std::uint8_t check_extensions{0};
 };
 
 class SearchContext {
@@ -690,6 +723,12 @@ public:
   // changes is where the search spends its depth. Nothing on the UCI path
   // writes it.
   bool internal_iterative_reduction_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason. The cap on check extensions only
+  // decides how long a forcing line may keep buying plies, so what it changes
+  // is the size of the tree under a position full of checks. Nothing on the UCI
+  // path writes it.
+  bool check_extension_cap_enabled{true};
 
   // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
   // the underpromotion filter in quiescence all change how much work is done

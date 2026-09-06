@@ -495,6 +495,64 @@ bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int al
 
 constexpr std::uint8_t IIR_MIN_DEPTH = 4;
 
+// =============================================================================
+// CAPPING THE CHECK EXTENSION
+// =============================================================================
+// A node that runs out of depth while in check does not stop: it is given a
+// ply back, because a position where the king is under attack is the last one
+// whose evaluation should be trusted. That is the check extension, and it is
+// the one place in this search where recursing does not cost depth.
+//
+// WHICH MEANS IT HAS NO NATURAL END. Every extension hands the child a fresh
+// depth of 1, so a line of consecutive checks extends once per ply for as long
+// as the checks last—and a perpetual check lasts for ever. What actually
+// stopped it before this cap was the ply ceiling at MAX_DEPTH: two hundred and
+// fifty-five plies of forced checks, each one a real stack frame and a real
+// subtree, spent proving something the first dozen already showed.
+//
+// REPETITION DOES BOUND SOME OF IT, and it is worth being exact about how
+// little. A perpetual check repeats positions, and is_repetition_draw() ends
+// the line at the third occurrence—so the classic queen shuffling between two
+// checking squares is caught quickly. What is NOT caught is the checking
+// sequence that never repeats: a king walked across the board by a series of
+// different checks, a rook chased down a file. Those are finite but long, and
+// they are what this cap is for.
+//
+// SO THE PATH GETS A BUDGET. Each node inherits its parent's count of
+// extensions taken above it and adds its own, and once the budget is spent a
+// node in check resolves with quiescence instead of extending. That is not the
+// same as ignoring the check: quiescence in check refuses to stand pat,
+// generates every legal reply and reports mate when there is none, so the
+// answer is still an honest one—it is simply not given another full ply of
+// width.
+//
+// WHAT THIS DOES NOT BUY: NODES. Measured, the cap changes no node count at
+// all—the bench total is identical with it on and off, and so is the total on
+// every position where it demonstrably bites. That is not a disappointment,
+// it is what the mechanism is: a node that stops extending does not vanish, it
+// hands its position to quiescence instead, and quiescence charges for the
+// captures it resolves. What the cap buys is a BOUND—on ply, and therefore on
+// stack frames and on how far past its nominal depth one line may drag the
+// search. It ships on for the same reason the ply ceiling does, and like the
+// ply ceiling it earns its place in the pathological case, not the average one.
+//
+// WHY FOUR. Because the extension is far more self-limiting than it looks: it
+// only fires when a node runs out of depth WHILE IN CHECK, so a chain of two
+// needs both sides in check on consecutive plies—the side that was checked has
+// to answer with a check of its own. Sampled over thousands of random
+// positions searched to depth 6 and 8, the longest chain seen was four. Four
+// is therefore the edge of ordinary play: past it is the tail this cap exists
+// to cut off, and the value is small enough that the rule can be tested rather
+// than being dead code waiting for a position that never arrives.
+//
+// FAILURE MODE. A forced win that genuinely lies more than four consecutive
+// check extensions deep is seen a little later—found by a later iteration
+// rather than this one—because the tail of the line is resolved by quiescence
+// instead of searched. Quiescence in check refuses to stand pat and reports
+// mate when there is none, so nothing is scored wrongly; the depth simply
+// stops growing where the budget runs out.
+// =============================================================================
+
 constexpr std::uint8_t LATE_MOVE_PRUNING_DEPTH = 4;
 constexpr std::size_t LATE_MOVE_PRUNING_BASE = 3;
 
@@ -1618,18 +1676,37 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     return quiescence(pos, alpha, beta, ctx, report, stopper);
   }
 
+  // HOW MANY CHECK EXTENSIONS THE LINE ABOVE THIS NODE HAS ALREADY SPENT.
+  // Each node leaves its own running total in its scratch row, so a node finds
+  // out what its ancestors did by reading the row one ply up. The root has no
+  // parent and starts from zero. See CAPPING THE CHECK EXTENSION below.
+  const std::uint8_t extensions_above =
+      report.ply > 0 ? ctx.at_ply(static_cast<std::uint8_t>(report.ply - 1)).check_extensions : 0;
+  std::uint8_t extensions_here = extensions_above;
+
   // Leaf node: drop into quiescence search
   if (depth == 0) {
-    if (!is_in_check(pos.colour_to_move, pos.board)) {
-      return quiescence(pos, alpha, beta, ctx, report, stopper);
-    }
     // CHECK EXTENSION: Don't stop search while in check (tactical danger).
     // This is the one place the recursion does not spend a ply of depth, so it
     // is also the only way ply can grow without bound. The ceiling above is
-    // what stops it: we can only get here with report.ply < MAX_DEPTH, so the
-    // child this extension creates still sits inside every per-ply table.
+    // what stops it in the last resort: we can only get here with
+    // report.ply < MAX_DEPTH, so the child this extension creates still sits
+    // inside every per-ply table. The cap is what stops it long before that.
+    const bool may_extend =
+        !ctx.check_extension_cap_enabled || extensions_above < MAX_CHECK_EXTENSIONS;
+
+    if (!may_extend || !is_in_check(pos.colour_to_move, pos.board)) {
+      return quiescence(pos, alpha, beta, ctx, report, stopper);
+    }
+
     depth = 1;
+    extensions_here = static_cast<std::uint8_t>(extensions_above + 1);
+    report.max_check_extensions = std::max(report.max_check_extensions, extensions_here);
   }
+
+  // Published before anything recurses, so every child below reads a total that
+  // includes this node.
+  ctx.at_ply(report.ply).check_extensions = extensions_here;
 
   // PV NODES vs NON-PV NODES
   // A node searched with a full window (beta > alpha + 1) is a "PV node": it

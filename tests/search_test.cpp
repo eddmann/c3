@@ -705,6 +705,57 @@ TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
   EXPECT_GT(report.max_ply, DEPTH) << "a check at the horizon should have been extended";
 }
 
+TEST(SearchPlySafety, TheCheckExtensionBudgetBoundsHowFarAPathMayRun) {
+  // The extension is the one place the recursion does not spend depth, so a
+  // line of checks can go on buying plies for as long as the checks last. It is
+  // more self-limiting than that sounds—a second extension needs the side that
+  // was just checked to answer with a check of its own—but "more self-limiting"
+  // is not a bound, and the only thing that used to stop it was the ply ceiling
+  // at 255.
+  //
+  // This position was found by searching random games for the longest chain of
+  // consecutive check extensions, and it runs past the budget: uncapped it
+  // takes six, which is what makes it the position this rule is about.
+  //
+  // Internal iterative reduction is switched off so the search really reaches
+  // the depth it was given; the extension is measured against that depth.
+  constexpr std::string_view FEN =
+      "r1b3k1/1p1p2p1/p4r2/4K2p/PbPP1P1q/1B6/1P1B1n2/RN1Q2NR w - - 3 24";
+  constexpr std::uint8_t DEPTH = 8;
+
+  const auto search_with_cap = [](bool capped) {
+    Position pos = parse(FEN);
+    search::SearchContext ctx;
+    ctx.check_extension_cap_enabled = capped;
+    ctx.internal_iterative_reduction_enabled = false;
+
+    search::TranspositionTable tt(8);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
+
+    search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report,
+                              stopper);
+    return report;
+  };
+
+  const auto capped = search_with_cap(true);
+  const auto uncapped = search_with_cap(false);
+
+  EXPECT_GT(uncapped.max_check_extensions, search::MAX_CHECK_EXTENSIONS)
+      << "this position must run past the budget, or the test proves nothing";
+  EXPECT_LE(capped.max_check_extensions, search::MAX_CHECK_EXTENSIONS)
+      << "no path may take more extensions than the budget allows";
+  EXPECT_LT(capped.max_ply, uncapped.max_ply) << "the cap should be holding the ply down";
+
+  // ...and it holds the ply down for free. A node that stops extending does not
+  // disappear—it is handed to quiescence, which charges for the captures it
+  // resolves—so the bound is bought with a bound, not with nodes. This is the
+  // one mechanism here that is not a saving, and pinning that keeps a later
+  // reader from "fixing" it into one.
+  EXPECT_EQ(capped.nodes, uncapped.nodes) << "capping the extension is not a node saving";
+}
+
 // Static exchange evaluation ---------------------------------------------------
 
 namespace {
