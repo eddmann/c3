@@ -397,10 +397,47 @@ bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int al
 // ranks last are usually as bad as they look, and it is a bet that pays.
 // =============================================================================
 
+constexpr std::uint8_t LMR_MIN_DEPTH = 3;
+
+// How many moves at the front of a node's list are searched at full depth. The
+// name says what the number IS rather than where it is compared: the first
+// three moves searched are never reduced, so the fourth is the first that can
+// be. Spelling it as a minimum move number invited the off-by-one of reading it
+// as "the first reduced move is number 3".
+constexpr std::size_t LMR_UNREDUCED_MOVES = 3;
+
+constexpr double LMR_BASE = 0.75;
+constexpr double LMR_DIVISOR = 2.25;
+
+// The table is consulted with clamped indices, so these bound the arithmetic,
+// not the search: beyond them the reduction simply stops growing.
+constexpr std::size_t LMR_TABLE_DEPTHS = 64;
+constexpr std::size_t LMR_TABLE_MOVES = 64;
+
+// Logarithms are not constexpr in this standard, so the table is filled once at
+// start-up rather than at compile time. It is read-only from then on.
+struct LmrTable {
+  std::array<std::array<std::uint8_t, LMR_TABLE_MOVES>, LMR_TABLE_DEPTHS> reductions{};
+
+  LmrTable() {
+    for (std::size_t depth = 1; depth < LMR_TABLE_DEPTHS; ++depth) {
+      for (std::size_t move_number = 1; move_number < LMR_TABLE_MOVES; ++move_number) {
+        const double reduction =
+            LMR_BASE + (std::log(static_cast<double>(depth)) *
+                        std::log(static_cast<double>(move_number)) / LMR_DIVISOR);
+        reductions[depth][move_number] =
+            static_cast<std::uint8_t>(std::max(0.0, std::floor(reduction)));
+      }
+    }
+  }
+};
+
+const LmrTable LMR_TABLE;
+
 // =============================================================================
 // LATE MOVE PRUNING (move-count pruning)
 // =============================================================================
-// Late move reductions below say "a quiet move ordering ranked near the back
+// Late move reductions above say "a quiet move ordering ranked near the back
 // gets less depth". Late move pruning says the blunter thing: near the horizon,
 // once a node has searched enough quiet moves, the rest are not searched at
 // all. No reduced search, no verification, no re-search—they are simply gone.
@@ -438,6 +475,14 @@ bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int al
 // catches it—and pruning does not: the move is not searched, so nothing can
 // contradict it. That is why the count is generous and the depth is small.
 // =============================================================================
+
+constexpr std::uint8_t LATE_MOVE_PRUNING_DEPTH = 4;
+constexpr std::size_t LATE_MOVE_PRUNING_BASE = 3;
+
+std::size_t late_move_pruning_threshold(std::uint8_t depth) {
+  const std::size_t plies = depth;
+  return LATE_MOVE_PRUNING_BASE + (plies * plies);
+}
 
 // =============================================================================
 // INTERNAL ITERATIVE REDUCTION (IIR)
@@ -551,51 +596,6 @@ constexpr std::uint8_t IIR_MIN_DEPTH = 4;
 // mate when there is none, so nothing is scored wrongly; the depth simply
 // stops growing where the budget runs out.
 // =============================================================================
-
-constexpr std::uint8_t LATE_MOVE_PRUNING_DEPTH = 4;
-constexpr std::size_t LATE_MOVE_PRUNING_BASE = 3;
-
-std::size_t late_move_pruning_threshold(std::uint8_t depth) {
-  const std::size_t plies = depth;
-  return LATE_MOVE_PRUNING_BASE + (plies * plies);
-}
-
-constexpr std::uint8_t LMR_MIN_DEPTH = 3;
-
-// How many moves at the front of a node's list are searched at full depth. The
-// name says what the number IS rather than where it is compared: the first
-// three moves searched are never reduced, so the fourth is the first that can
-// be. Spelling it as a minimum move number invited the off-by-one of reading it
-// as "the first reduced move is number 3".
-constexpr std::size_t LMR_UNREDUCED_MOVES = 3;
-
-constexpr double LMR_BASE = 0.75;
-constexpr double LMR_DIVISOR = 2.25;
-
-// The table is consulted with clamped indices, so these bound the arithmetic,
-// not the search: beyond them the reduction simply stops growing.
-constexpr std::size_t LMR_TABLE_DEPTHS = 64;
-constexpr std::size_t LMR_TABLE_MOVES = 64;
-
-// Logarithms are not constexpr in this standard, so the table is filled once at
-// start-up rather than at compile time. It is read-only from then on.
-struct LmrTable {
-  std::array<std::array<std::uint8_t, LMR_TABLE_MOVES>, LMR_TABLE_DEPTHS> reductions{};
-
-  LmrTable() {
-    for (std::size_t depth = 1; depth < LMR_TABLE_DEPTHS; ++depth) {
-      for (std::size_t move_number = 1; move_number < LMR_TABLE_MOVES; ++move_number) {
-        const double reduction =
-            LMR_BASE + (std::log(static_cast<double>(depth)) *
-                        std::log(static_cast<double>(move_number)) / LMR_DIVISOR);
-        reductions[depth][move_number] =
-            static_cast<std::uint8_t>(std::max(0.0, std::floor(reduction)));
-      }
-    }
-  }
-};
-
-const LmrTable LMR_TABLE;
 
 } // namespace
 
