@@ -407,8 +407,8 @@ bool is_in_check(Colour colour, const Board& board) {
   return is_attacked(Square::first_occupied(king_bb), !colour, board);
 }
 
-MoveList pseudo_legal_moves(const Position& pos) {
-  MoveList moves;
+void pseudo_legal_moves_into(const Position& pos, MoveList& moves) {
+  moves.clear();
 
   const Colour colour_to_move = pos.colour_to_move;
 
@@ -471,12 +471,16 @@ MoveList pseudo_legal_moves(const Position& pos) {
       });
     }
   }
+}
 
+MoveList pseudo_legal_moves(const Position& pos) {
+  MoveList moves;
+  pseudo_legal_moves_into(pos, moves);
   return moves;
 }
 
-MoveList pseudo_legal_noisy_moves(const Position& pos) {
-  MoveList moves;
+void pseudo_legal_noisy_moves_into(const Position& pos, MoveList& moves) {
+  moves.clear();
 
   const Colour colour_to_move = pos.colour_to_move;
   const Bitboard captures_mask = pos.board.pieces_by_colour(!colour_to_move);
@@ -537,7 +541,11 @@ MoveList pseudo_legal_noisy_moves(const Position& pos) {
       });
     }
   }
+}
 
+MoveList pseudo_legal_noisy_moves(const Position& pos) {
+  MoveList moves;
+  pseudo_legal_noisy_moves_into(pos, moves);
   return moves;
 }
 

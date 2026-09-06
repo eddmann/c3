@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -97,12 +98,6 @@ int history_bonus(std::uint8_t depth) {
   return std::min(HISTORY_BONUS_SCALE * d * d, HISTORY_BONUS_CAP);
 }
 
-// How many quiet moves a node remembers for the history malus. A node that has
-// searched more than this before finding a cutoff has bigger problems than the
-// exactness of its bookkeeping, and the array keeps the recursion's stack
-// frames small.
-constexpr std::size_t MAX_PENALISED_QUIETS = 32;
-
 // Check if a side has any pieces besides pawns.
 // Used in null-move pruning: don't prune in pawn-only endgames (zugzwang risk).
 bool has_non_pawn_material(const Board& board, Colour colour) {
@@ -134,6 +129,109 @@ bool has_non_pawn_material(const Board& board, Colour colour) {
 // =============================================================================
 constexpr std::array<int, 3> FUTILITY_MARGIN = {0, 100, 300}; // margins for depth 0, 1, 2
 constexpr int FUTILITY_DEPTH = 2;
+
+// =============================================================================
+// DELTA PRUNING
+// =============================================================================
+// Futility pruning's idea, moved into quiescence. There the moves all capture
+// something, so the question is not "can a quiet move help?" but "can THIS
+// capture help?", and the most optimistic answer is exactly computable: the
+// side to move keeps its stand-pat score and wins the whole victim, free.
+//
+//     stand_pat + what the capture wins + margin < alpha  ->  skip it
+//
+// If even that best case does not reach alpha, searching the capture cannot
+// change this node's score. The margin is the admission that "stand pat plus
+// the victim" is not really the ceiling—a recapture can be answered, a check
+// can follow—so two hundred centipawns of benefit of the doubt are added
+// before anything is thrown away.
+//
+// TWO EXEMPTIONS, both places where the arithmetic stops describing the
+// position:
+//   - IN CHECK. There is no stand-pat score to build on, because the side to
+//     move is not allowed to stand pat.
+//   - LATE ENDGAMES. With no pieces left beyond pawns, a single promotion is
+//     worth more than the entire margin, and a static evaluation that has not
+//     seen the pawn race is a poor thing to prune on. The classic condition,
+//     and the one place delta pruning is known to lose games.
+//
+// FAILURE MODE: like every form of pruning, this is a claim about material
+// made where material is not the point. A capture that walks into a mating net
+// or a perpetual is pruned on the grounds that it does not win enough wood.
+// =============================================================================
+constexpr int DELTA_PRUNING_MARGIN = 200;
+
+// Could this move possibly come out of the exchange behind? A capture whose
+// victim is worth at least as much as the attacker cannot: even if the capture
+// is answered immediately, the trade is even or better, so the swap list can
+// only reach zero or above. Everything else—QxP, RxN, and every non-capture
+// promotion, whose "attacker" is the pawn but which can still be answered by a
+// defender of the promotion square—has to be asked properly.
+//
+// This exists purely so that see() is not called for captures whose answer is
+// already known: it copies a whole Board and walks the exchange square by
+// square, and most captures a node looks at are the obvious good ones.
+bool may_lose_material(const Move& mv) {
+  if (!mv.captured_piece.has_value()) {
+    return true;
+  }
+
+  const int victim = PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)];
+  const int attacker = PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  return victim < attacker;
+}
+
+// What a noisy move wins at its most optimistic: the piece it takes, plus the
+// difference between the piece a promoting pawn becomes and the pawn itself.
+int optimistic_gain(const Move& mv) {
+  int gain = 0;
+  if (mv.captured_piece.has_value()) {
+    gain += PIECE_VALUES[static_cast<std::size_t>(*mv.captured_piece)];
+  }
+  if (mv.promotion_piece.has_value()) {
+    gain += PIECE_VALUES[static_cast<std::size_t>(*mv.promotion_piece)] -
+            PIECE_VALUES[static_cast<std::size_t>(mv.piece)];
+  }
+  return gain;
+}
+
+// EVERY REASON QUIESCENCE HAS FOR NOT SEARCHING A NOISY MOVE, in the order they
+// are cheapest to ask. The caller has already established that the side to move
+// is not in check, where none of these hold.
+//
+// 1. ONLY QUEEN PROMOTIONS. A promotion is generated four times over, once per
+//    piece the pawn can become, and three of those are almost always the wrong
+//    answer: if promoting is good at all, the queen is what makes it good. The
+//    capture is not lost with them—bxa8=Q takes the same rook bxa8=N would—so
+//    quiescence sees the same material either way, three times cheaper. What IS
+//    given up is the underpromotion that is brilliant for a reason material
+//    cannot see: the knight check that forks, the rook that promotes to avoid
+//    stalemating the opponent. Those are left to the main search, which
+//    generates all four and is where a tactic that subtle belongs.
+//
+// 2. DELTA PRUNING. Even winning the victim outright would not reach alpha, so
+//    the capture cannot change this node's score. See DELTA PRUNING above.
+//
+// 3. LOSING CAPTURES. The exchange on that square comes out badly however it is
+//    played, so searching it only rediscovers that. MVV-LVA cannot tell—it ranks
+//    QxP above every quiet move whether or not the pawn is defended—and this is
+//    the check it is missing. Only STRICTLY losing captures go: an even trade
+//    (SEE == 0) may still be exactly the move that resolves the position, which
+//    is what quiescence is for. may_lose_material() keeps see(), which copies a
+//    Board and walks the exchange, off the captures whose answer is already
+//    known.
+bool quiescence_skips(const Position& pos, const Move& mv, int stand_pat, int alpha,
+                      bool late_endgame) {
+  if (mv.promotion_piece.has_value() && *mv.promotion_piece != queen(pos.colour_to_move)) {
+    return true;
+  }
+
+  if (!late_endgame && stand_pat + optimistic_gain(mv) + DELTA_PRUNING_MARGIN < alpha) {
+    return true;
+  }
+
+  return may_lose_material(mv) && detail::see(pos, mv) < 0;
+}
 
 // =============================================================================
 // LATE MOVE REDUCTIONS (LMR)
@@ -174,6 +272,14 @@ constexpr int FUTILITY_DEPTH = 2;
 //     expensive: an error there changes the move we play, while an error in a
 //     zero-window node usually only costs a re-search.
 //
+// AND WHAT THE TABLE ENDS UP BELIEVING. A move that fails low after a reduced
+// search is never looked at again, so the node's score—and the upper bound it
+// writes to the transposition table—is stamped with the node's FULL depth even
+// though part of the tree behind it was searched shallower. That is the
+// standard optimism: the bound is treated as if it had been earned at full
+// depth, and a later search that trusts it inherits whatever the reduction
+// missed. It is the price of the saving, and it is why the exemptions matter.
+//
 // FAILURE MODE: TACTICAL BLINDNESS. A quiet move can be a quiet SACRIFICE
 // setup, a mating net, a zugzwang move—brilliant precisely because it looks
 // like nothing. Reduced by three plies, its refutation-or-vindication may lie
@@ -185,8 +291,12 @@ constexpr int FUTILITY_DEPTH = 2;
 
 constexpr std::uint8_t LMR_MIN_DEPTH = 3;
 
-// The first three moves searched at a node are never reduced.
-constexpr std::size_t LMR_MIN_MOVE_NUMBER = 3;
+// How many moves at the front of a node's list are searched at full depth. The
+// name says what the number IS rather than where it is compared: the first
+// three moves searched are never reduced, so the fourth is the first that can
+// be. Spelling it as a minimum move number invited the off-by-one of reading it
+// as "the first reduced move is number 3".
+constexpr std::size_t LMR_UNREDUCED_MOVES = 3;
 
 constexpr double LMR_BASE = 0.75;
 constexpr double LMR_DIVISOR = 2.25;
@@ -622,6 +732,22 @@ void CounterMoves::store(const Move& previous, const Move& refutation) {
   moves_[static_cast<std::size_t>(previous.piece)][previous.to.index()] = refutation;
 }
 
+void CounterMoves::clear() {
+  for (auto& by_piece : moves_) {
+    by_piece.fill(std::nullopt);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Search context
+// ---------------------------------------------------------------------------
+
+// The rows are allocated—and zeroed—once, here, rather than a frame at a time
+// inside the recursion. See WHY THE SCRATCH SPACE LIVES HERE in the header.
+SearchContext::SearchContext()
+    : plies_(std::make_unique<std::array<PlyScratch, MAX_DEPTH + 1>>()),
+      quiescence_(std::make_unique<std::array<MoveScratch, QUIESCENCE_MAX_DEPTH>>()) {}
+
 // ---------------------------------------------------------------------------
 // Mate score normalisation
 // ---------------------------------------------------------------------------
@@ -752,12 +878,17 @@ static_assert(HISTORY_MAX < ORDER_COUNTER_MOVE, "history must not outrank a coun
 // generation order (see select()), never scored out of bounds.
 constexpr std::size_t MAX_SCORED_MOVES = MoveList::CAPACITY;
 
+// The scores live in a row the caller owns—a SearchContext's per-ply scratch
+// during a search—rather than in this object. A quarter-kilobyte array of ints
+// is small in isolation and ruinous 255 frames deep; see WHY THE SCRATCH SPACE
+// LIVES HERE in search.hpp.
 class OrderedMoves {
 public:
   // Main search: the full priority list above.
-  OrderedMoves(MoveList& moves, const SearchContext& ctx, std::uint8_t ply,
+  OrderedMoves(MoveList& moves, std::span<int> scores, const SearchContext& ctx, std::uint8_t ply,
                const std::optional<Move>& hash_move, const std::optional<Move>& previous_move)
-      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)),
+      : moves_(moves), scores_(scores),
+        scored_(std::min({moves.size(), scores.size(), MAX_SCORED_MOVES})),
         killer1_(ctx.killers.probe(ply, 0)), killer2_(ctx.killers.probe(ply, 1)),
         counter_(previous_move.has_value() ? ctx.counters.probe(*previous_move) : std::nullopt) {
     for (std::size_t i = 0; i < scored_; ++i) {
@@ -767,8 +898,9 @@ public:
 
   // Quiescence: every move there is a capture or a promotion, so MVV-LVA is
   // the whole ordering—there are no killers or quiet moves to rank.
-  explicit OrderedMoves(MoveList& moves)
-      : moves_(moves), scored_(std::min(moves.size(), MAX_SCORED_MOVES)) {
+  OrderedMoves(MoveList& moves, std::span<int> scores)
+      : moves_(moves), scores_(scores),
+        scored_(std::min({moves.size(), scores.size(), MAX_SCORED_MOVES})) {
     for (std::size_t i = 0; i < scored_; ++i) {
       scores_[i] = noisy_move_score(moves_[i]);
     }
@@ -838,15 +970,17 @@ private:
   }
 
   MoveList& moves_;
+  // Entries [0, scored_) are written by the constructor before anything reads
+  // them, so nothing here depends on what the row held before.
+  std::span<int> scores_;
   std::size_t scored_;
   std::optional<Move> killer1_;
   std::optional<Move> killer2_;
   std::optional<Move> counter_;
-  // Deliberately left uninitialised: entries [0, scored_) are written by the
-  // constructor before anything reads them, and zeroing a kilobyte at every
-  // node would cost more than the ordering it serves.
-  std::array<int, MAX_SCORED_MOVES> scores_; // NOLINT(*-member-init)
 };
+
+static_assert(MAX_ORDERED_MOVES >= MAX_SCORED_MOVES,
+              "a scratch row must be long enough to score any move list");
 
 } // namespace
 
@@ -856,14 +990,17 @@ void detail::order_moves(MoveList& moves, const SearchContext& ctx, std::uint8_t
   // The eager form: run the lazy selection all the way to the end. The search
   // itself never calls this—it asks for one move at a time and usually stops
   // after the first—but "the whole list, in order" is what a test can read.
-  OrderedMoves ordering(moves, ctx, ply, hash_move, previous_move);
+  // Its score row is a local because nothing recursive calls this.
+  std::array<int, MAX_ORDERED_MOVES> scores{};
+  OrderedMoves ordering(moves, scores, ctx, ply, hash_move, previous_move);
   for (std::size_t i = 0; i < moves.size(); ++i) {
     ordering.select(i);
   }
 }
 
 void detail::order_quiescence_moves(MoveList& moves) {
-  OrderedMoves ordering(moves);
+  std::array<int, MAX_ORDERED_MOVES> scores{};
+  OrderedMoves ordering(moves, scores);
   for (std::size_t i = 0; i < moves.size(); ++i) {
     ordering.select(i);
   }
@@ -885,6 +1022,155 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 }
 
 // ---------------------------------------------------------------------------
+// STATIC EXCHANGE EVALUATION
+// ---------------------------------------------------------------------------
+// The swap list. Capturing on a square starts an argument: I take, you take
+// back with your cheapest piece, I take back with mine, and so on until one
+// side runs out of attackers or decides it would rather stop. see() plays that
+// argument out on a private copy of the board and reports what the side that
+// started it ends up with.
+//
+// TWO PASSES. Forward, we record what each capture wins if it happens:
+// gain[d] = value of the piece standing on the square - gain[d - 1]. Backward,
+// we let each side refuse: nobody is obliged to recapture, so
+// gain[d - 1] = -max(-gain[d - 1], gain[d]) turns the list of "if everyone
+// captures" numbers into "what actually happens when both sides play sensibly".
+// The forward pass also stops early once neither side can profit from
+// continuing, which is the same decision made one step sooner.
+//
+// CHEAPEST ATTACKER FIRST is not a heuristic here, it is the rule: recapturing
+// with the queen when a pawn could do it hands the opponent a better trade, so
+// the least valuable attacker is always the right one to use.
+//
+// X-RAYS COME FREE. Pieces are physically removed from the board copy as they
+// capture, so a queen sitting behind a rook on the same file simply appears in
+// the next get_attackers() call. That is why this works on a Board rather than
+// on a precomputed set of attackers, and it is what makes a battery score the
+// way a human would read it.
+//
+// WHAT THE BOARD COPY COSTS, AND THE VERSION THAT WOULD NOT PAY IT. A Board is
+// 272 bytes and every put_piece/remove_piece on it also updates the evaluation
+// accumulator—the running material, piece-square and phase totals—which SEE
+// never reads. So each swap pays for bookkeeping it throws away. The version
+// that does not is a bitboard-only SEE: keep a shrinking occupancy mask instead
+// of a Board, clear the capturing square's bit, and re-detect the slider x-rays
+// by intersecting the target's rook and bishop rays with what is left. It needs
+// attack helpers that take an occupancy rather than a Board, which movegen does
+// not export today; measured against this version it is worth roughly 15-20% of
+// nps, and it is the obvious follow-up rather than something this change should
+// smuggle in.
+//
+// See the header for what SEE deliberately does not know—pins, most of all.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The king is worth more than everything else on the board put together, so
+// that "the king is the cheapest attacker left" can never look like a bargain.
+// The other values are the plain middlegame ones the ordering already uses.
+constexpr int SEE_KING_VALUE = 10'000;
+
+int see_value(Piece piece) {
+  return is_king(piece) ? SEE_KING_VALUE : PIECE_VALUES[static_cast<std::size_t>(piece)];
+}
+
+// One exchange per piece that can reach the square, and there are 32 pieces.
+constexpr std::size_t SEE_MAX_SWAPS = 32;
+
+// pieces_for() lists a colour's pieces in ascending value—pawn, knight, bishop,
+// rook, queen, king—so the first one that appears among the attackers is the
+// cheapest.
+std::optional<Piece> least_valuable_attacker(Bitboard attackers, Colour side, const Board& board) {
+  for (const auto piece : pieces_for(side)) {
+    if ((attackers & board.pieces(piece)) != 0) {
+      return piece;
+    }
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
+int detail::see(const Position& pos, const Move& mv) {
+  // Nothing changes hands, so there is no exchange to evaluate.
+  if (is_quiet(mv)) {
+    return 0;
+  }
+
+  const Square target = mv.to;
+  Board board = pos.board;
+
+  std::array<int, SEE_MAX_SWAPS> gain{};
+
+  // What the move itself wins: whatever it captured, plus—if it promotes—the
+  // difference between the piece the pawn becomes and the pawn it was.
+  const int promotion_gain =
+      mv.promotion_piece.has_value() ? see_value(*mv.promotion_piece) - see_value(mv.piece) : 0;
+  gain[0] = (mv.captured_piece.has_value() ? see_value(*mv.captured_piece) : 0) + promotion_gain;
+
+  // Play the move on the copy. capture_square() is the target for an ordinary
+  // capture and the square behind it for en passant, which is exactly the
+  // distinction that decides which piece leaves the board.
+  if (const auto captured_square = mv.capture_square()) {
+    board.remove_piece(*captured_square);
+  }
+  board.remove_piece(mv.from);
+  Piece occupier = mv.promotion_piece.value_or(mv.piece);
+  board.put_piece(occupier, target);
+
+  Colour side = !colour(mv.piece);
+  std::size_t depth = 0;
+
+  while (true) {
+    const Bitboard attackers = get_attackers(target, side, board);
+    const auto attacker = least_valuable_attacker(attackers, side, board);
+    if (!attacker.has_value()) {
+      break;
+    }
+
+    // A king may only capture on a square the other side no longer defends, so
+    // if anything still defends it the exchange stops here rather than ending
+    // in an illegal move. (Read from the board as it stands, which misses the
+    // rare defender that only appears once the king leaves its own square.)
+    if (is_king(*attacker) && get_attackers(target, !side, board) != 0) {
+      break;
+    }
+
+    if (depth + 1 >= SEE_MAX_SWAPS) {
+      break;
+    }
+    ++depth;
+
+    // What this capture wins, assuming it happens: the piece standing on the
+    // square, less whatever the previous capture had already banked.
+    gain[depth] = see_value(occupier) - gain[depth - 1];
+
+    // Neither side can profit from carrying on—the one to move here would
+    // rather stop, and so would the one before it. Everything past this point
+    // would be refused by the backward pass anyway.
+    if (std::max(-gain[depth - 1], gain[depth]) < 0) {
+      break;
+    }
+
+    const Square from = Square::first_occupied(attackers & board.pieces(*attacker));
+    board.remove_piece(target);
+    board.remove_piece(from);
+    board.put_piece(*attacker, target);
+    occupier = *attacker;
+    side = !side;
+  }
+
+  // Backward pass: at every step the side to move may decline the recapture, so
+  // it takes the better of "stop here" and "carry on".
+  while (depth > 0) {
+    gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
+    --depth;
+  }
+
+  return gain[0];
+}
+
+// ---------------------------------------------------------------------------
 // QUIESCENCE SEARCH
 // ---------------------------------------------------------------------------
 // Problem: If we evaluate a position at the search horizon, we might miss
@@ -898,6 +1184,19 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // move can always "stand pat" (decline to capture) if no capture improves the
 // position. This prevents quiescence from searching forever.
 //
+// EXCEPT IN CHECK, WHERE STANDING PAT IS A LIE
+// "I do not have to capture" is the one claim a side in check cannot make: it
+// must answer the check or the game is over. A quiescence node that stands pat
+// in check therefore reports the static evaluation of a position the side to
+// move may not be allowed to keep—and the position it is hiding may be
+// checkmate, which no material count resembles. So in check quiescence takes
+// no stand-pat score at all, generates every legal reply rather than only the
+// captures (blocking and king moves are usually the only answers there are),
+// and returns a mate score if none of them is legal. That makes a check node
+// behave like a small alpha-beta node inside quiescence, which is what it is:
+// the position is not quiet, and pretending otherwise is how an engine walks
+// into a mate that was one ply past its horizon.
+//
 // QUIESCENCE MUST ASK THE STOPPER TOO
 // "Until the position is quiet" is not a bound anybody set. A middlegame with
 // both sides' pieces contesting the same squares can spend thousands of nodes
@@ -909,9 +1208,31 @@ std::uint8_t detail::lmr_reduction(std::uint8_t depth, std::size_t move_number, 
 // Stopper makes sure that score is discarded rather than stored.
 // ---------------------------------------------------------------------------
 
-int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper& stopper) {
+int detail::quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, Report& report,
+                       const Stopper& stopper, std::size_t quiescence_depth) {
   if (stopper.should_stop(report)) {
     return 0;
+  }
+
+  // THE QUIESCENCE DEPTH CAP
+  // "Search captures until the position is quiet" is a promise with no bound in
+  // it. In practice the bound is the board itself—every recursion has to find
+  // another capture or promotion, and there are only so many pieces to trade—
+  // but "in practice" is not a guarantee, and this recursion holds a move list
+  // per level. Past the cap we stop resolving. See QUIESCENCE_MAX_DEPTH.
+  //
+  // WHAT WE RETURN THERE depends on the same thing everything else in this
+  // function depends on. Out of check, the static evaluation is what a quiet
+  // position would have returned anyway, so it is the honest answer. IN check
+  // it is not: it is the stand-pat this function refuses to take everywhere
+  // else, and returning it here would put the hole back at the one depth
+  // nobody looks at. So a check at the cap fails low instead—alpha is a bound
+  // we are entitled to, it claims nothing about a position we did not resolve,
+  // and the worst it can do is make this node look no better than it already
+  // did. (Reaching the cap in check needs sixty-four consecutive
+  // capture-or-check plies; the branch is insurance, not a hot path.)
+  if (quiescence_depth >= QUIESCENCE_MAX_DEPTH) {
+    return is_in_check(pos.colour_to_move, pos.board) ? alpha : eval(pos);
   }
 
   // THIS position has already been counted—by the alphabeta leaf that handed
@@ -919,25 +1240,64 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
   // decides to visit instead, which keeps every position worth exactly one
   // node whichever of the two searches resolves it.
 
-  // Stand-pat: static evaluation as the fallback
-  const int stand_pat = eval(pos);
+  const Colour colour_to_move = pos.colour_to_move;
+  const bool in_check = is_in_check(colour_to_move, pos.board);
 
-  // Beta cutoff: position is already too good, opponent won't allow this
-  if (stand_pat >= beta) {
-    return beta;
+  int stand_pat = 0;
+
+  if (!in_check) {
+    // Stand-pat: static evaluation as the fallback
+    stand_pat = eval(pos);
+
+    // Beta cutoff: position is already too good, opponent won't allow this
+    if (stand_pat >= beta) {
+      return beta;
+    }
+
+    // Update alpha: we can always achieve at least the stand-pat score
+    alpha = std::max(alpha, stand_pat);
   }
 
-  // Update alpha: we can always achieve at least the stand-pat score
-  alpha = std::max(alpha, stand_pat);
+  // Delta pruning is arithmetic about material, and in a position where the
+  // only material left is pawns a promotion outweighs the whole margin. See
+  // DELTA PRUNING for why this is where it is switched off.
+  const bool late_endgame = !has_non_pawn_material(pos.board, colour_to_move);
 
-  const Colour colour_to_move = pos.colour_to_move;
+  // Everything below is a bet that a capture cannot matter; a check makes every
+  // move matter, so none of it applies there.
+  const bool prune = ctx.quiescence_pruning_enabled && !in_check;
 
-  // Only search noisy moves (captures and promotions)
-  MoveList moves = pseudo_legal_noisy_moves(pos);
-  OrderedMoves ordering(moves);
+  // Normally only the noisy moves (captures and promotions); in check, every
+  // legal reply, because the check has to be answered and the answer is often a
+  // quiet block or a king step.
+  //
+  // The list and its ordering scores are the context's row for this quiescence
+  // depth, and generation writes STRAIGHT INTO that row: taking the returning
+  // form and assigning it would put a two-kilobyte MoveList temporary in this
+  // frame, which is exactly the cost the rows exist to avoid. See
+  // pseudo_legal_moves_into() in movegen.hpp.
+  //
+  // Ordering is MVV-LVA either way. Among evasions that means capturing the
+  // checker is tried first, which is usually right; the quiet evasions—blocks
+  // and king steps—all score 0 under noisy_move_score, so they tie with each
+  // other and select() hands them over in generation order.
+  MoveScratch& scratch = ctx.at_quiescence_depth(quiescence_depth);
+  MoveList& moves = scratch.moves;
+  if (in_check) {
+    pseudo_legal_moves_into(pos, moves);
+  } else {
+    pseudo_legal_noisy_moves_into(pos, moves);
+  }
+  OrderedMoves ordering(moves, scratch.scores);
+
+  std::size_t legal_moves = 0;
 
   for (std::size_t i = 0; i < moves.size(); ++i) {
     const Move mv = ordering.select(i);
+
+    if (prune && quiescence_skips(pos, mv, stand_pat, alpha, late_endgame)) {
+      continue;
+    }
 
     pos.make_move(mv);
 
@@ -947,12 +1307,14 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
       continue;
     }
 
+    ++legal_moves;
+
     // The child is a position we are about to enter and decide, so it is
     // counted here—the callee will not count itself.
     report.nodes += 1;
 
     // Negamax: negate score and swap alpha/beta
-    const int score = -quiescence(pos, -beta, -alpha, report, stopper);
+    const int score = -quiescence(pos, -beta, -alpha, ctx, report, stopper, quiescence_depth + 1);
 
     pos.unmake_move(mv);
 
@@ -960,6 +1322,25 @@ int quiescence(Position& pos, int alpha, int beta, Report& report, const Stopper
       return beta; // Beta cutoff
     }
     alpha = std::max(alpha, score);
+  }
+
+  // In check with nothing legal to play is checkmate, and it is only reachable
+  // here because the in-check branch generated ALL the moves: with captures
+  // alone an empty list would mean "quiet", not "over". Stalemate cannot land
+  // here—a side with no legal move and no check is not in check by definition.
+  //
+  // The distance is counted from the root, so it is the alphabeta ply this
+  // quiescence started from plus however deep into quiescence we now are—and
+  // that sum is clamped to MAX_DEPTH, because the two are bounded separately
+  // (255 plies and 64 quiescence levels) and nothing stops them adding up past
+  // either. CENTIPAWN_MATE_THRESHOLD is CENTIPAWN_MATE - 255, so a distance of
+  // 256 would produce a "mate" score BELOW the threshold: it would stop being
+  // recognised as a mate at all, and would be read as an ordinary evaluation of
+  // about -97 pawns. Clamping costs only the exactness of a mate distance no
+  // search can reach anyway; not clamping loses the mate.
+  if (in_check && legal_moves == 0) {
+    const int distance = static_cast<int>(report.ply) + static_cast<int>(quiescence_depth);
+    return -CENTIPAWN_MATE + std::min(distance, static_cast<int>(MAX_DEPTH));
   }
 
   return alpha;
@@ -1005,18 +1386,34 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // counted here and quiescence does not count itself, so every position costs
   // exactly one node no matter which of the two searches resolves it.
   report.nodes += 1;
+  report.max_ply = std::max(report.max_ply, report.ply);
 
   // Draw detection: 50-move rule or threefold repetition
   if (pos.is_fifty_move_draw() || pos.is_repetition_draw(report.ply)) {
     return CENTIPAWN_DRAW;
   }
 
+  // THE PLY CEILING
+  // Everything indexed by ply—killers, and this context's per-ply scratch
+  // rows—has exactly MAX_DEPTH + 1 rows, and report.ply is a single byte, so
+  // recursing from here would wrap round to ply 0 and start overwriting the
+  // root's own tables. Quiescence still resolves the captures, so the answer
+  // is a real one; it simply stops growing the tree in a direction that has
+  // nowhere left to go. See THE PLY CEILING in search.hpp.
+  if (report.ply >= MAX_DEPTH) {
+    return quiescence(pos, alpha, beta, ctx, report, stopper);
+  }
+
   // Leaf node: drop into quiescence search
   if (depth == 0) {
     if (!is_in_check(pos.colour_to_move, pos.board)) {
-      return quiescence(pos, alpha, beta, report, stopper);
+      return quiescence(pos, alpha, beta, ctx, report, stopper);
     }
-    // CHECK EXTENSION: Don't stop search while in check (tactical danger)
+    // CHECK EXTENSION: Don't stop search while in check (tactical danger).
+    // This is the one place the recursion does not spend a ply of depth, so it
+    // is also the only way ply can grow without bound. The ceiling above is
+    // what stops it: we can only get here with report.ply < MAX_DEPTH, so the
+    // child this extension creates still sits inside every per-ply table.
     depth = 1;
   }
 
@@ -1027,6 +1424,12 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // zero window (beta == alpha + 1) is a non-PV node; it only ever answers
   // "better or worse than alpha?", so it has no line to report.
   const bool is_pv_node = beta - alpha > 1;
+
+  // report.ply moves up and down around every child call below, so this node's
+  // own ply is named once here: it is what the scratch rows are indexed by, and
+  // what mate distances and killer slots are measured in.
+  const std::uint8_t ply = report.ply;
+  PlyScratch& scratch = ctx.at_ply(ply);
 
   std::uint16_t hash_move_packed = TT_NO_MOVE;
 
@@ -1041,7 +1444,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     // rely on. So PV nodes pay for the search and keep their line; they still
     // get the hash move below, which is where most of the speed came from.
     if (!is_pv_node && entry->depth >= depth) {
-      const int tt_eval = eval_out(entry->score, report.ply);
+      const int tt_eval = eval_out(entry->score, ply);
 
       switch (entry->bound()) {
       case Bound::Exact:
@@ -1083,12 +1486,15 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     report.ply += 1;
 
     const int r = depth > 6 ? 3 : 2; // Deeper positions allow more reduction
-    MoveList scratch;
     // Zero-window search: just checking if score >= beta
     // No previous move to answer: we did not make one. A counter-move keyed by
     // the opponent's last real move would be answering the wrong question.
+    // The line it produces is thrown away—a zero window proves "better or worse
+    // than beta" and nothing else—so it is written into the child's own row and
+    // never read.
     const int null_eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - r - 1), -beta,
-                                     -beta + 1, scratch, tt, ctx, report, stopper, std::nullopt);
+                                     -beta + 1, ctx.at_ply(static_cast<std::uint8_t>(ply + 1)).pv,
+                                     tt, ctx, report, stopper, std::nullopt);
 
     report.ply -= 1;
     pos.unmake_null_move();
@@ -1110,7 +1516,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // TT_NO_MOVE and rely on the table to keep any move it already holds.
       const int null_bound = std::min(null_eval, beta);
       if (!stopper.has_stopped() && null_bound < CENTIPAWN_MATE_THRESHOLD) {
-        tt.store(pos.key, depth, eval_in(null_bound, report.ply), Bound::Lower, TT_NO_MOVE);
+        tt.store(pos.key, depth, eval_in(null_bound, ply), Bound::Lower, TT_NO_MOVE);
       }
       return beta;
     }
@@ -1119,7 +1525,11 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // Static evaluation for futility pruning (only compute at shallow depths when not in check)
   const int static_eval = (depth <= FUTILITY_DEPTH && !in_check) ? eval(pos) : 0;
 
-  MoveList moves = pseudo_legal_moves(pos);
+  // Generated straight into this ply's row. The returning form would build a
+  // two-kilobyte MoveList in this frame first, 255 frames deep; see
+  // pseudo_legal_moves_into() in movegen.hpp.
+  MoveList& moves = scratch.ordering.moves;
+  pseudo_legal_moves_into(pos, moves);
 
   // Turn the 16 packed bits back into a real Move by finding it among the
   // moves this position actually has. This is the only place a stored move is
@@ -1129,7 +1539,12 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // search is finding would make us search the same move twice.
   const std::optional<Move> hash_move = decode_tt_move(hash_move_packed, moves);
 
-  OrderedMoves ordering(moves, ctx, report.ply, hash_move, previous_move);
+  OrderedMoves ordering(moves, scratch.ordering.scores, ctx, ply, hash_move, previous_move);
+
+  // The line this node's children report back into. One row per ply, so the
+  // child's PV is written where the child's own row lives and this frame holds
+  // no move list at all.
+  MoveList& child_pv = ctx.at_ply(static_cast<std::uint8_t>(ply + 1)).pv;
 
   // How many legal moves this node has actually searched, so the move about to
   // be searched is number `moves_searched + 1`. Late move reductions are a
@@ -1144,7 +1559,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // The quiet moves searched here so far. If one of the moves after them causes
   // a cutoff, these are the ones that were tried first and did not work, and
   // history wants to hear about it.
-  std::array<Move, MAX_PENALISED_QUIETS> searched_quiets{};
+  auto& searched_quiets = scratch.searched_quiets;
   std::size_t searched_quiet_count = 0;
 
   // The hash move is simply the first move the ordering hands over, so it goes
@@ -1173,13 +1588,17 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
     ++moves_searched;
     report.ply += 1;
 
-    MoveList child_pv;
     int eval;
 
     if (moves_searched == 1) {
       // First move: search with full window. Ordering says this is the likely
       // best move, and the score the rest are measured against has to come
       // from somewhere.
+      //
+      // child_pv is a shared row, so it is emptied before every search whose
+      // line we might keep. A local list gave that for free; a reused one would
+      // otherwise hand us the previous sibling's line.
+      child_pv.clear();
       eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt, ctx,
                         report, stopper, mv);
     } else {
@@ -1188,8 +1607,9 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // check for whether the move GIVES check is last because it costs a scan
       // of the board and the cheap conditions usually decide the question.
       std::uint8_t reduction = 0;
-      if (depth >= LMR_MIN_DEPTH && moves_searched > LMR_MIN_MOVE_NUMBER && is_quiet(mv) &&
-          !in_check && !ordering.is_refutation(mv) && !is_in_check(pos.colour_to_move, pos.board)) {
+      if (ctx.reductions_enabled && depth >= LMR_MIN_DEPTH &&
+          moves_searched > LMR_UNREDUCED_MOVES && is_quiet(mv) && !in_check &&
+          !ordering.is_refutation(mv) && !is_in_check(pos.colour_to_move, pos.board)) {
         reduction = lmr_reduction(depth, moves_searched, is_pv_node);
 
         // Never reduce into quiescence: a move searched at depth 0 is a move
@@ -1202,21 +1622,27 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // After the first move, search the rest with a "zero window"
       // (alpha, alpha+1). That only proves "worse than alpha" or "better", but
       // it proves it far more cheaply than a real search.
-      MoveList zero_window_pv;
+      //
+      // A zero-window search has no line to report—it answers a yes/no question
+      // about alpha—so these two calls write into the same shared row as the
+      // full-window search below, and whatever they leave there is overwritten
+      // by the clear() before that search. Giving each of them a list of its
+      // own is what used to put three move lists in this frame.
       eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1 - reduction), -alpha - 1, -alpha,
-                        zero_window_pv, tt, ctx, report, stopper, mv);
+                        child_pv, tt, ctx, report, stopper, mv);
 
       // The reduced search says the move is better than alpha, and a reduced
       // search is not entitled to that opinion: verify it at full depth, still
       // with the zero window.
       if (reduction > 0 && eval > alpha) {
-        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha,
-                          zero_window_pv, tt, ctx, report, stopper, mv);
+        eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -alpha - 1, -alpha, child_pv,
+                          tt, ctx, report, stopper, mv);
       }
 
       // Still looking like a new best move, so pay for the real thing: the full
       // window is what produces a true score and the line behind it.
       if (eval > alpha && eval < beta) {
+        child_pv.clear();
         eval = -alphabeta(pos, static_cast<std::uint8_t>(depth - 1), -beta, -alpha, child_pv, tt,
                           ctx, report, stopper, mv);
       }
@@ -1232,7 +1658,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
       // here would crowd out the quiet moves these tables exist to rescue from
       // the back of the list.
       if (is_quiet(mv)) {
-        ctx.killers.store(report.ply, mv);
+        ctx.killers.store(ply, mv);
 
         const int bonus = history_bonus(depth);
         ctx.history.update(mv, bonus);
@@ -1251,7 +1677,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
 
       // Store in TT as a lower bound (actual score might be even higher)
       if (!stopper.has_stopped()) {
-        tt.store(pos.key, depth, eval_in(eval, report.ply), Bound::Lower, encode_tt_move(mv));
+        tt.store(pos.key, depth, eval_in(eval, ply), Bound::Lower, encode_tt_move(mv));
       }
       return beta;
     }
@@ -1276,7 +1702,7 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   if (moves_searched == 0) {
     // Checkmate: return negative mate score (we're getting mated)
     // Stalemate: draw
-    return in_check ? -CENTIPAWN_MATE + report.ply : CENTIPAWN_DRAW;
+    return in_check ? -CENTIPAWN_MATE + ply : CENTIPAWN_DRAW;
   }
 
   // Store the result in the transposition table for future use.
@@ -1285,23 +1711,11 @@ int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, Mo
   // that into the table would poison the position with a fabricated "equal"
   // evaluation that outlives the aborted search, so we say nothing.
   if (!stopper.has_stopped()) {
-    tt.store(pos.key, depth, eval_in(alpha, report.ply), tt_bound,
+    tt.store(pos.key, depth, eval_in(alpha, ply), tt_bound,
              best_move.has_value() ? encode_tt_move(*best_move) : TT_NO_MOVE);
   }
 
   return alpha;
-}
-
-int detail::alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
-                      TranspositionTable& tt, KillerMoves& killers, Report& report,
-                      const Stopper& stopper) {
-  SearchContext ctx;
-  ctx.killers = killers;
-
-  const int eval = alphabeta(pos, depth, alpha, beta, pv, tt, ctx, report, stopper);
-
-  killers = ctx.killers;
-  return eval;
 }
 
 // ---------------------------------------------------------------------------

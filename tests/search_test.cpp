@@ -222,18 +222,31 @@ TEST(SearchOrdering, RanksQuietMovesByHistory) {
 
 // History heuristic and counter-moves -------------------------------------------
 
-TEST(SearchHistory, GravityMakesScoresSaturateInsteadOfRunningAway) {
-  search::HistoryTable history;
-  const auto mv = make_move(Piece::WN, "g1", "f3");
+namespace {
 
+// Applies the same bonus `repetitions` times, checking after each one that the
+// score only ever climbs and never escapes the ceiling, and returns where it
+// settled. A loop of assertions belongs in a named function: the test that
+// calls it then reads as the claim it is making rather than as bookkeeping.
+int saturate_history(search::HistoryTable& history, const Move& mv, int bonus, int repetitions) {
   int previous = 0;
-  for (int i = 0; i < 1'000; ++i) {
-    history.update(mv, 1'200);
+  for (int i = 0; i < repetitions; ++i) {
+    history.update(mv, bonus);
     const int score = history.probe(mv);
     EXPECT_GE(score, previous) << "a bonus must never lower a score";
     EXPECT_LE(score, search::HISTORY_MAX) << "gravity must cap the score";
     previous = score;
   }
+  return previous;
+}
+
+} // namespace
+
+TEST(SearchHistory, GravityMakesScoresSaturateInsteadOfRunningAway) {
+  search::HistoryTable history;
+  const auto mv = make_move(Piece::WN, "g1", "f3");
+
+  const int previous = saturate_history(history, mv, 1'200, 1'000);
 
   EXPECT_GT(previous, search::HISTORY_MAX / 2) << "repeated cutoffs should still add up";
 
@@ -318,67 +331,92 @@ TEST(SearchHistory, PenalisesQuietMovesTriedBeforeTheCutoff) {
 
 // Late move reductions ---------------------------------------------------------
 
-TEST(SearchReductions, GrowWithDepthAndMoveNumber) {
-  const auto reduction = [](std::uint8_t depth, std::size_t move_number, bool is_pv_node) {
-    return static_cast<int>(search::detail::lmr_reduction(depth, move_number, is_pv_node));
-  };
+namespace {
 
+int lmr(std::uint8_t depth, std::size_t move_number, bool is_pv_node = false) {
+  return static_cast<int>(search::detail::lmr_reduction(depth, move_number, is_pv_node));
+}
+
+struct ReductionCase {
+  const char* what;
+  std::uint8_t depth;
+  std::size_t move_number;
+  bool is_pv_node;
+  int expected;
+};
+
+void expect_reductions(const std::vector<ReductionCase>& cases) {
+  for (const auto& c : cases) {
+    EXPECT_EQ(lmr(c.depth, c.move_number, c.is_pv_node), c.expected) << c.what;
+  }
+}
+
+void expect_reductions_are_monotone() {
+  for (std::uint8_t depth = 3; depth < 32; ++depth) {
+    for (std::size_t move_number = 4; move_number < 32; ++move_number) {
+      EXPECT_GE(lmr(depth, move_number), lmr(static_cast<std::uint8_t>(depth - 1), move_number));
+      EXPECT_GE(lmr(depth, move_number), lmr(depth, move_number - 1));
+    }
+  }
+}
+
+} // namespace
+
+TEST(SearchReductions, GrowWithDepthAndMoveNumber) {
   // floor(0.75 + ln(depth) * ln(move number) / 2.25), the shape the table is
   // built from. Spot values rather than a reimplementation of the formula:
   // a test that recomputes what it is testing proves nothing.
-  EXPECT_EQ(reduction(3, 4, false), 1);
-  EXPECT_EQ(reduction(8, 8, false), 2);
-  EXPECT_EQ(reduction(16, 16, false), 4);
-
-  // A PV node gives up one ply less than the zero-window nodes around it.
-  EXPECT_EQ(reduction(16, 16, true), 3);
-  EXPECT_EQ(reduction(8, 8, true), 1);
-
-  // ln(1) = 0, so depth 1 reduces nothing however late the move; and a
-  // reduction is never negative.
-  EXPECT_EQ(reduction(1, 60, false), 0);
-  EXPECT_EQ(reduction(3, 4, true), 0);
+  expect_reductions({
+      {"depth 3, move 4", 3, 4, false, 1},
+      {"depth 8, move 8", 8, 8, false, 2},
+      {"depth 16, move 16", 16, 16, false, 4},
+      // A PV node gives up one ply less than the zero-window nodes around it.
+      {"PV node, depth 16, move 16", 16, 16, true, 3},
+      {"PV node, depth 8, move 8", 8, 8, true, 1},
+      // ln(1) = 0, so depth 1 reduces nothing however late the move; and a
+      // reduction is never negative.
+      {"depth 1 reduces nothing", 1, 60, false, 0},
+      {"a PV reduction never goes negative", 3, 4, true, 0},
+  });
 
   // Monotone in both arguments: deeper searches can spare more, and the further
   // down the list ordering put a move the less it is believed.
-  for (std::uint8_t depth = 3; depth < 32; ++depth) {
-    for (std::size_t move_number = 4; move_number < 32; ++move_number) {
-      EXPECT_GE(reduction(depth, move_number, false), reduction(depth - 1, move_number, false));
-      EXPECT_GE(reduction(depth, move_number, false), reduction(depth, move_number - 1, false));
-    }
-  }
+  expect_reductions_are_monotone();
 
   // Out-of-range arguments are clamped, not wrapped: the reduction stops
   // growing rather than folding back to zero.
-  EXPECT_EQ(reduction(255, 250, false), reduction(63, 63, false));
+  EXPECT_EQ(lmr(255, 250), lmr(63, 63));
 }
 
 TEST(SearchReductions, SearchLateQuietMovesShallower) {
   // Reductions have no output of their own; the only thing they change is how
-  // much work a search does. Measured in this Debug build, the starting
-  // position at depth 6 cost about 26,000 nodes when every move was searched at
-  // full depth and about 11,500 once late quiet moves were reduced, under the
-  // evaluation of the time. Adding pawn-structure, king-safety and mobility
-  // terms reshaped the tree to about 20,700 reduced nodes, so the ceiling below
-  // is deliberately generous. A ceiling pinned to one evaluation is a weak
-  // test; a proper version compares the same search with reductions switched
-  // on and off, which needs a test-only toggle in the search context.
-  Position pos = Position::startpos();
+  // much work a search does. This used to be pinned to an absolute node
+  // ceiling, which measured the evaluation function as much as the reductions
+  // and had to be loosened every time a term was added. The honest measurement
+  // is the same search twice, with reductions on and off.
+  const auto search_startpos = [](bool reductions_enabled) {
+    Position pos = Position::startpos();
 
-  search::SearchContext ctx;
-  search::TranspositionTable tt(8);
-  search::Report report;
-  search::Stopper stopper;
-  MoveList pv;
+    search::SearchContext ctx;
+    ctx.reductions_enabled = reductions_enabled;
+    search::TranspositionTable tt(8);
+    search::Report report;
+    search::Stopper stopper;
+    MoveList pv;
 
-  search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+    search::detail::alphabeta(pos, 6, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+    return std::make_pair(report.nodes, pv_to_uci(pv));
+  };
 
-  EXPECT_LT(report.nodes, 30'000U) << "late quiet moves should not be costing full depth";
+  const auto [reduced_nodes, reduced_pv] = search_startpos(true);
+  const auto [full_nodes, full_pv] = search_startpos(false);
+
+  EXPECT_LT(reduced_nodes, full_nodes) << "late quiet moves should not be costing full depth";
 
   // ...and the shallower search still comes back with a real line, not with
   // whatever a reduced search happened to leave behind.
-  ASSERT_FALSE(pv.empty());
-  EXPECT_GE(pv.size(), 2U);
+  ASSERT_FALSE(reduced_pv.empty());
+  EXPECT_GE(reduced_pv.size(), 2U);
 }
 
 TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
@@ -399,6 +437,16 @@ TEST(SearchCounterMoves, KeyOnThePieceAndSquareOfThePreviousMove) {
   // A different piece landing there does not.
   const auto other_piece = make_move(Piece::BN, "f6", "d5");
   EXPECT_FALSE(counters.probe(other_piece).has_value());
+}
+
+TEST(SearchCounterMoves, ClearForgetsEverything) {
+  search::CounterMoves counters;
+  const auto previous = make_move(Piece::BP, "d7", "d5");
+  counters.store(previous, make_move(Piece::WP, "e4", "e5"));
+  ASSERT_TRUE(counters.probe(previous).has_value());
+
+  counters.clear();
+  EXPECT_FALSE(counters.probe(previous).has_value());
 }
 
 TEST(SearchCounterMoves, ASearchFillsTheTable) {
@@ -427,6 +475,348 @@ TEST(SearchCounterMoves, ASearchFillsTheTable) {
   }
 
   EXPECT_GT(recorded, 0) << "quiet cutoffs should leave counter-moves behind";
+}
+
+// Ply and stack safety ---------------------------------------------------------
+
+TEST(SearchPlySafety, ResolvesStaticallyAtThePlyCeiling) {
+  // Killers and the search's own per-ply scratch rows are indexed by ply, and
+  // Report::ply is a single byte. A search that keeps recursing past MAX_DEPTH
+  // therefore does not run out of room, it WRAPS: ply 255's child is ply 0, and
+  // a line 255 plies deep starts overwriting the root's tables from underneath
+  // it. The check extension is the one place ply can grow without bound—it
+  // resets depth to 1, so a long enough forcing sequence never has to end—and
+  // every one of those frames also costs a stack frame.
+  //
+  // So a node that is already at the ceiling must answer without recursing.
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  // Killers are the tell. Only the main search stores them, and only for a move
+  // it actually searched, so a context that comes back empty is proof that the
+  // node answered without recursing. A search that wrapped instead would have
+  // gone on to search a full depth-4 tree and left killers behind at plies 255,
+  // 0, 1, 2... — the root's own slots, filled in from 255 plies away.
+  const auto killers_stored_by = [&pos](std::uint8_t ply) {
+    search::SearchContext ctx;
+    search::TranspositionTable tt(1);
+    search::Report report;
+    report.ply = ply;
+    search::Stopper stopper;
+    MoveList pv;
+    search::detail::alphabeta(pos, 4, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+    int stored = 0;
+    for (int slot = 0; slot <= static_cast<int>(search::MAX_DEPTH); ++slot) {
+      const auto killer_ply = static_cast<std::uint8_t>(slot);
+      stored += static_cast<int>(ctx.killers.probe(killer_ply, 0).has_value());
+      stored += static_cast<int>(ctx.killers.probe(killer_ply, 1).has_value());
+    }
+    return std::make_pair(stored, report.max_ply);
+  };
+
+  const auto [at_ceiling, ceiling_max_ply] = killers_stored_by(search::MAX_DEPTH);
+  const auto [at_root, root_max_ply] = killers_stored_by(0);
+
+  EXPECT_EQ(at_ceiling, 0)
+      << "a node at the ply ceiling must resolve statically instead of recursing";
+  EXPECT_GT(at_root, 0) << "the same search from the root does recurse, and says so";
+
+  // ...and it stopped at the ceiling rather than carrying on from a wrapped 0.
+  EXPECT_EQ(ceiling_max_ply, search::MAX_DEPTH);
+  EXPECT_LT(root_max_ply, search::MAX_DEPTH);
+}
+
+TEST(SearchPlySafety, CheckExtensionsSearchPastTheNominalDepth) {
+  // The other half of the same story: the extension really does push ply past
+  // the depth it was given—that is the whole point of it, and the reason the
+  // ceiling above has to exist. A position with checks available at the horizon
+  // therefore reaches plies the depth limit alone would never reach.
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  search::SearchContext ctx;
+  search::TranspositionTable tt(1);
+  search::Report report;
+  search::Stopper stopper;
+  MoveList pv;
+
+  constexpr std::uint8_t DEPTH = 5;
+  search::detail::alphabeta(pos, DEPTH, CENTIPAWN_MIN, CENTIPAWN_MAX, pv, tt, ctx, report, stopper);
+
+  EXPECT_GT(report.max_ply, DEPTH) << "a check at the horizon should have been extended";
+}
+
+// Static exchange evaluation ---------------------------------------------------
+
+namespace {
+
+// The legal move from `from` to `to`, so a test can name a capture the way a
+// player would and still hand see() a fully-formed Move.
+Move capture(const Position& pos, std::string_view from, std::string_view to,
+             std::optional<Piece> promotion = std::nullopt) {
+  const auto from_sq = Square::parse(from);
+  const auto to_sq = Square::parse(to);
+  EXPECT_TRUE(from_sq.has_value());
+  EXPECT_TRUE(to_sq.has_value());
+
+  for (const auto& mv : legal_moves(pos)) {
+    if (mv.from == *from_sq && mv.to == *to_sq && mv.promotion_piece == promotion) {
+      return mv;
+    }
+  }
+
+  ADD_FAILURE() << "no legal move " << from << to;
+  return {};
+}
+
+int see_of(std::string_view fen, std::string_view from, std::string_view to) {
+  const Position pos = parse(fen);
+  return search::detail::see(pos, capture(pos, from, to));
+}
+
+constexpr int PAWN = PIECE_VALUES[static_cast<std::size_t>(Piece::WP)];
+constexpr int ROOK = PIECE_VALUES[static_cast<std::size_t>(Piece::WR)];
+constexpr int QUEEN = PIECE_VALUES[static_cast<std::size_t>(Piece::WQ)];
+
+} // namespace
+
+TEST(SearchSee, WinsTheWholePieceWhenNothingDefendsIt) {
+  // PxQ, the capture MVV-LVA and SEE agree about: an undefended queen taken by
+  // a pawn is a queen, and nothing comes back.
+  EXPECT_EQ(see_of("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1", "e4", "d5"), QUEEN);
+}
+
+TEST(SearchSee, ScoresACaptureIntoADefenceAsTheLoss) {
+  // QxP where a pawn defends: MVV-LVA still ranks it above every quiet move,
+  // because it only looks at what is being taken. SEE plays the reply and sees
+  // a queen going for a pawn.
+  const int score = see_of("4k3/8/2p5/3p4/8/8/8/3QK3 w - - 0 1", "d1", "d5");
+
+  EXPECT_LT(score, 0);
+  EXPECT_EQ(score, PAWN - QUEEN);
+}
+
+TEST(SearchSee, ScoresAnEvenTradeAtZero) {
+  // Rook takes rook, rook takes back. Neither side gained anything, and the
+  // capture is neither a blunder to be pruned nor a win to be searched first.
+  EXPECT_EQ(see_of("3rr1k1/8/8/8/8/8/8/3R2K1 w - - 0 1", "d1", "d8"), 0);
+}
+
+TEST(SearchSee, SeesTheQueenBehindTheRook) {
+  // A battery: white's queen on d1 sits behind its rook on d2, and only joins
+  // the exchange once the rook has left the file. Counting attackers up front
+  // misses it and calls the capture an even trade; removing pieces from the
+  // board as they capture makes the queen appear by itself.
+  const int with_battery = see_of("3rr1k1/8/8/8/8/8/3R4/3Q2K1 w - - 0 1", "d2", "d8");
+  const int without_battery = see_of("3rr1k1/8/8/8/8/8/3R4/6K1 w - - 0 1", "d2", "d8");
+
+  EXPECT_EQ(without_battery, 0);
+  EXPECT_GT(with_battery, without_battery);
+  EXPECT_EQ(with_battery, ROOK);
+}
+
+TEST(SearchSee, RefusesToLetTheKingCaptureIntoADefendedSquare) {
+  // Black's rook on d8 is defended only by its king. Whether the king may
+  // actually recapture depends on whether white still attacks d8 afterwards,
+  // and that is the whole difference between these two positions: doubled
+  // rooks, so the second one covers d8, against a single rook that leaves.
+  const int king_may_not_recapture = see_of("3r4/2k5/8/8/8/8/3R4/3R2K1 w - - 0 1", "d2", "d8");
+  const int king_may_recapture = see_of("3r4/2k5/8/8/8/8/3R4/6K1 w - - 0 1", "d2", "d8");
+
+  EXPECT_EQ(king_may_recapture, 0);
+  EXPECT_GT(king_may_not_recapture, king_may_recapture);
+  EXPECT_EQ(king_may_not_recapture, ROOK)
+      << "a rook the king is not allowed to take back is simply won";
+}
+
+TEST(SearchSee, IgnoresQuietMoves) {
+  // Nothing changes hands, so there is no exchange to price.
+  const Position pos = parse("4k3/8/8/8/8/8/8/4K2R w K - 0 1");
+  EXPECT_EQ(search::detail::see(pos, capture(pos, "h1", "h4")), 0);
+}
+
+// Quiescence -------------------------------------------------------------------
+
+namespace {
+
+// Quiescence with nothing around it: no alpha-beta parent, no iterative
+// deepening, so what comes back is quiescence's own opinion of the position.
+struct QuiescenceRun {
+  int eval{0};
+  std::uint64_t nodes{0};
+};
+
+QuiescenceRun quiesce(Position& pos, search::SearchContext& ctx, int alpha = CENTIPAWN_MIN,
+                      int beta = CENTIPAWN_MAX) {
+  search::Report report;
+  search::Stopper stopper;
+  const int eval = search::detail::quiescence(pos, alpha, beta, ctx, report, stopper);
+  return {eval, report.nodes};
+}
+
+QuiescenceRun quiesce(Position& pos, int alpha = CENTIPAWN_MIN, int beta = CENTIPAWN_MAX) {
+  search::SearchContext ctx;
+  return quiesce(pos, ctx, alpha, beta);
+}
+
+} // namespace
+
+TEST(SearchQuiescence, ReportsCheckmateInsteadOfStandingPat) {
+  // Standing pat says "I do not have to move"—and in check that is exactly the
+  // one thing the side to move cannot say. Here it is mated: the static
+  // evaluation calls the position merely bad, and a quiescence node that
+  // believed it would hand alpha-beta a losing position dressed up as a
+  // playable one, right at the horizon where nothing above can correct it.
+  Position pos = parse("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1");
+
+  EXPECT_LE(quiesce(pos).eval, -CENTIPAWN_MATE_THRESHOLD) << "quiescence stood pat in a checkmate";
+}
+
+TEST(SearchQuiescence, FindsAMateThatOnlyAppearsInsideTheCaptureSearch) {
+  // The same failure from the other side. Qxa8 is a capture, so quiescence
+  // searches it; the mate is only visible once the position AFTER it is
+  // resolved, and that position is a check.
+  Position pos = parse("r5k1/5ppp/8/8/8/8/8/Q5K1 w - - 0 1");
+
+  EXPECT_GE(quiesce(pos).eval, CENTIPAWN_MATE_THRESHOLD)
+      << "the mate behind the capture was hidden by a stand-pat in check";
+}
+
+namespace {
+
+// How many noisy moves a position offers, and how many of those are promotions
+// to a queen. The two numbers are what "quiescence searches only queen
+// promotions" means, expressed in the position's own terms rather than as a
+// node count somebody wrote down once.
+struct NoisyMoveCounts {
+  std::size_t total{0};
+  std::size_t queen_promotions{0};
+};
+
+NoisyMoveCounts count_noisy_moves(const Position& pos) {
+  NoisyMoveCounts counts;
+  for (const auto& mv : pseudo_legal_noisy_moves(pos)) {
+    ++counts.total;
+    if (mv.promotion_piece == queen(pos.colour_to_move)) {
+      ++counts.queen_promotions;
+    }
+  }
+  return counts;
+}
+
+// Every noisy move in these positions is a promotion by the same pawn, and
+// nothing can recapture on the promotion square, so quiescence visits exactly
+// one node per promotion it decides to search and the node count IS the count
+// of promotions searched.
+void expect_only_queen_promotions_searched(std::string_view fen) {
+  Position pos = parse(fen);
+  const auto counts = count_noisy_moves(pos);
+  ASSERT_GT(counts.queen_promotions, 0U);
+  ASSERT_LT(counts.queen_promotions, counts.total) << "the position must offer underpromotions";
+
+  search::SearchContext filtered;
+  search::SearchContext unfiltered;
+  unfiltered.quiescence_pruning_enabled = false;
+
+  // A full window, so delta pruning cannot fire and the only filter at work is
+  // the one being tested.
+  EXPECT_EQ(quiesce(pos, unfiltered).nodes, counts.total)
+      << "unfiltered, every promotion is searched";
+  EXPECT_EQ(quiesce(pos, filtered).nodes, counts.queen_promotions)
+      << "filtered, only the queen promotions are";
+}
+
+} // namespace
+
+TEST(SearchQuiescence, ClampsAMateDistanceToThePlyCeiling) {
+  // The mate distance quiescence reports is its parent's ply plus how deep into
+  // quiescence it is, and those two are bounded separately: 255 and 64. Their
+  // sum is not. CENTIPAWN_MATE_THRESHOLD is CENTIPAWN_MATE - 255, so a distance
+  // past 255 produces a score that is no longer in the mate range at all—it
+  // reads as an ordinary evaluation of about -97 pawns, and the mate is simply
+  // lost.
+  Position pos = parse("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1");
+
+  search::SearchContext ctx;
+  search::Report report;
+  report.ply = search::MAX_DEPTH;
+  search::Stopper stopper;
+
+  const int score =
+      search::detail::quiescence(pos, CENTIPAWN_MIN, CENTIPAWN_MAX, ctx, report, stopper, 5);
+
+  EXPECT_LE(score, -CENTIPAWN_MATE_THRESHOLD)
+      << "a mate found deep in quiescence must still read as a mate";
+}
+
+TEST(SearchQuiescence, DoesNotStandPatInCheckAtTheDepthCap) {
+  // The depth cap stops resolving, and what it returns has to respect the same
+  // rule the rest of the function does. Out of check the static evaluation is
+  // the honest answer; in check it is the stand-pat this search refuses to
+  // take, so the cap fails low instead. Reaching the cap needs sixty-four
+  // consecutive capture-or-check plies in a real search, but the depth is a
+  // parameter, so the branch can be asked about directly.
+  Position in_check = parse("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1");
+  Position quiet = parse("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1");
+
+  search::SearchContext ctx;
+  search::Report report;
+  search::Stopper stopper;
+
+  const int alpha = -1234;
+  const int at_cap_in_check = search::detail::quiescence(
+      in_check, alpha, CENTIPAWN_MAX, ctx, report, stopper, search::QUIESCENCE_MAX_DEPTH);
+  const int at_cap_quiet = search::detail::quiescence(quiet, alpha, CENTIPAWN_MAX, ctx, report,
+                                                      stopper, search::QUIESCENCE_MAX_DEPTH);
+
+  ASSERT_NE(eval(in_check), alpha) << "the position must not evaluate to alpha by accident";
+  EXPECT_EQ(at_cap_in_check, alpha) << "a check at the cap must fail low, not stand pat";
+  EXPECT_EQ(at_cap_quiet, eval(quiet)) << "a quiet position at the cap is worth its evaluation";
+}
+
+TEST(SearchQuiescence, SearchesOnlyQueenPromotions) {
+  // A pawn pushing to the last rank...
+  expect_only_queen_promotions_searched("8/1P6/8/8/8/8/8/k5K1 w - - 0 1");
+}
+
+TEST(SearchQuiescence, SearchesOnlyQueenCapturePromotions) {
+  // ...and a pawn capturing its way there. The rule looks at the piece the pawn
+  // becomes, not at whether it took something on the way, so bxa8=Q is searched
+  // and bxa8=N is not—and the rook is captured either way.
+  expect_only_queen_promotions_searched("rn5k/1P6/8/8/8/8/8/6K1 w - - 0 1");
+}
+
+TEST(SearchQuiescence, PruningCutsDownACaptureHeavyPosition) {
+  // Delta pruning and the SEE filter have no output of their own; what they
+  // change is how much of the capture tree gets walked. So the measurement is
+  // the same position searched twice, with them on and off.
+  Position pos = parse("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+
+  search::SearchContext pruning;
+  search::SearchContext everything;
+  everything.quiescence_pruning_enabled = false;
+
+  // A narrow window around the static evaluation, which is what quiescence is
+  // called with in a real search and what gives delta pruning an alpha worth
+  // measuring against.
+  const int centre = eval(pos);
+  const auto with_pruning = quiesce(pos, pruning, centre - 50, centre + 50);
+  const auto without_pruning = quiesce(pos, everything, centre - 50, centre + 50);
+
+  EXPECT_LT(with_pruning.nodes, without_pruning.nodes)
+      << "delta and SEE pruning should be cutting captures out of the search";
+}
+
+TEST(SearchQuiescence, StillFindsMatesWithPruningOn) {
+  // Pruning is allowed to skip captures that cannot change the score; it is not
+  // allowed to lose a mate. Both of these run with the switches at their
+  // defaults—the settings a real search uses.
+  Position mated = parse("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1");
+  EXPECT_LE(quiesce(mated).eval, -CENTIPAWN_MATE_THRESHOLD);
+
+  Position mate_in_two =
+      parse("r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 1");
+  const auto result = search::search(mate_in_two, 4);
+  EXPECT_LE(result.eval, -CENTIPAWN_MATE_THRESHOLD) << "black is mated and the search must say so";
 }
 
 // Transposition table layout, move packing and replacement ---------------------
@@ -541,6 +931,16 @@ TEST(TranspositionTable, PrefersReplacingEntriesFromAnEarlierSearch) {
   EXPECT_EQ(tt.probe(key), nullptr);
 }
 
+namespace {
+
+void advance_generations(search::TranspositionTable& tt, int searches) {
+  for (int i = 0; i < searches; ++i) {
+    tt.new_search();
+  }
+}
+
+} // namespace
+
 TEST(TranspositionTable, GenerationWrapsAfterSixtyFourSearches) {
   // Six bits hold the generation, so after TT_GENERATION_COUNT searches the
   // counter comes back round and a very old entry looks current again. That is
@@ -552,9 +952,7 @@ TEST(TranspositionTable, GenerationWrapsAfterSixtyFourSearches) {
 
   tt.store(key, 9, 100, search::Bound::Exact, search::TT_NO_MOVE);
 
-  for (int i = 0; i < search::TT_GENERATION_COUNT; ++i) {
-    tt.new_search();
-  }
+  advance_generations(tt, search::TT_GENERATION_COUNT);
   EXPECT_EQ(tt.generation(), 0) << "the counter should have wrapped exactly once";
 
   // The entry now claims the current generation, so it is no longer "stale"
@@ -709,16 +1107,18 @@ TEST(TranspositionTable, NonPvNodesTakeCutoffsFromEveryBoundType) {
   // keep, so all three bound types must still cut off without searching.
   Position pos = Position::startpos();
 
-  const struct {
+  struct BoundCase {
     const char* name;
     int score;
     search::Bound bound;
     int expected;
-  } cases[] = {
+  };
+
+  const std::array<BoundCase, 3> cases = {{
       {"exact", 123, search::Bound::Exact, 123},
       {"lower", 500, search::Bound::Lower, 1},  // >= beta: return beta
       {"upper", -500, search::Bound::Upper, 0}, // <= alpha: return alpha
-  };
+  }};
 
   for (const auto& scenario : cases) {
     search::TranspositionTable tt;
@@ -998,26 +1398,56 @@ TEST(SearchMate, ReportsMoveCountUntilMate) {
 // mating—because a reduction bug shows up in some shapes and not others.
 // -----------------------------------------------------------------------------
 
-TEST(SearchTactics, FindsTheOnlyMoveInKnownPositions) {
-  struct Tactic {
-    std::string_view name;
-    std::string_view fen;
-    std::uint8_t depth;
-    std::string_view best;
-    bool is_mate;
-    // A second key move that is exactly as good, when the position has one.
-    // Which of two equal moves wins is decided by ordering ties, not strength.
-    std::string_view equally_good = {};
-  };
+namespace {
 
+struct Tactic {
+  std::string_view name;
+  std::string_view fen;
+  std::uint8_t depth;
+  std::string_view best;
+  bool is_mate;
+  // A second key move that is exactly as good, when the position has one.
+  // Which of two equal moves wins is decided by ordering ties, not strength.
+  std::string_view equally_good;
+};
+
+void expect_tactic_found(const Tactic& tactic) {
+  SCOPED_TRACE(std::string(tactic.name) + " — " + std::string(tactic.fen));
+
+  Position pos = parse(tactic.fen);
+  search::NullReporter reporter;
+  search::Limits limits;
+  limits.depth = tactic.depth;
+
+  const auto result = search::search(pos, limits, reporter);
+
+  ASSERT_FALSE(result.pv.empty());
+  const auto played = to_uci(result.pv[0]);
+  EXPECT_TRUE(played == tactic.best ||
+              (!tactic.equally_good.empty() && played == tactic.equally_good))
+      << "played " << played << ", expected " << tactic.best;
+
+  if (tactic.is_mate) {
+    EXPECT_GT(result.eval, CENTIPAWN_MATE_THRESHOLD) << "should be scored as a forced mate";
+    return;
+  }
+
+  // A queen for a knight, with the knight getting out afterwards. The exact
+  // number belongs to the evaluation; that it is a large advantage does not.
+  EXPECT_GT(result.eval, 200);
+}
+
+} // namespace
+
+TEST(SearchTactics, FindsTheOnlyMoveInKnownPositions) {
   const std::vector<Tactic> tactics = {
-      {"back-rank mate", "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1", 4, "a1a8", true},
+      {"back-rank mate", "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1", 4, "a1a8", true, ""},
       {"Scholar's mate", "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 1", 4,
-       "f3f7", true},
+       "f3f7", true, ""},
       {"smothered mate: the rook and pawns are the cage", "6rk/6pp/8/6N1/8/8/8/6K1 w - - 0 1", 4,
-       "g5f7", true},
+       "g5f7", true, ""},
       {"the pawn takes the last flight square away", "1k6/1P6/1K6/8/8/8/8/7R w - - 0 1", 4, "h1h8",
-       true},
+       true, ""},
       // The key move is a quiet king move, which is exactly the kind of move a
       // reduction is happiest to throw away.
       // Kg6 and Kf7 both mate in two (1.Kf7 Kh7 2.Rh1#), so either is accepted.
@@ -1026,32 +1456,11 @@ TEST(SearchTactics, FindsTheOnlyMoveInKnownPositions) {
       // No mate anywhere: the reward is material, several plies away, and the
       // move that wins it is quiet in the sense that matters here—it captures
       // nothing.
-      {"knight fork wins the queen", "4k3/8/q7/3N4/8/8/4P3/7K w - - 0 1", 6, "d5c7", false},
+      {"knight fork wins the queen", "4k3/8/q7/3N4/8/8/4P3/7K w - - 0 1", 6, "d5c7", false, ""},
   };
 
   for (const auto& tactic : tactics) {
-    SCOPED_TRACE(std::string(tactic.name) + " — " + std::string(tactic.fen));
-
-    Position pos = parse(tactic.fen);
-    search::NullReporter reporter;
-    search::Limits limits;
-    limits.depth = tactic.depth;
-
-    const auto result = search::search(pos, limits, reporter);
-
-    ASSERT_FALSE(result.pv.empty());
-    const auto played = to_uci(result.pv[0]);
-    EXPECT_TRUE(played == tactic.best ||
-                (!tactic.equally_good.empty() && played == tactic.equally_good))
-        << "played " << played << ", expected " << tactic.best;
-
-    if (tactic.is_mate) {
-      EXPECT_GT(result.eval, CENTIPAWN_MATE_THRESHOLD) << "should be scored as a forced mate";
-    } else {
-      // A queen for a knight, with the knight getting out afterwards. The exact
-      // number belongs to the evaluation; that it is a large advantage does not.
-      EXPECT_GT(result.eval, 200);
-    }
+    expect_tactic_found(tactic);
   }
 }
 
@@ -1493,7 +1902,7 @@ TEST(SearchPV, KeepsFullLengthPvOnAWarmTable) {
   // scores for its own principal variation. If PV nodes were allowed to take
   // those cutoffs they would return a score with no line behind it, and the
   // reported PV would collapse to a move or two.
-  const auto fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+  const auto* const fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
 
   search::TranspositionTable tt;
   search::NullReporter reporter;

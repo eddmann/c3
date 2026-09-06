@@ -47,7 +47,11 @@
 //   5. QUIESCENCE SEARCH
 //      At leaf nodes, don't just evaluate—keep searching captures until the
 //      position is "quiet". This avoids the "horizon effect" where we stop
-//      searching just before a piece gets captured.
+//      searching just before a piece gets captured. A leaf that is IN CHECK is
+//      not quiet and does not get to pretend otherwise: it searches every legal
+//      reply and reports mate when there is none. The captures it does search
+//      are filtered—by delta pruning, by static exchange evaluation, and to
+//      queen promotions only—because most of them cannot change the answer.
 //
 //   6. NULL-MOVE PRUNING
 //      If doing nothing (passing) still gives a good score, the position is
@@ -66,6 +70,20 @@
 //      than the rest. If such a move turns out to beat alpha anyway, it is
 //      searched again at full depth, so the saving costs nothing when the
 //      guess was right and a re-search when it was wrong.
+//
+//  10. STATIC EXCHANGE EVALUATION
+//      Price the whole exchange on a square—I take, you take back, and so on
+//      with the cheapest piece each time—without searching a node. Quiescence
+//      uses it to refuse captures that lose material outright, which is the
+//      one thing MVV-LVA cannot see.
+//
+// WHERE THE SEARCH'S WORKING STORAGE LIVES
+// Not on the stack. The recursion is up to 255 frames deep and each frame
+// would otherwise hold several two-kilobyte move lists, which overflows the
+// 512 KiB stack the search thread gets on macOS. Move lists, ordering scores
+// and principal variations live in per-ply rows owned by the SearchContext
+// below; see WHY THE SCRATCH SPACE LIVES HERE for the full argument, and THE
+// PLY CEILING for what keeps the ply from running past the end of those rows.
 //
 // =============================================================================
 
@@ -95,10 +113,32 @@ inline constexpr std::size_t TT_DEFAULT_SIZE_MB = 64;
 // ---------------------------------------------------------------------------
 // Reporting and limits
 // ---------------------------------------------------------------------------
+//
+// THE PLY CEILING
+// ---------------------------------------------------------------------------
+// MAX_DEPTH is not only the deepest iteration the engine will start; it is the
+// deepest PLY any node may sit at, and that is the stricter of the two claims.
+// Killer slots, and the per-ply scratch rows a SearchContext hands out, are
+// arrays with exactly MAX_DEPTH + 1 rows, and Report::ply is a single byte. A
+// search that recursed past the ceiling would not run out of room, it would
+// WRAP: the child of ply 255 is ply 0, and a line that long would start
+// overwriting the root's own tables from underneath it. Each of those frames
+// also costs real stack, which is the other reason the ceiling has to hold.
+//
+// Depth alone does not enforce it. Every recursion normally spends a ply of
+// depth, so ply <= root depth <= MAX_DEPTH falls out for free—except at the
+// check extension, which resets depth to 1 and can therefore go on for as long
+// as the checks do. So the ceiling is checked explicitly, in alphabeta(), and
+// a node that has reached it answers with quiescence instead of recursing.
+// ---------------------------------------------------------------------------
 
 struct Report {
   std::uint8_t depth{0};
   std::uint8_t ply{0};
+  // The deepest ply the main search reached, which is what a UCI `seldepth`
+  // would report and what the ply ceiling is asserted against. It only ever
+  // grows, so it survives the recursion unwinding back to the root.
+  std::uint8_t max_ply{0};
   std::uint64_t nodes{0};
   std::optional<std::pair<MoveList, int>> pv{};
   std::pair<std::size_t, std::size_t> tt_stats{0, 0};
@@ -485,6 +525,12 @@ public:
   [[nodiscard]] std::optional<Move> probe(const Move& previous) const;
   void store(const Move& previous, const Move& refutation);
 
+  // Forget every refutation. A SearchContext is built fresh for each search, so
+  // the search itself never needs this; it is here because HistoryTable has it,
+  // and a pair of tables that are cleared in different ways is a trap for
+  // whoever eventually decides to carry one of them between moves.
+  void clear();
+
 private:
   std::array<std::array<std::optional<Move>, 64>, 12> moves_{};
 };
@@ -505,12 +551,129 @@ private:
 // "cleared between searches", and it is what keeps `bench` reproducible.
 // (Stronger engines do carry history from move to move, halving it each time;
 // that is a refinement, not a correction.)
+//
+// WHY THE SCRATCH SPACE LIVES HERE TOO, AND NOT ON THE STACK
+// The context also owns the working storage each node needs while it decides:
+// the move list it generated, the ordering scores for those moves, the line it
+// reports to its parent, and the quiet moves it has already tried. Every one of
+// those is naturally a local variable, and every one of them is here instead.
+// Three reasons, in order of how badly they bite:
+//
+//   1. THREAD STACKS ARE SMALL, AND THE SEARCH IS 255 FRAMES DEEP. A MoveList
+//      is a fixed-capacity array of 256 moves—two kilobytes—so a frame holding
+//      three of them costs six. Multiply by the ply ceiling and alpha-beta
+//      alone wants a megabyte and a half of stack. The main thread usually has
+//      eight megabytes, but the search does not run there: it runs on a
+//      std::thread so the UCI loop can keep reading `stop`, and a default
+//      std::thread gets 512 KiB on macOS and 1 MiB on Windows. The overflow
+//      that follows is not an exception, it is a dead process mid-game—and it
+//      only shows up on the deep tactical positions the engine most wants to
+//      get right.
+//
+//      DECLARING THE ROWS HERE IS ONLY HALF OF IT. A generator that RETURNS a
+//      MoveList puts those two kilobytes in the caller's frame on the way to
+//      the row, which costs the same as never having moved it: measured with
+//      -fstack-usage, alphabeta's Release frame was 2528 bytes that way and
+//      464 once generation wrote into the row directly. So the search fills
+//      its rows through pseudo_legal_moves_into() (movegen.hpp), and its
+//      frames hold no move list at all.
+//
+//   2. LOCALITY. A row is allocated once and reused by every node that visits
+//      that ply, so the same cache lines are hit again and again instead of a
+//      fresh, cold slice of stack being touched at each node.
+//
+//   3. REPRODUCIBILITY. Rows are zeroed once, when the context is built. A node
+//      that reads a row before writing it therefore sees the same bytes on
+//      every run, rather than whatever the previous frame left behind, which is
+//      what keeps `bench` reporting the same node count twice in a row.
+//
+// The rows are heap-allocated (a couple of megabytes) and owned by the context,
+// so they are freed when the search that needed them ends.
 // ---------------------------------------------------------------------------
 
-struct SearchContext {
+// How many quiet moves one node remembers, so that a later cutoff can penalise
+// the quiet moves that were tried before it and failed. A node that searched
+// more than this before finding a cutoff has bigger problems than the exactness
+// of its bookkeeping.
+inline constexpr std::size_t MAX_PENALISED_QUIETS = 32;
+
+// One ordering score per move, so a row must be as long as a move list can be.
+// MoveList::CAPACITY is 256; the most pseudo-legal moves anyone has found a
+// position producing is 248, and the most LEGAL moves is 218. A row this long
+// can therefore score anything move generation can hand us, and the
+// static_assert in search.cpp keeps the two numbers tied together.
+inline constexpr std::size_t MAX_ORDERED_MOVES = 256;
+
+// How deep quiescence may recurse before it stops resolving and simply returns
+// the static evaluation. In practice it never comes close: each recursion needs
+// another capture or promotion, and a position only has so many pieces to trade
+// off. The cap exists for the pathological case—a long forced sequence, or a
+// bug in move generation—where "keep going until it is quiet" would otherwise
+// be an unbounded promise, and it is what makes the per-depth storage below a
+// fixed, affordable size.
+inline constexpr std::size_t QUIESCENCE_MAX_DEPTH = 64;
+
+// The scratch one node needs to pick its moves: the list it generated, and the
+// score ordering gave each entry of that list.
+struct MoveScratch {
+  MoveList moves;
+  std::array<int, MAX_ORDERED_MOVES> scores{};
+};
+
+// Everything one ply of the main search needs, on top of the above: the line it
+// reports to its parent, and the quiet moves it has already tried.
+//
+// searched_quiets is value-initialised, and here that costs nothing worth
+// counting: the row is zeroed once when the context is built, not—as it was
+// when it lived in alphabeta's frame—a quarter of a kilobyte written at every
+// single node for the sake of entries the node was about to overwrite anyway.
+struct PlyScratch {
+  MoveScratch ordering;
+  MoveList pv;
+  std::array<Move, MAX_PENALISED_QUIETS> searched_quiets{};
+};
+
+class SearchContext {
+public:
+  SearchContext();
+
   KillerMoves killers;
   HistoryTable history;
   CounterMoves counters;
+
+  // TEST-ONLY SWITCH. Late move reductions have no output of their own—the only
+  // thing they change is how much work a search does—so the only honest way to
+  // measure them is to run the same search twice with them on and off. Nothing
+  // on the UCI path ever writes this; it is here for tests and for bench
+  // experiments, and it is why the reduction block in search.cpp asks a
+  // question that always answers "yes" in a real game.
+  bool reductions_enabled{true};
+
+  // TEST-ONLY SWITCH, for the same reason: delta pruning, the SEE filter and
+  // the underpromotion filter in quiescence all change how much work is done
+  // and (deliberately) a little of what is seen, so the only way to measure
+  // them is to run with and without. Nothing on the UCI path writes it.
+  bool quiescence_pruning_enabled{true};
+
+  // The scratch row for a node at `ply`. Rows live for the whole search and are
+  // reused by every node that visits that ply, so a reference into one stays
+  // valid across the recursion below it—which is exactly what alphabeta relies
+  // on when it hands its child `at_ply(ply + 1).pv` to fill in.
+  [[nodiscard]] PlyScratch& at_ply(std::uint8_t ply) { return (*plies_)[ply]; }
+
+  // The same, for quiescence, indexed by how deep INTO quiescence we are rather
+  // than by search ply. Callers must respect QUIESCENCE_MAX_DEPTH.
+  [[nodiscard]] MoveScratch& at_quiescence_depth(std::size_t depth) {
+    return (*quiescence_)[depth];
+  }
+
+private:
+  // std::array rather than std::vector so the rows cannot be reallocated out
+  // from under a reference the recursion is still holding, and behind a
+  // unique_ptr because these are megabytes: putting them in the object itself
+  // would just move the stack problem to whoever declares a SearchContext.
+  std::unique_ptr<std::array<PlyScratch, MAX_DEPTH + 1>> plies_;
+  std::unique_ptr<std::array<MoveScratch, QUIESCENCE_MAX_DEPTH>> quiescence_;
 };
 
 // ---------------------------------------------------------------------------
@@ -648,21 +811,50 @@ void order_quiescence_moves(MoveList& moves);
 [[nodiscard]] std::uint8_t lmr_reduction(std::uint8_t depth, std::size_t move_number,
                                          bool is_pv_node);
 
+// STATIC EXCHANGE EVALUATION
+// "If I capture on this square and both sides then keep capturing there with
+// their cheapest piece, what do I end up with?" The answer is a material
+// number, in centipawns, computed without searching a single node: build the
+// swap list of alternating captures, then walk it backwards asking at each step
+// whether the side to move would rather stop than continue. PxQ comes out
+// positive, QxP defended by a pawn comes out negative, and a rook that trades
+// itself for a rook comes out at zero.
+//
+// WHAT IT IS FOR. Quiescence generates every capture, and most of them are
+// simply bad. MVV-LVA can only guess—it ranks by what is being taken, not by
+// what happens next—so it happily puts QxP at the front of a list where the
+// pawn is defended. SEE knows, so quiescence can refuse the capture outright
+// instead of searching a subtree to rediscover that it loses a queen.
+//
+// WHAT IT DOES NOT KNOW, AND WHY THAT IS ACCEPTED
+//   - PINS AND LEGALITY. A defender that is pinned against its own king cannot
+//     actually recapture, and SEE counts it anyway; the mirror case—a defender
+//     that would be giving away its king—is only handled for the king itself,
+//     which may not capture into a square the other side still defends.
+//   - PROMOTIONS DURING THE SWAP. The promotion of the move being scored is
+//     counted; a defending pawn that would itself promote while recapturing is
+//     scored as a pawn.
+//   - EVERYTHING THAT IS NOT MATERIAL. A capture that loses a rook to open a
+//     mating net scores badly, and rightly, as far as material goes.
+// X-rays ARE handled: pieces are removed from a private copy of the board as
+// they capture, so a queen behind a rook on the same file joins the exchange by
+// itself, which is the case a naive "count the attackers" version gets wrong.
+[[nodiscard]] int see(const Position& pos, const Move& mv);
+
+// The capture-only search alphabeta drops into at its leaves. Exposed so that
+// what it does and refuses to do—stand pat, resolve a check, prune a losing
+// capture—can be tested for itself, without a whole search wrapped round it.
+// `quiescence_depth` counts levels INTO quiescence, not search plies, and is
+// what QUIESCENCE_MAX_DEPTH bounds; callers start at 0.
+int quiescence(Position& pos, int alpha, int beta, SearchContext& ctx, Report& report,
+               const Stopper& stopper, std::size_t quiescence_depth = 0);
+
 // `previous_move` is the move that led to this position; it is what the
 // counter-move table is keyed by, and it is empty at the root and immediately
 // after a null move, where there is no move to answer.
 int alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
               TranspositionTable& tt, SearchContext& ctx, Report& report, const Stopper& stopper,
               const std::optional<Move>& previous_move = std::nullopt);
-
-// The spelling from before killers, history and counter-moves were bundled into
-// a SearchContext, kept for one cycle so callers written against it still
-// compile. It searches with a context of its own, seeded from `killers` and
-// copied back afterwards, which means the history and counter-move tables that
-// context builds are discarded when the call returns—so this is the slower way
-// to search, and new code should take a SearchContext.
-int alphabeta(Position& pos, std::uint8_t depth, int alpha, int beta, MoveList& pv,
-              TranspositionTable& tt, KillerMoves& killers, Report& report, const Stopper& stopper);
 } // namespace detail
 
 } // namespace c3::search
