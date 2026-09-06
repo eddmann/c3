@@ -10,27 +10,215 @@ This project grew out of a fascination with chess programming and a desire to de
 
 ## Features
 
-- Bitboards with magic bitboard move generation
-- Iterative deepening with aspiration windows
-- Negamax with alpha-beta pruning and principal variation search
-- Null-move pruning, futility pruning, quiescence search, check extensions
-- Transposition table with Zobrist hashing
-- Move ordering: TT move, MVV-LVA, killer moves
-- Tapered evaluation: material and piece-square tables (kept as an incremental
-  running total), pawn structure, king safety, rook placement, mobility, tempo
-- Full UCI protocol with time management
-- GoogleTest suite with perft validation
-- Fastchess gauntlet and SPRT strength testing
+Everything below is implemented. [How a move is chosen](#how-a-move-is-chosen)
+walks through the order these actually run in.
+
+**Board and move generation** — `include/c3/board.hpp`, `movegen.hpp`, `move_list.hpp`, `zobrist.hpp`, `src/fen.cpp`
+
+- Hybrid board representation: a 64-square mailbox for "what is on e4", plus a
+  bitboard per piece type, per colour and for total occupancy for everything
+  else.
+- Magic bitboards for sliding attacks, read from the checked-in
+  `include/c3/magic.hpp`, which carries a "do not edit" banner naming the option
+  that regenerates it.
+- The magic generator's search is bounded rather than a bare `while (true)`: a
+  round that exhausts `MAX_ATTEMPTS_PER_ROUND` reseeds and draws denser
+  candidates, and only a square that defeats every round fails the build — with
+  a message saying which square, instead of hanging for ever.
+- A `Move` is at most 8 bytes (`static_assert` in `move.hpp`), and moves live in
+  a fixed-capacity `MoveList` of 256 entries, so nothing on the hot path
+  allocates.
+- `pseudo_legal_moves_into()` fills a list the caller already owns;
+  `legal_moves()` is the make/unmake king test layered on top of it.
+- Material, piece-square and game-phase totals are maintained incrementally by
+  an `EvalAccumulator` the Board updates on every piece add and remove.
+- Zobrist keys are drawn from a seeded xorshift64\*, whose output is scrambled by
+  a multiply: plain xorshift64 draws are linear in the seed, and keys built from
+  them share XOR relations no set of chess positions should have.
+- FEN parsing validates what it reads — rank widths, piece letters, side to
+  move, castling rights against the pieces actually on the board, the en-passant
+  square, king counts, pawns on the first or last rank, and the move counters.
+
+**Search** — `include/c3/search.hpp`, `src/search.cpp`
+
+- Iterative deepening: depth 1, then 2, then 3, each iteration ordering its moves
+  by what the last one found.
+- Aspiration windows around the previous iteration's score, re-searched wider on
+  a fail.
+- Fail-hard negamax alpha-beta with principal variation search: the first move
+  gets a full window, the rest a zero window and a re-search only when they
+  threaten to beat alpha.
+- A 16-byte packed transposition table, owned by the `Engine` and therefore
+  living across moves. Entries carry a 6-bit generation ("age") that the
+  replacement policy prefers to overwrite, and the table is wiped only on
+  `ucinewgame` or a change of `Hash`.
+- TT moves are stored as 16 bits and validated on the way out by finding them in
+  the position's own move list, so a key collision can never put an impossible
+  move on the board.
+- Two time limits: a soft one checked only between iterations, and a hard one
+  polled during them. Another iteration is started only while
+  `elapsed + 4 x last_iteration` still fits inside the hard limit — 6x when soft
+  and hard coincide, as they do for `go movetime`, because there is then no
+  headroom to absorb a bad guess.
+- Move ordering, scored once per move and then picked one at a time rather than
+  fully sorted: hash move, captures and promotions by MVV-LVA, killers,
+  counter-move, history.
+- Promotions are scored as trading the pawn for the piece it becomes, so queen
+  promotions lead their underpromotions instead of trailing them.
+- Butterfly history with gravity (`score += bonus - score * |bonus| / HISTORY_MAX`),
+  so the table saturates instead of overflowing and old evidence decays without
+  an ageing pass.
+- Late move reductions, with a full-depth re-search whenever a reduced move turns
+  out to beat alpha.
+- Null-move pruning.
+- Futility pruning and late move pruning inside the move loop; reverse futility
+  pruning and razoring at the node, razoring's claim verified by quiescence
+  before it is acted on.
+- Internal iterative reduction: a node the table knows nothing about is searched
+  a ply shallower, and the move it finds is left behind for the next iteration to
+  order by.
+- Check extensions, capped at `MAX_CHECK_EXTENSIONS` (4) per path so a perpetual
+  check cannot buy plies for ever, under an explicit ply ceiling of `MAX_DEPTH`.
+- Quiescence search that stands pat on quiet positions but searches every legal
+  reply when in check, and filters the captures it does search by delta pruning,
+  by a bitboard static exchange evaluation, and down to queen promotions only.
+- Per-ply scratch — move lists, ordering scores, principal variations, searched
+  quiets — owned by the `SearchContext` rather than by the stack. Generating
+  through `pseudo_legal_moves_into()` took alphabeta's Release frame from 2528
+  bytes to 464 (measured with `-fstack-usage`; see WHY THE SCRATCH SPACE LIVES
+  HERE TOO in `search.hpp`), which is what keeps a 255-ply recursion inside a
+  512 KiB thread stack.
+- `seldepth`: the deepest ply any single line reached, quiescence included.
+
+**Evaluation** — `include/c3/eval.hpp`, `eval_terms.hpp`, `pawns.hpp`, `src/eval.cpp`
+
+- Tapered: every term has a middlegame and an endgame reading, blended over a
+  24-point game phase (`PHASE_MAX`).
+- Material and piece-square tables in the "Simplified Evaluation Function"
+  flavour (Tomasz Michniewski, Chess Programming Wiki).
+- Bishop pair bonus.
+- Insufficient-material detection, so a position neither side can mate from
+  scores as a draw.
+- Pawn structure: passed pawns (the front pawn of a file only), doubled pawns,
+  isolated pawns.
+- King safety: pawn shield, open and semi-open files beside the king, and enemy
+  pieces whose attacks touch the king zone — all middlegame numbers, all zero in
+  the endgame.
+- Rooks: open files, semi-open files at half value, and the seventh rank.
+- Mobility, weighted per piece and per phase, excluding for knights and bishops
+  the squares an enemy pawn attacks.
+- Tempo for the side to move.
+
+**UCI** — `include/c3/uci.hpp`, `src/uci.cpp`
+
+- The full protocol: `uci`, `isready`, `ucinewgame`, `position`, `go`, `stop`,
+  `setoption`, `quit`, with `debug`, `register` and `ponderhit` accepted and
+  ignored.
+- `go` understands `depth`, `movetime`, `wtime`/`btime`, `winc`/`binc`,
+  `movestogo`, `nodes`, `mate` and `infinite`; tokens it does not know are
+  skipped rather than aborting the command, as the spec requires.
+- Time budgeting from the clock: a share of what is left (divided by `movestogo`
+  when given, and never more than half the clock), plus half the increment, minus
+  a reserve; the hard limit is three times the soft one, capped by the clock.
+- Exactly one `bestmove` per `go`, always. A fallback legal move is chosen before
+  the search starts, so a search that throws — or a clock with nothing left on it
+  — still answers.
+- The search runs on its own thread so the loop can keep reading `stop`, and the
+  thread body catches everything: an exception escaping a `std::thread` would
+  call `std::terminate`.
+- `info` lines report `depth`, `seldepth`, `nodes`, `nps`, `hashfull`, `time`,
+  `score` and `pv`.
+- Non-UCI helpers for development: `bench`, `perft`, `eval`, `zobrist`,
+  `printboard`, `printfen`, `domove`.
+
+**Testing** — `tests/`
+
+- Over 450 GoogleTest cases, each registered as its own ctest entry.
+- Perft suite against Chess Programming Wiki ground truth, plus an opt-in deep
+  run of some 15 million nodes.
+- A tactical sanity suite: fixed positions whose best move the search must still
+  find.
+- A/B toggles on `SearchContext`, so a heuristic that only changes the size of the
+  tree can be measured by searching the same position twice.
+- `bench`: twelve fixed positions to a fixed depth, whose node total is a
+  per-commit signature for the search.
+- SPRT and gauntlet runs through fastchess, and a perft speed benchmark, driven
+  from `scripts/`.
+
+**Tooling**
+
+- Lichess bot bridge in `bot/`: a setup script and a lichess-bot config template.
+
+## How a move is chosen
+
+One `go`, in the order the code runs. Each step names the file and the comment
+block that argues for it.
+
+1. **`go` arrives** (`src/uci.cpp`). The line is parsed into `GoParams`; unknown
+   tokens are skipped so the command always reaches the search.
+2. **A budget is set** (`calculate_time_budget`, `src/uci.cpp` — TIME BUDGET FOR
+   ONE MOVE, SOFT AND HARD BUDGET FOR ONE MOVE). Clock, increment and `movestogo`
+   become a soft limit and a hard limit three times as large.
+3. **The search thread starts** (`src/uci.cpp`), leaving the loop free to read
+   `stop`; a fallback legal move is picked first, so a `bestmove` is guaranteed.
+4. **Iterative deepening** (`search()`, `src/search.cpp` — ITERATIVE DEEPENING).
+   Each depth is searched inside an aspiration window around the last score, and
+   `should_continue_deepening()` decides whether the next one is affordable.
+5. **`alphabeta()` enters a node** (`src/search.cpp` — ALPHA-BETA SEARCH WITH
+   NEGAMAX). It counts the node, then asks the cheap questions first: is this a
+   draw by repetition or the fifty-move rule, and has the ply ceiling been
+   reached (THE PLY CEILING)?
+6. **Out of depth?** The node hands over to quiescence — unless it is in check,
+   which buys a ply back until the path's budget runs out (CAPPING THE CHECK
+   EXTENSION).
+7. **The table is probed** (TRANSPOSITION TABLE PROBE). A deep enough entry can
+   end the node outright; a shallower one still leaves a move worth trying first.
+   A node with no entry gives up a ply instead (INTERNAL ITERATIVE REDUCTION).
+8. **One static evaluation is taken** (THE ONE STATIC EVALUATION THIS NODE GETS)
+   and reused by everything below it.
+9. **Whole-node pruning**: REVERSE FUTILITY PRUNING when the score is far above
+   beta, RAZORING when it is far below alpha and quiescence agrees, NULL-MOVE
+   PRUNING when passing the move still beats beta.
+10. **Moves are generated into this ply's row and scored once** (MOVE ORDERING),
+    then handed over one at a time, best first.
+11. **Per move**: FUTILITY PRUNING and LATE MOVE PRUNING can skip a quiet move
+    outright, and LATE MOVE REDUCTIONS can search it shallower.
+12. **PVS** (PRINCIPAL VARIATION SEARCH): full window for the first move, zero
+    window for the rest, re-searched at full width only when one of them looks
+    like a new best move.
+13. **A beta cutoff** records the killer, the counter-move and a history bonus
+    for a quiet move — with a malus for the quiet moves tried before it — and
+    stores a lower bound in the table.
+14. **Otherwise the node stores its result**, exact or upper bound, unless the
+    stopper fired below it: a score assembled from an abandoned tree is thrown
+    away rather than written.
+15. **Quiescence** (`quiescence()`, `src/search.cpp` — QUIESCENCE SEARCH) plays
+    the captures out until the position is quiet, filtered by DELTA PRUNING and
+    STATIC EXCHANGE EVALUATION, and **`eval()`** (`src/eval.cpp`) finally puts a
+    number on it.
 
 ## Roadmap
 
-- Late-move reductions (LMR)
-- Endgame patterns (king-pawn races, opposition, drawn-endgame scaling)
-- Pawn hash table, and evaluation weights fitted by tuning rather than by hand
-  (`scripts/texel_tune.py` sketches the machinery)
-- Opening book support
-- Tablebase support
-- Multi-threaded search
+- Engine-versus-engine validation of the mobility term and of the quiescence and
+  pruning set. Both are unit-tested and reasoned about, but **no gauntlet or SPRT
+  run was possible in the environment this work was done in**, so their effect on
+  playing strength is argued from node counts, not measured in games.
+  `scripts/compare_branches.py` against the previous tag is the first thing to
+  run on a machine that can play them.
+- Pawn hash table. The pawn-structure term, and the shield and open-file halves
+  of king safety, read only the pawn bitboards and the king squares, so they
+  could be computed once per pawn structure rather than once per node (see THE
+  NEXT OPTIMISATION in `include/c3/eval.hpp`).
+- Texel tuning of the evaluation weights, which needs a labelled dataset;
+  `scripts/texel_tune.py` has the machinery and no data.
+- Adaptive time management. The current rule predicts the next iteration as a
+  fixed multiple of the last one, and the constant is a compromise — see WHY SIX
+  in `include/c3/search.hpp` for two cases the rule can barely tell apart.
+- Opening book support.
+- Endgame tablebases.
+- Lazy SMP. The search is single-threaded; the transposition table it would have
+  to share is already the right shape for it.
+- Chess960.
 
 ## Usage
 
@@ -60,9 +248,13 @@ printf 'bench\nquit\n' | ./build-release/c3 | tail -2
 ```
 
 ```
-info string bench time 696 ms
-info string bench nodes 1133254 nps 1628238
+info string bench time <T> ms
+info string bench nodes <N> nps <M>
 ```
+
+No node count is quoted here on purpose: every change to search, evaluation or
+move ordering moves it, which is the whole point of the number. Take the figure
+from the build you are comparing against, not from this file.
 
 The transposition table is cleared before each position and once more at the
 end, so the node total is reproducible: run it twice on one build and the
