@@ -199,6 +199,8 @@ block that argues for it.
 
 ## Roadmap
 
+- Pentanomial (paired-game) statistics in `scripts/common.py`, so the gauntlet
+  summary's error bar matches fastchess's for paired openings.
 - More engine-versus-engine measurement. One SPRT run against the pre-rebuild
   build exists (see Strength Testing); per-term runs behind the `SearchContext`
   A/B toggles, and a run against an external engine of known rating, are the
@@ -466,7 +468,24 @@ four-core container. fastchess accepted H1 after 298 games: 291 wins, 4 draws,
 3 losses for the rebuilt engine, every game ending normally with no time
 forfeits. The point estimate is around +700 Elo, a figure so lopsided that the
 error bar is not meaningful; read it as "a different class of engine", not as a
-precise rating. The PGN and fastchess log are written to `Testing/fastchess/`,
+precise rating.
+
+The same harness was then pointed at an outside engine with a comparable
+feature list: [Anodos 1.3.0](https://github.com/tomcant/chess-rs) (Tom Cant's
+chess-rs, the engine this project drew inspiration from), built from source,
+200 games each, same clock and openings:
+
+| Match | Games | W / D / L | Elo (fastchess, pentanomial) | LOS |
+| --- | --- | --- | --- | --- |
+| rebuilt c3 vs Anodos 1.3.0 | 200 | 84 / 57 / 59 | +44 ± 38 | 99% |
+| original 03e993b vs Anodos 1.3.0 | 200 | 0 / 7 / 193 | −700 ± 158 | 0% |
+
+The two matches agree with the head-to-head figure above, and put the rebuilt
+engine a little ahead of Anodos rather than merely ahead of its own past. Every
+game in all three runs ended normally, with no time forfeits. Note that the
+gauntlet summariser's error bar is narrower than fastchess's for the same games
+because it treats games as independent (trinomial) rather than as colour-paired
+(pentanomial); prefer the fastchess figure, and see the roadmap. The PGN and fastchess log are written to `Testing/fastchess/`,
 which is gitignored, so re-run it rather than looking for the file:
 
 ```bash
