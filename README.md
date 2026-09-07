@@ -201,10 +201,14 @@ block that argues for it.
 
 - Pentanomial (paired-game) statistics in `scripts/common.py`, so the gauntlet
   summary's error bar matches fastchess's for paired openings.
-- More engine-versus-engine measurement. One SPRT run against the pre-rebuild
-  build exists (see Strength Testing); per-term runs behind the `SearchContext`
-  A/B toggles, and a run against an external engine of known rating, are the
-  next step before trusting any single heuristic's weight.
+- Act on the per-heuristic matches (see Strength Testing, "Per-heuristic
+  results"), which have replaced the guesses about individual terms with eleven
+  200-game numbers. In priority order: sweep `FUTILITY_MARGIN` away from
+  `{0, 100, 300}`, the one rule the engine may be better off without; split
+  `C3_DISABLE_QUIESCENCE_PRUNING` into its three separate filters, which one
+  macro currently bundles; and re-run the results whose error bars still cross
+  zero over 400 games. A second external engine of known rating would anchor
+  the scale the same way Anodos does.
 - Pawn hash table. The pawn-structure term, and the shield and open-file halves
   of king safety, read only the pawn bitboards and the king squares, so they
   could be computed once per pawn structure rather than once per node (see THE
@@ -492,6 +496,98 @@ which is gitignored, so re-run it rather than looking for the file:
 # build the old binary once, then let fastchess play until a bound is crossed
 python3 scripts/compare_branches.py --base 03e993b --test HEAD --mode movetime --movetime-ms 200
 ```
+
+### Per-heuristic results
+
+Eleven further matches price the heuristics one at a time. Each pits a variant
+binary — the same commit built with a single `C3_DISABLE_*` macro, so exactly one
+rule is compiled out — against the default build under identical conditions:
+fastchess, real clock 10 s + 0.1 s, 100 rounds of colour-swapped paired games
+from `tests/fixtures/openings.epd` (200 games per match), 64 MB hash,
+concurrency 3, timemargin 100 ms, one four-core container, no time forfeits.
+
+The Elo column belongs to the **variant**, so a negative number means the variant
+lost and the heuristic is earning its place. Read the error bar first: 200 paired
+games resolve only about ±35 Elo. These are fastchess's pentanomial figures; the
+repo's summariser gives the same point estimate with an error bar about half as
+wide (−83.2 ± 19.8 against −83.20 ± 40.49 for `no-mobility`) because it treats
+colour-paired games as independent.
+
+| Variant | Heuristic | Macro | W/D/L | Elo ± (pentanomial) | LOS variant better | bench (default 218288) | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `no-reductions` | Late move reductions | `C3_DISABLE_REDUCTIONS` | 31 / 84 / 85 | −96.2 ± 41.3 | 0.0% | 470597 | keep (proven) |
+| `no-mobility` | Mobility evaluation | `C3_DISABLE_MOBILITY` | 40 / 73 / 87 | −83.2 ± 40.5 | 0.0% | 205553 | keep (proven) |
+| `no-late-move-pruning` | Late move pruning | `C3_DISABLE_LATE_MOVE_PRUNING` | 35 / 85 / 80 | −79.5 ± 37.6 | 0.0% | 336692 | keep (proven) |
+| `no-null-move` | Null move pruning | `C3_DISABLE_NULL_MOVE` | 33 / 98 / 69 | −63.2 ± 33.7 | 0.0% | 216246 | keep (proven) |
+| `no-king-attackers` | King-zone attacker count | `C3_DISABLE_KING_ATTACKERS` | 44 / 90 / 66 | −38.4 ± 34.1 | 1.3% | 206777 | keep (proven) |
+| `no-reverse-futility` | Reverse futility pruning | `C3_DISABLE_REVERSE_FUTILITY` | 45 / 91 / 64 | −33.1 ± 31.8 | 2.0% | 264010 | keep (proven) |
+| `no-iir` | Internal iterative reduction | `C3_DISABLE_INTERNAL_ITERATIVE_REDUCTION` | 50 / 85 / 65 | −26.1 ± 39.0 | 9.3% | 240269 | keep (likely) |
+| `no-quiescence-pruning` | Quiescence filter set | `C3_DISABLE_QUIESCENCE_PRUNING` | 50 / 92 / 58 | −13.9 ± 35.5 | 22.0% | 702959 | neutral |
+| `no-razoring` | Razoring | `C3_DISABLE_RAZORING` | 41 / 111 / 48 | −12.2 ± 32.2 | 22.8% | 208945 | neutral |
+| `no-check-extension-cap` | Check extension cap | `C3_DISABLE_CHECK_EXTENSION_CAP` | 44 / 108 / 48 | −7.0 ± 28.5 | 31.6% | 218288 (identical) | neutral |
+| `no-futility` | Futility pruning | `C3_DISABLE_FUTILITY` | 59 / 96 / 45 | **+24.4 ± 35.7** | 91.1% | 225390 | remove or retune (likely harmful) |
+
+**Late move reductions** (−96 Elo) are the most valuable rule in the search:
+removing them more than doubles the tree for the same clock, so the variant sees
+less, and a loss this large says the re-search catches the mistakes LMR makes.
+
+**Mobility** (−83 Elo) answers the question the Strength Testing preamble raises:
+the most expensive evaluation term pays for itself several times over. The open
+question is whether the roadmap's pawn hash table can make it cheaper.
+
+**Late move pruning** (−80 Elo) buys a 35% smaller tree and 80 Elo. Its threshold
+is `LATE_MOVE_PRUNING_BASE + depth²` = `3 + depth²` up to
+`LATE_MOVE_PRUNING_DEPTH = 4` (`src/search.cpp`); since the rule is clearly
+positive, the next experiment is a retune of that base, not a removal.
+
+**Null move pruning** (−63 Elo) is proven despite a bench that barely moves
+(216246 against 218288): on those twelve positions the verification re-search
+costs about what the cut-offs save, and the win only shows up in the deeper
+searches of a real game — the clearest case for why bench cannot price a rule.
+
+**King-zone attacker count** (−38 Elo) is real but modest, and its interval
+(−72 to −4) only just clears zero. It is not separable from mobility in cost —
+both read the same attack sets — so give it 400 more games before retuning it.
+
+**Reverse futility pruning** (−33 Elo, interval −65 to −1) is the shallowest
+margin rule that survives. `REVERSE_FUTILITY_MARGIN_PER_PLY = 80` up to
+`REVERSE_FUTILITY_DEPTH = 3` is conservative; a sweep of 60 / 80 / 100 per ply
+would say whether the margin is where the value is.
+
+**Internal iterative reduction** (−26 ± 39) points the right way, but the
+interval crosses zero, so it is "probably worth keeping" and not more. Another
+400 games would narrow the error bar to roughly ±25 and settle it.
+
+**The quiescence filter set** (−14 ± 35) is the most interesting neutral, because
+turning it off triples the tree (702959 nodes) and costs almost nothing
+measurable. One macro hides three rules — queen-only promotions, delta pruning at
+`DELTA_PRUNING_MARGIN = 200`, and the SEE skip for strictly losing captures — and
+a bundled result cannot say which carries the value. Split it into three variants
+before concluding anything.
+
+**Razoring** (−12 ± 32) is indistinguishable from doing nothing. It pays a
+quiescence search at every node it wants to refuse, which is why removing it
+makes the tree *smaller* (208945 nodes). With `RAZORING_MARGIN_PER_PLY = 200` at
+`RAZORING_DEPTH = 2` it fires rarely; widen the depth, or accept the cost.
+
+**The check extension cap** (−7 ± 29, the narrowest interval and the highest draw
+ratio at 51%) is the one rule bench cannot see: the variant is node-identical to
+the default (218288 either way), because `MAX_CHECK_EXTENSIONS = 4`
+(`include/c3/search.hpp`) only refuses an extension once a line has already taken
+four, and no bench position has a forcing line that long. Nothing measurable in
+either direction is the expected shape for a safety valve — it exists to stop a
+perpetual check exploding the search, not to win games. Keep it, and test it on
+perpetual-check positions rather than with more games.
+
+**Futility pruning is the one result that argues for a change.** Compiled out it
+scored +24.4 ± 35.7 with LOS 91.1% — the interval still crosses zero, so this is
+not proof, but it is the only heuristic whose point estimate says the engine
+plays better without it. `FUTILITY_MARGIN = {0, 100, 300}` at
+`FUTILITY_DEPTH = 2` (`src/search.cpp`) predates LMP and LMR, which already
+discard the late quiet moves futility aims at; what is left throws away moves
+those two would have searched at reduced depth and found. Sweep the margins —
+`{0, 150, 400}` and `{0, 200, 500}` as variant binaries — and if neither recovers
+the loss, confirm over 400 games before removing the rule.
 
 ### Gauntlet
 
